@@ -662,7 +662,8 @@ public sealed class JobQuestFlow : AutoTask
         if (plan.Craft.LockedBySecretBook.Count > 0)
             return this.Fail($"秘伝書が未読のため作れない品があります：{string.Join("、", plan.Craft.LockedBySecretBook.Select(c => CraftPlanner.ItemName(c.ItemId)))}");
 
-        if (this.craftRound++ > ctx.Config.MaxRetryRounds + 4)
+        // 素材集め（+2 以上で止める）と同じ書き方にそろえる：製作は MaxRetryRounds+4 周まで（既定 7 周）
+        if (this.craftRound++ >= ctx.Config.MaxRetryRounds + 4)
             return this.Fail("何度作っても納品物がそろいません（HQ ができない等）");
 
         var steps = new List<Func<TaskContext, AutoTask?>> { _ => new GoToInnTask() };
