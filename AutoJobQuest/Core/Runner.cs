@@ -81,6 +81,12 @@ public sealed class Runner
 
     public bool IsRunning => this.root != null;
 
+    /// <summary>始まったとき（記録の開始に使う）。</summary>
+    public Action<AutoTask>? Started { get; set; }
+
+    /// <summary>終わったとき（結果の文言, 失敗したか）。失敗なら記録係が状態の写しを書き出す。</summary>
+    public Action<string, bool>? Finished { get; set; }
+
     /// <summary>いま動いている作業（画面表示用）。</summary>
     public AutoTask? Root => this.root;
 
@@ -98,6 +104,7 @@ public sealed class Runner
         this.stopReason = null;
         this.root = task;
         this.LastResult = string.Empty;
+        this.Started?.Invoke(task);
         this.ctx.Log.Write("実行", $"開始: {task.Name}");
     }
 
@@ -117,7 +124,7 @@ public sealed class Runner
 
         if (this.stopReason != null)
         {
-            this.Finish($"止めました（{this.stopReason}）");
+            this.Finish($"止めました（{this.stopReason}）", false);
             return;
         }
 
@@ -129,23 +136,37 @@ public sealed class Runner
         catch (Exception ex)
         {
             Svc.Log.Error(ex, "[AutoJobQuest] 実行中の例外");
-            this.Finish($"例外で止まりました: {ex.GetType().Name}: {ex.Message}");
+            DebugLog.Current?.Exception("実行", "実行中の例外", ex);
+            this.Finish($"例外で止まりました: {ex.GetType().Name}: {ex.Message}", true);
             return;
         }
 
         switch (r)
         {
             case TaskResult.Done:
-                this.Finish("すべて終わりました");
+                this.Finish("すべて終わりました", false);
                 break;
             case TaskResult.Failed:
-                this.Finish($"失敗で止まりました: {this.root.FailReason}");
+                this.Finish($"失敗で止まりました: {this.root.FailReason}", true);
                 break;
         }
     }
 
-    private void Finish(string result)
+    private void Finish(string result, bool failed)
     {
+        // 失敗の写しは後始末の前に取る（後始末で状態が変わるため）
+        if (failed)
+        {
+            try
+            {
+                this.Finished?.Invoke(result, true);
+            }
+            catch (Exception ex)
+            {
+                Svc.Log.Error(ex, "[AutoJobQuest] 失敗の記録に失敗");
+            }
+        }
+
         var task = this.root;
         this.root = null;
 
@@ -165,5 +186,9 @@ public sealed class Runner
         this.LastResult = result;
         this.ctx.Log.Write("実行", result);
         Svc.Chat.Print($"[AutoJobQuest] {result}");
+        if (!failed)
+            this.Finished?.Invoke(result, false);
+        else
+            DebugLog.Current?.EndRun(result);
     }
 }

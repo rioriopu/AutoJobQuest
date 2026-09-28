@@ -6,6 +6,7 @@ using AutoJobQuest.Core;
 using AutoJobQuest.Data;
 using AutoJobQuest.Ipc;
 using Dalamud.Game.ClientState.Objects.Enums;
+using Dalamud.Game.ClientState.Objects.Types;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
@@ -22,7 +23,7 @@ public sealed class RunQuestTask : AutoTask
     private readonly string label;
     private bool started;
     private int restarts;
-    private DateTime notRunningSince = DateTime.MinValue;
+    private int notRunningFrames;
 
     public RunQuestTask(uint questRowId, string label)
     {
@@ -52,21 +53,20 @@ public sealed class RunQuestTask : AutoTask
             return TaskResult.Running;
         }
 
+        // QuestTask と同じ：続けて3回 false を見たら止まったとみなす（時間ではなく状態で判断）
         if (ctx.Questionable.IsRunning() == false)
         {
-            if (this.notRunningSince == DateTime.MinValue)
-                this.notRunningSince = DateTime.UtcNow;
-            if (DateTime.UtcNow - this.notRunningSince > TimeSpan.FromSeconds(8))
+            if (++this.notRunningFrames >= 3)
             {
                 if (this.restarts++ >= 3)
                     return this.Fail("Questionable が途中で止まりました");
                 this.started = false;
-                this.notRunningSince = DateTime.MinValue;
+                this.notRunningFrames = 0;
             }
         }
         else
         {
-            this.notRunningSince = DateTime.MinValue;
+            this.notRunningFrames = 0;
             this.Status = ctx.Questionable.GetCurrentStepData() is { } sd ? $"Questionable: {sd.InteractionType}" : "Questionable が進めています";
         }
 
@@ -82,159 +82,413 @@ public sealed class RunQuestTask : AutoTask
 }
 
 /// <summary>
-/// NPC のところへ行って話しかけ、目的の画面が開くまで進める。
-/// 会話の選択肢（SelectString / SelectIconString）が出たら、渡された候補の文言で選ぶ
-/// （空白を除いて完全一致を優先、無ければ部分一致。ちょうど1件のときだけ選ぶ）。
+/// NPC の会話メニュー（SelectString / SelectIconString）で、手がかりの文言に合う項目を選ぶ
+///  ・番号では選ばない（並びはクエストの進み具合で変わる）。
+///  ・空白（半角・全角）を除いて、完全一致を優先し、無ければ部分一致。**ちょうど1件のときだけ**選ぶ。
 /// </summary>
-public sealed class TalkToNpcTask : AutoTask
+public static class MenuPicker
 {
+    public enum Failure { None, NotFound, Ambiguous }
+
+    public static int Resolve(IReadOnlyList<string> entries, string hint, out Failure failure)
+    {
+        failure = Failure.None;
+        var target = GameUi.Normalize(hint);
+        if (target.Length == 0)
+        {
+            failure = Failure.NotFound;
+            return -1;
+        }
+
+        var exact = new List<int>();
+        var partial = new List<int>();
+        for (var i = 0; i < entries.Count; i++)
+        {
+            var e = GameUi.Normalize(entries[i]);
+            if (e.Length == 0)
+                continue;
+            if (string.Equals(e, target, StringComparison.OrdinalIgnoreCase))
+                exact.Add(i);
+            else if (e.Contains(target, StringComparison.OrdinalIgnoreCase) || target.Contains(e, StringComparison.OrdinalIgnoreCase))
+                partial.Add(i);
+        }
+
+        var candidates = exact.Count > 0 ? exact : partial;
+        switch (candidates.Count)
+        {
+            case 1:
+                return candidates[0];
+            case 0:
+                failure = Failure.NotFound;
+                return -1;
+            default:
+                failure = Failure.Ambiguous;
+                return -1;
+        }
+    }
+}
+
+/// <summary>
+/// NPC のところへ行って話しかけ、目的の画面が開くまで進める
+/// （TickTeleport → TickNavigate → TickInteract → TickMenu の流れ）。
+///
+///  ・移動中でも、NPC が話しかけられる距離（5.5m）に入ったら経路の終わりを待たずに話しかける
+///    （カウンターの向こうの NPC だと、経路が NPC の足元へ向かって走り続けるため）。
+///  ・配置データの座標と実際の NPC の位置が 3m 以上ずれていたら、実際の位置へ経路を引き直す（3回まで）。
+///  ・話しかけ：動けない状態なら待つ → ターゲット → 1秒おきに話しかける（視線判定なし）。遠ければ近づき直す（3回まで）。
+///  ・会話ウィンドウ（Talk）は 0.3 秒おきに進める。
+///  ・選択肢：手がかりの順に試す。同じ選択を4回・合計9回選んでも進まなければ失敗。選択肢が変わらないまま
+///    2秒たっても合うものが無ければ失敗。メニューが閉じたら1度だけ話しかけ直す。
+///  ・マウントに乗っていたら降りてから話しかける。
+/// </summary>
+public sealed unsafe class TalkToNpcTask : AutoTask
+{
+    private enum TalkStep { Teleport, Navigate, Interact, Menu }
+
+    /// <summary>話しかけられる距離（5.5m。ゲームの判定は非公開なので「明らかに遠い」だけを判定する）。</summary>
+    public const float InteractRange = 5.5f;
+
+    private static readonly TimeSpan MenuSettle = TimeSpan.FromSeconds(2);
+
     private readonly NpcSpot spot;
     private readonly Func<bool> opened;
     private readonly string label;
-    private readonly List<string> menuHints;
+    private readonly List<string> hints;
+
+    private TalkStep step = TalkStep.Teleport;
     private AutoTask? sub;
-    private int phase;
+    private Vector3 destination;
+    private int destinationUpdates;
+    private int reapproaches;
+    private DateTime stepDeadline = DateTime.MaxValue;
+
+    private DateTime lastTalk = DateTime.MinValue;
     private DateTime lastInteract = DateTime.MinValue;
     private DateTime lastMenu = DateTime.MinValue;
-    private int interacts;
+    private DateTime lastReapproach = DateTime.MinValue;
+    private DateTime lastDismount = DateTime.MinValue;
 
-    public TalkToNpcTask(NpcSpot spot, Func<bool> opened, string label, IEnumerable<string>? menuHints = null)
+    private int menuBounces;
+    private int menuSelections;
+    private int sameMenuSelections;
+    private string lastMenuSelection = string.Empty;
+    private string lastMenuSignature = string.Empty;
+    private DateTime menuSignatureSince = DateTime.MinValue;
+
+    /// <param name="hints">会話メニューが出たときに選ぶ手がかり（試す順）。</param>
+    public TalkToNpcTask(NpcSpot spot, Func<bool> opened, string label, IEnumerable<string>? hints = null)
     {
         this.spot = spot;
         this.opened = opened;
         this.label = label;
-        this.menuHints = menuHints?.Select(GameUi.Normalize).Where(x => x.Length > 0).ToList() ?? [];
+        this.hints = hints?.Where(h => !string.IsNullOrWhiteSpace(h)).Distinct().ToList() ?? [];
+        this.destination = spot.Position;
     }
 
     public override string Name => $"話しかけ: {this.label}";
 
-    protected override unsafe TaskResult Tick(TaskContext ctx)
+    protected override TaskResult Tick(TaskContext ctx)
     {
         if (this.opened())
             return TaskResult.Done;
 
-        if (this.Elapsed > TimeSpan.FromMinutes(8))
-            return this.Fail($"{this.label} の画面を開けませんでした");
+        if (this.Elapsed > TimeSpan.FromMinutes(10))
+            return this.Fail($"{this.label} の画面を10分以内に開けませんでした");
 
-        // 1) テレポ → 2) 近くまで移動
-        if (this.phase < 2)
+        return this.step switch
         {
-            this.sub ??= this.phase == 0
-                ? new TeleportTask(this.spot.Territory, this.spot.Position)
-                : new MoveToTask(this.spot.Position, 3f, this.label);
-            var r = this.sub.Step(ctx);
-            this.Status = this.sub.Status;
-            if (r == TaskResult.Running)
+            TalkStep.Teleport => this.TickTeleport(ctx),
+            TalkStep.Navigate => this.TickNavigate(ctx),
+            TalkStep.Interact => this.TickInteract(ctx),
+            _ => this.TickMenu(ctx),
+        };
+    }
+
+    private TaskResult TickTeleport(TaskContext ctx)
+    {
+        this.sub ??= new TeleportTask(this.spot.Territory, this.spot.Position);
+        var r = this.sub.Step(ctx);
+        this.Status = this.sub.Status;
+        if (r == TaskResult.Running)
+            return TaskResult.Running;
+        this.sub.Cleanup(ctx);
+        var failed = r == TaskResult.Failed ? this.sub.FailReason : null;
+        this.sub = null;
+        if (failed != null)
+            return this.Fail(failed);
+
+        this.GoTo(TalkStep.Navigate, $"{this.label} へ移動します", TimeSpan.FromMinutes(4));
+        return TaskResult.Running;
+    }
+
+    private TaskResult TickNavigate(TaskContext ctx)
+    {
+        var live = FindNpc(this.spot.NpcId);
+        if (live != null)
+        {
+            // 届く距離なら、経路の終わりを待たずに話しかける
+            if (Vector3.Distance(live.Position, Me.Position) <= InteractRange)
+            {
+                this.StopSub(ctx);
+                this.GoTo(TalkStep.Interact, $"{live.Name} に話しかけます", TimeSpan.FromSeconds(30));
                 return TaskResult.Running;
-            this.sub.Cleanup(ctx);
-            var failed = r == TaskResult.Failed ? this.sub.FailReason : null;
-            this.sub = null;
-            if (failed != null)
-                return this.Fail(failed);
-            this.phase++;
+            }
+
+            // 配置データの座標と実際の位置が大きくずれていれば、実際の位置へ引き直す
+            if (Vector3.Distance(live.Position, this.destination) > 3f && this.destinationUpdates < 3)
+            {
+                this.destinationUpdates++;
+                this.destination = live.Position;
+                this.StopSub(ctx);
+                ctx.Log.Debug("会話", $"{this.label} の実際の位置へ経路を引き直します（{this.destinationUpdates} 回目）");
+            }
+        }
+
+        this.sub ??= new MoveToTask(this.destination, 3f, this.label);
+        var r = this.sub.Step(ctx);
+        this.Status = this.sub.Status;
+        if (r == TaskResult.Running)
+        {
+            if (DateTime.UtcNow > this.stepDeadline)
+                return this.Fail($"{this.label} へ移動できませんでした（時間切れ）");
             return TaskResult.Running;
         }
 
-        // 3) 選択肢が出ていれば選ぶ
-        var entries = GameUi.MenuEntries(out var menu);
-        if (entries != null)
+        this.sub.Cleanup(ctx);
+        var failed = r == TaskResult.Failed ? this.sub.FailReason : null;
+        this.sub = null;
+
+        // 届いていなくても、話しかけ側で近づき直す（それでも駄目なら失敗）
+        if (failed != null)
+            ctx.Log.Debug("会話", $"{this.label} への移動が途中で終わりました（{failed}）。話しかけ側で近づき直します");
+        this.GoTo(TalkStep.Interact, $"{this.label} に話しかけます", TimeSpan.FromSeconds(30));
+        return TaskResult.Running;
+    }
+
+    private TaskResult TickInteract(TaskContext ctx)
+    {
+        if (this.TryAdvanceTalk())
         {
+            this.Status = "会話を進めています";
+            return TaskResult.Running;
+        }
+
+        if (GameUi.MenuEntries(out _) != null)
+        {
+            this.GoTo(TalkStep.Menu, "会話の選択肢を選んでいます", TimeSpan.FromSeconds(45));
+            return TaskResult.Running;
+        }
+
+        var npc = FindNpc(this.spot.NpcId);
+        if (npc == null)
+        {
+            if (DateTime.UtcNow > this.stepDeadline)
+                return this.Fail($"{this.label} の NPC が見つかりません");
+            this.Status = $"{this.label} の NPC を探しています";
+            return TaskResult.Running;
+        }
+
+        // 遠いと「話しかけられない距離です」と出るだけで進まない。実際の位置へ近づき直す
+        if (Vector3.Distance(npc.Position, Me.Position) > InteractRange)
+        {
+            if (this.reapproaches >= 3)
+                return this.Fail($"{this.label} に近づけませんでした");
+            if (DateTime.UtcNow - this.lastReapproach < TimeSpan.FromSeconds(3))
+                return TaskResult.Running;
+
+            this.lastReapproach = DateTime.UtcNow;
+            this.reapproaches++;
+            ctx.Log.Debug("会話", $"{this.label} から離れているので近づき直します（{this.reapproaches} 回目）");
+            this.destination = npc.Position;
+            this.StopSub(ctx);
+            this.sub = new MoveToTask(npc.Position, 2.5f, this.label);
+            this.GoTo(TalkStep.Navigate, $"{this.label} へ近づき直しています", TimeSpan.FromSeconds(60));
+            return TaskResult.Running;
+        }
+
+        // マウントに乗ったままなら降りる（降りきるまで待つ）
+        if (GameUi.Mounted)
+        {
+            if (DateTime.UtcNow - this.lastDismount >= TimeSpan.FromSeconds(1))
+            {
+                this.lastDismount = DateTime.UtcNow;
+                GameUi.UseGeneralAction(23); // 降りる（GeneralAction 23：ゲームデータで確認。CombatTask と同じ）
+            }
+
+            this.Status = "マウントから降りています";
+            return TaskResult.Running;
+        }
+
+        // 動けない状態（会話の開始待ち・詠唱など）なら待つ。ターゲット → 次の呼び出しで話しかけ、を1秒おきに
+        if (GameUi.PlayerFree() && DateTime.UtcNow - this.lastInteract >= TimeSpan.FromSeconds(1))
+        {
+            this.lastInteract = DateTime.UtcNow;
+            GameUi.Interact(npc);
+            this.Status = $"{npc.Name} に話しかけています";
+        }
+
+        if (DateTime.UtcNow > this.stepDeadline)
+            return this.Fail($"{this.label} に話しかけても画面が開きませんでした");
+        return TaskResult.Running;
+    }
+
+    private TaskResult TickMenu(TaskContext ctx)
+    {
+        // 選んだあとに会話が挟まることがある
+        if (this.TryAdvanceTalk())
+        {
+            this.Status = "会話を進めています";
+            return TaskResult.Running;
+        }
+
+        var entries = GameUi.MenuEntries(out var menu);
+        if (entries == null)
+        {
+            // 選択肢が閉じただけかもしれないので、話しかけからやり直す。ただし1度だけ
+            // （利用者が手で閉じた・選ぶべき項目が無い場合に、話しかけ直して永久に往復しないため）
+            if (++this.menuBounces > 1)
+                return this.Fail($"会話を抜けられませんでした（{this.menuBounces} 回やり直し）");
+            this.GoTo(TalkStep.Interact, "話しかけ直します", TimeSpan.FromSeconds(30));
+            return TaskResult.Running;
+        }
+
+        var ambiguous = false;
+        foreach (var hint in this.hints)
+        {
+            var idx = MenuPicker.Resolve(entries, hint, out var failure);
+            if (idx < 0)
+            {
+                ambiguous |= failure == MenuPicker.Failure.Ambiguous;
+                continue;
+            }
+
             if (DateTime.UtcNow - this.lastMenu < TimeSpan.FromMilliseconds(500))
                 return TaskResult.Running;
             this.lastMenu = DateTime.UtcNow;
 
-            var idx = this.ChooseMenu(entries);
-            if (idx < 0)
-                return this.Fail($"会話の選択肢から選べませんでした（{string.Join(" / ", entries)}）");
+            // 選んでも画面が進まない（選択肢の先がまた選択肢・条件を満たさず戻される）ときに、同じ項目を選び続けない
+            if (hint == this.lastMenuSelection)
+            {
+                this.sameMenuSelections++;
+            }
+            else
+            {
+                this.lastMenuSelection = hint;
+                this.sameMenuSelections = 1;
+            }
+
+            if (++this.menuSelections > 8 || this.sameMenuSelections > 3)
+            {
+                return this.Fail($"「{hint}」を選んでも先へ進みませんでした（同じ選択 {this.sameMenuSelections} 回 / 合計 {this.menuSelections} 回）。"
+                                 + $"選択肢: {string.Join(" / ", entries)}");
+            }
+
+            ctx.Log.Write("会話", $"選択肢「{entries[idx]}」を選びます（手がかり「{hint}」・{this.menuSelections} 回目）");
             GameUi.Fire(menu, true, idx);
-            this.Status = $"選択肢「{entries[idx]}」を選びました";
+            this.Status = $"「{entries[idx]}」を選びました";
             return TaskResult.Running;
         }
 
-        // 4) 話しかける
-        if (!GameUi.PlayerFree())
+        // 合うものが無い。選択肢が切り替わる途中なら待つが、変わらないまま2秒たったら失敗にする
+        var signature = string.Join("\u0001", entries);
+        if (signature != this.lastMenuSignature)
         {
-            this.Status = "会話中";
+            this.lastMenuSignature = signature;
+            this.menuSignatureSince = DateTime.UtcNow;
             return TaskResult.Running;
         }
 
-        if (DateTime.UtcNow - this.lastInteract < TimeSpan.FromSeconds(2))
+        if (DateTime.UtcNow - this.menuSignatureSince <= MenuSettle && DateTime.UtcNow <= this.stepDeadline)
             return TaskResult.Running;
 
-        var npc = Svc.Objects
-            .Where(o => o.ObjectKind == ObjectKind.EventNpc && o.BaseId == this.spot.NpcId && o.IsTargetable)
-            .OrderBy(o => Vector3.Distance(o.Position, Me.Position))
-            .FirstOrDefault();
-        if (npc == null)
-        {
-            if (this.PhaseElapsed > TimeSpan.FromSeconds(20))
-                return this.Fail($"{this.label} の NPC が見つかりません");
-            return TaskResult.Running;
-        }
-
-        if (Vector3.Distance(npc.Position, Me.Position) > 5.5f)
-        {
-            this.phase = 1; // 近づき直す
-            this.sub = new MoveToTask(npc.Position, 3f, this.label);
-            return TaskResult.Running;
-        }
-
-        if (this.interacts++ >= 6)
-            return this.Fail($"{this.label} に話しかけても画面が開きません");
-
-        GameUi.Interact(npc);
-        this.lastInteract = DateTime.UtcNow;
-        this.Status = $"{npc.Name} に話しかけました";
-        return TaskResult.Running;
+        return this.Fail(ambiguous
+            ? $"選択肢を1つに絞れませんでした。手がかり: {string.Join(" / ", this.hints)} / 選択肢: {string.Join(" / ", entries)}"
+            : $"合う選択肢がありません。手がかり: {string.Join(" / ", this.hints)} / 選択肢: {string.Join(" / ", entries)}");
     }
 
-    private int ChooseMenu(List<string> entries)
+    private bool TryAdvanceTalk()
     {
-        var norm = entries.Select(GameUi.Normalize).ToList();
-        foreach (var hint in this.menuHints)
+        if (!GameUi.IsReady("Talk", out _))
+            return false;
+        if (DateTime.UtcNow - this.lastTalk >= TimeSpan.FromMilliseconds(300))
         {
-            var exact = norm.Select((e, i) => (e, i)).Where(x => x.e == hint).ToList();
-            if (exact.Count == 1)
-                return exact[0].i;
+            this.lastTalk = DateTime.UtcNow;
+            GameUi.AdvanceTalk();
         }
 
-        foreach (var hint in this.menuHints)
-        {
-            var partial = norm.Select((e, i) => (e, i)).Where(x => x.e.Contains(hint, StringComparison.Ordinal) || hint.Contains(x.e, StringComparison.Ordinal) && x.e.Length > 0).ToList();
-            if (partial.Count == 1)
-                return partial[0].i;
-        }
-
-        return -1;
+        return true;
     }
 
-    public override void Cleanup(TaskContext ctx)
+    private void GoTo(TalkStep s, string status, TimeSpan limit)
+    {
+        this.step = s;
+        this.stepDeadline = DateTime.UtcNow + limit;
+        this.NextPhase(status);
+    }
+
+    private void StopSub(TaskContext ctx)
     {
         this.sub?.Cleanup(ctx);
         this.sub = null;
     }
+
+    /// <summary>その NPC（BaseId）のうち、ターゲットできる一番近いもの。</summary>
+    public static IGameObject? FindNpc(uint baseId)
+        => Svc.Objects
+            .Where(o => o.ObjectKind == ObjectKind.EventNpc && o.BaseId == baseId && o.IsTargetable)
+            .OrderBy(o => Vector3.Distance(o.Position, Me.Position))
+            .FirstOrDefault();
+
+    public override void Cleanup(TaskContext ctx) => this.StopSub(ctx);
 }
 
 /// <summary>
 /// 収集品を納品して紫貨を得る。
 ///
 ///  ・納品画面は開いた時点の「今のジョブ」のタブが出るので、先にその品のタブのジョブ（木工）に着替えてから話しかける。
-///  ・一覧：AtkValues[20]＝表示行数、[33+i×11]＝行番号、[34+i×11]＝ItemId+500000。
-///  ・選ぶ：Fire(12, (uint)行番号)。渡す：Fire(15, 0u)。確認ダイアログは出ず、1回で1個。
-///  ・成功は「収集品が減った AND 紫貨が増えた」。
-///  ・終わったら（成功でも失敗でも）自分で開いた画面を閉じる。
+///  ・一覧：AtkValues[20]＝表示行数（見出しを含む。走査の上限にだけ使う）、[33+i×11]＝行番号、[34+i×11]＝ItemId+500000。
+///    行番号が 0 からの連番でない・収集品の形でない値がある・同じ行番号が2回出る、のどれかなら配置ずれとみなして撃たない。
+///  ・選ぶ：Fire(12, (uint)行番号)。選べたかは右の一覧（node 31）の行数＝その品の所持数で確かめる
+///    （左の一覧の選択位置は動かないので見ない）。確かめられなければ納品ボタン（node 51）が押せる状態かで代える。2秒で諦める。
+///  ・渡す：Fire(15, 0u)。確認ダイアログは出ず、1回で1個。
+///  ・成功は「その収集品が減った AND 紫貨が増えた」（2.5秒まで待つ）。狙っていない収集品が減ったら即停止。
+///    変わらなければ1度だけ撃ち直す。
+///  ・終わったら（成功でも失敗でも）自分が開いた画面だけを閉じる（1手目 Close、2手目以降 Fire(-1)。0.8秒おき）。
 /// </summary>
 public sealed unsafe class DeliverCollectablesTask : AutoTask
 {
+    private enum DeliverStep { Equip, Talk, Select, WaitTrade, Verify, Close }
+
+    private const uint CollectableOffset = 500000;
+    private const int DisplayRowCountIndex = 20;
+    private const int FirstEntry = 33;
+    private const int EntryStride = 11;
+    private const uint HeldListNodeId = 31;
+    private const uint TradeButtonNodeId = 51;
+
+    private static readonly TimeSpan TradeReadyLimit = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan TradeReadyDumpAfter = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan VerifyLimit = TimeSpan.FromMilliseconds(2500);
+
     private readonly BookData data;
     private readonly NpcSpot npc;
+    private DeliverStep step = DeliverStep.Equip;
     private AutoTask? sub;
-    private int stage;
-    private int beforeItems;
-    private int beforeScrips;
-    private DateTime firedAt = DateTime.MinValue;
-    private bool selected;
-    private int retries;
+
+    private int rowIndex;
+    private int ownedBefore;
+    private Dictionary<uint, int> heldBefore = [];
+    private int scripsBefore;
+    private DateTime selectedAt;
+    private DateTime verifyUntil;
+    private bool dumped;
+    private bool retried;
+    private int observedReward;
+    private string lastButton = "未読";
+    private string lastSelection = "未確認";
+
+    private DateTime lastClose = DateTime.MinValue;
+    private int closeAttempts;
 
     public int Delivered { get; private set; }
 
@@ -246,28 +500,53 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
 
     public override string Name => "収集品の納品";
 
-    private int Held => Inventory.CountCollectables(this.data.CollectableItemId, this.data.MinCollectability);
+    private uint Item => this.data.CollectableItemId;
+
+    /// <summary>納品の下限を満たす手持ち。</summary>
+    private int Deliverable => Inventory.CountCollectables(this.Item, this.data.MinCollectability);
+
+    protected override TaskResult OnStart(TaskContext ctx)
+    {
+        ctx.Ownership.Clear();
+        ctx.Ownership.IsClaiming = true;
+        return TaskResult.Running;
+    }
 
     protected override TaskResult Tick(TaskContext ctx)
     {
-        switch (this.stage)
+        switch (this.step)
         {
-            case 0:
-                if (this.Held == 0)
+            case DeliverStep.Equip:
+                if (this.Deliverable == 0)
+                {
+                    ctx.Log.Write("納品", $"納品できる {CraftPlanner.ItemName(this.Item)}（収集価値 {this.data.MinCollectability} 以上）がありません");
                     return TaskResult.Done;
+                }
+
                 this.sub ??= new EquipJobTask(this.data.CollectableTabClassJob);
-                return this.RunSub(ctx);
-            case 1:
-                this.sub ??= new TalkToNpcTask(this.npc, () => GameUi.IsReady("CollectablesShop", out _), "収集品納品窓口");
-                return this.RunSub(ctx);
-            case 2:
-                return this.Deliver(ctx);
-            default:
-                return this.Close();
+                return this.RunSub(ctx, DeliverStep.Talk);
+
+            case DeliverStep.Talk:
+                this.sub ??= new TalkToNpcTask(this.npc, () => GameUi.IsReady("CollectablesShop", out _), "収集品納品窓口", [this.data.CollectablesShopName]);
+                return this.RunSub(ctx, DeliverStep.Select);
+
+            case DeliverStep.Close:
+                return this.Close(ctx);
         }
+
+        // ここから先は納品画面が開いている前提。閉じたら撃ち続けない
+        if (!GameUi.IsReady("CollectablesShop", out var addon))
+            return this.Fail($"納品画面が閉じました（{this.Delivered} 個まで納品済み）");
+
+        return this.step switch
+        {
+            DeliverStep.Select => this.TickSelect(ctx, addon),
+            DeliverStep.WaitTrade => this.TickWaitTrade(ctx, addon),
+            _ => this.TickVerify(ctx),
+        };
     }
 
-    private TaskResult RunSub(TaskContext ctx)
+    private TaskResult RunSub(TaskContext ctx, DeliverStep next)
     {
         var r = this.sub!.Step(ctx);
         this.Status = this.sub.Status;
@@ -278,119 +557,286 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
         this.sub = null;
         if (failed != null)
             return this.Fail(failed);
-        this.stage++;
-        this.NextPhase(string.Empty);
+        this.Go(next, string.Empty);
         return TaskResult.Running;
     }
 
-    private TaskResult Deliver(TaskContext ctx)
+    private void Go(DeliverStep s, string status)
     {
-        if (!GameUi.IsReady("CollectablesShop", out var addon))
-            return this.Fail("納品画面が閉じられました");
+        this.step = s;
+        this.NextPhase(status);
+    }
+
+    private TaskResult TickSelect(TaskContext ctx, AtkUnitBase* addon)
+    {
+        if (!TryReadOffers(addon, out var offers, out var readFailure))
+            return this.Fail($"納品画面の一覧を読めません：{readFailure}");
+
+        var held = Inventory.HeldCollectables();
+        var owned = held.GetValueOrDefault(this.Item);
+        if (owned <= 0 || this.Deliverable == 0)
+        {
+            ctx.Log.Write("納品", $"納品を終えました（{this.Delivered} 個）");
+            this.Go(DeliverStep.Close, "納品画面を閉じます");
+            return TaskResult.Running;
+        }
+
+        // 溢れた分は捨てられるので、一番多くもらえる場合で上限を見る
+        var scrips = Inventory.CountSpecialCurrency(this.data.RewardSpecialCurrencyId, out _);
+        var cap = ScripCap(this.data.RewardSpecialCurrencyId);
+        var gain = Math.Max(this.observedReward, this.data.RewardHigh);
+        if (cap > 0 && scrips + gain > cap)
+        {
+            ctx.Log.Warn("納品", $"紫貨が上限に近いので納品をやめます（{scrips}/{cap}、次の納品で最大 +{gain}）");
+            this.Go(DeliverStep.Close, "納品画面を閉じます");
+            return TaskResult.Running;
+        }
+
+        var offer = offers.FirstOrDefault(o => o.ItemId == this.Item);
+        if (offer.ItemId == 0)
+            return this.Fail($"納品画面に {CraftPlanner.ItemName(this.Item)} が出ていません（ジョブのタブが違う可能性。読めた品：{string.Join("、", offers.Select(o => CraftPlanner.ItemName(o.ItemId)))}）");
+
+        this.rowIndex = offer.Row;
+        this.ownedBefore = owned;
+        this.heldBefore = held;
+        this.scripsBefore = scrips;
+        this.selectedAt = DateTime.UtcNow;
+        this.lastButton = "未読";
+        this.lastSelection = "未確認";
+
+        ctx.Log.Write("納品", $"{CraftPlanner.ItemName(this.Item)} を選びます（行 {offer.Row}、所持 {owned}）");
+        GameUi.Fire(addon, true, 12, (uint)offer.Row); // 実測は UInt（Int だと型が食い違う）
+        this.Go(DeliverStep.WaitTrade, "選択が効くのを待っています");
+        return TaskResult.Running;
+    }
+
+    private TaskResult TickWaitTrade(TaskContext ctx, AtkUnitBase* addon)
+    {
+        // 右の一覧（node 31）の行数＝その品の所持数なら、狙った品が選ばれている
+        var comp = addon->GetComponentByNodeId(HeldListNodeId);
+        if (comp != null && comp->GetComponentType() == ComponentType.List)
+        {
+            var rows = ((AtkComponentList*)comp)->ListLength;
+            this.lastSelection = $"手持ちの一覧 {rows} 行 / 所持 {this.ownedBefore}";
+            if (rows > 0 && rows == this.ownedBefore)
+                return this.FireDelivery(ctx, addon, this.lastSelection);
+        }
+        else
+        {
+            this.lastSelection = $"手持ちの一覧（node {HeldListNodeId}）を取れません";
+        }
+
+        // 確かめられない間は、納品ボタンが押せる状態かで代える
+        var btn = addon->GetComponentByNodeId(TradeButtonNodeId);
+        if (btn != null && btn->GetComponentType() == ComponentType.Button && btn->OwnerNode != null)
+        {
+            var visible = btn->OwnerNode->AtkResNode.IsVisible();
+            var enabled = ((AtkComponentButton*)btn)->IsEnabled;
+            this.lastButton = $"見える={visible} 押せる={enabled}";
+            if (visible && enabled)
+                return this.FireDelivery(ctx, addon, $"納品ボタンが押せる状態（{this.lastButton}）");
+        }
+
+        var waited = DateTime.UtcNow - this.selectedAt;
+        if (waited >= TradeReadyDumpAfter && !this.dumped)
+        {
+            this.dumped = true;
+            DebugLog.Current?.Block("納品", "選んだあとの納品画面", AddonRecorder.Describe(addon));
+        }
+
+        if (waited >= TradeReadyLimit)
+            return this.Fail($"{CraftPlanner.ItemName(this.Item)} を選びましたが納品できる状態になりませんでした（ボタン: {this.lastButton} / 選択: {this.lastSelection}）");
+        return TaskResult.Running;
+    }
+
+    private TaskResult FireDelivery(TaskContext ctx, AtkUnitBase* addon, string note)
+    {
+        ctx.Log.Debug("納品", $"納品を撃ちます（{note}）");
+        GameUi.Fire(addon, true, 15, 0u); // 実測：第2引数は行番号に関わらず 0u
+        this.verifyUntil = DateTime.UtcNow + VerifyLimit;
+        this.Go(DeliverStep.Verify, "納品の反映を待っています");
+        return TaskResult.Running;
+    }
+
+    private TaskResult TickVerify(TaskContext ctx)
+    {
+        var heldAfter = Inventory.HeldCollectables();
+        var ownedAfter = heldAfter.GetValueOrDefault(this.Item);
+
+        // 狙っていない収集品が減った＝別の品を渡した。続けると被害が積み上がるので止める
+        if (heldAfter.Count > 0)
+        {
+            foreach (var (id, before) in this.heldBefore)
+            {
+                if (id != this.Item && heldAfter.GetValueOrDefault(id) < before)
+                    return this.Fail($"狙っていない収集品が減りました（{CraftPlanner.ItemName(id)} {before}→{heldAfter.GetValueOrDefault(id)}）。取り違えの恐れがあるため止めました");
+            }
+        }
 
         var scrips = Inventory.CountSpecialCurrency(this.data.RewardSpecialCurrencyId, out _);
-        var held = this.Held;
+        var ok = ownedAfter < this.ownedBefore && scrips > this.scripsBefore;
+        if (!ok && DateTime.UtcNow < this.verifyUntil)
+            return TaskResult.Running;
 
-        // 渡したあとの結果待ち
-        if (this.firedAt != DateTime.MinValue)
+        if (!ok)
         {
-            if (held < this.beforeItems && scrips > this.beforeScrips)
+            if (ownedAfter < this.ownedBefore || scrips != this.scripsBefore)
+                return this.Fail($"納品の結果が片方しか反映されていません（{CraftPlanner.ItemName(this.Item)} {this.ownedBefore}→{ownedAfter}、紫貨 {this.scripsBefore}→{scrips}）");
+
+            if (!this.retried)
             {
-                this.Delivered++;
-                ctx.Log.Write("納品", $"{CraftPlanner.ItemName(this.data.CollectableItemId)} を納品しました（紫貨 {this.beforeScrips}→{scrips}）");
-                this.firedAt = DateTime.MinValue;
-                this.selected = false;
-                this.retries = 0;
+                this.retried = true;
+                ctx.Log.Warn("納品", $"{CraftPlanner.ItemName(this.Item)} が納品されなかったので、もう一度試します");
+                this.Go(DeliverStep.Select, "選び直します");
                 return TaskResult.Running;
             }
 
-            if (held < this.beforeItems && scrips <= this.beforeScrips && DateTime.UtcNow - this.firedAt > TimeSpan.FromSeconds(2.5))
-                return this.Fail("収集品は減ったのに紫貨が増えません（想定外。止めます）");
-
-            if (DateTime.UtcNow - this.firedAt < TimeSpan.FromSeconds(2.5))
-                return TaskResult.Running;
-
-            this.firedAt = DateTime.MinValue;
-            this.selected = false;
-            if (this.retries++ >= 1)
-                return this.Fail("納品が反映されません");
-            return TaskResult.Running;
+            var values = string.Join(" / ", Inventory.Collectabilities(this.Item));
+            return this.Fail($"{CraftPlanner.ItemName(this.Item)} を納品できませんでした（所持 {this.ownedBefore} のまま・紫貨の増加なし。収集価値 {values} / ボタン: {this.lastButton} / 選択: {this.lastSelection}）");
         }
 
-        if (held == 0)
-        {
-            this.stage = 3;
-            return TaskResult.Running;
-        }
-
-        // 溢れる分は捨てられるので、上限を超えるなら渡さない
-        var cap = ScripCap(this.data.RewardSpecialCurrencyId);
-        if (cap > 0 && scrips + this.data.RewardHigh > cap)
-        {
-            ctx.Log.Warn("納品", $"紫貨が上限に近いので納品をやめます（{scrips}/{cap}）");
-            this.stage = 3;
-            return TaskResult.Running;
-        }
-
-        var row = this.FindRow(addon);
-        if (row < 0)
-            return this.Fail($"納品画面に {CraftPlanner.ItemName(this.data.CollectableItemId)} が出ていません（ジョブのタブが違う可能性）");
-
-        if (!this.selected)
-        {
-            GameUi.Fire(addon, true, 12, (uint)row);
-            this.selected = true;
-            this.NextPhase("選択しました");
-            return TaskResult.Running;
-        }
-
-        // 右の一覧（node 31）に手持ちが出たら渡す（出ない場合もあるので、少し待ったら渡す）
-        var list = (AtkComponentList*)addon->GetComponentByNodeId(31);
-        var shown = list != null && list->ListLength > 0;
-        if (!shown && this.PhaseElapsed < TimeSpan.FromSeconds(1))
-            return TaskResult.Running;
-
-        this.beforeItems = held;
-        this.beforeScrips = scrips;
-        GameUi.Fire(addon, true, 15, 0u);
-        this.firedAt = DateTime.UtcNow;
+        this.Delivered++;
+        this.retried = false;
+        this.observedReward = scrips - this.scripsBefore;
+        ctx.Log.Write("納品", $"{CraftPlanner.ItemName(this.Item)} を納品しました（{this.ownedBefore}→{ownedAfter}、紫貨 {this.scripsBefore}→{scrips} ＋{this.observedReward}）");
+        this.Go(DeliverStep.Select, string.Empty);
         return TaskResult.Running;
     }
 
-    private int FindRow(AtkUnitBase* addon)
+    private TaskResult Close(TaskContext ctx)
     {
-        var rows = GameUi.AtkInt(addon, 20) ?? 0;
-        for (var i = 0; i < rows * 2 && i < 200; i++)
+        if (!GameUi.IsVisible("CollectablesShop"))
         {
-            var id = GameUi.AtkInt(addon, 34 + i * 11);
-            if (id == null)
-                break;
-            if (id == this.data.CollectableItemId + 500000)
-                return (int)(GameUi.AtkInt(addon, 33 + i * 11) ?? -1);
+            if (this.closeAttempts > 0)
+                ctx.Log.Debug("納品", $"納品画面を閉じました（{this.closeAttempts} 手目）");
+            return TaskResult.Done;
         }
 
-        return -1;
-    }
-
-    private TaskResult Close()
-    {
-        if (GameUi.Addon("CollectablesShop") is var a && a != null)
+        // 自分が開いたものでなければ触らない
+        if (!ctx.Ownership.TryGetOwned("CollectablesShop", out var addon))
         {
-            a->Close(true);
-            if (this.PhaseElapsed > TimeSpan.FromSeconds(10))
-                GameUi.Fire(a, true, -1);
+            ctx.Log.Warn("納品", "納品画面は自分が開いたものではないため閉じません");
+            return TaskResult.Done;
+        }
+
+        if (this.TimedOut(TimeSpan.FromSeconds(10)))
+        {
+            ctx.Log.Warn("納品", "納品画面を閉じられませんでした。手で閉じてください");
+            return TaskResult.Done;
+        }
+
+        if (DateTime.UtcNow - this.lastClose < TimeSpan.FromMilliseconds(800))
             return TaskResult.Running;
-        }
+        this.lastClose = DateTime.UtcNow;
 
-        return TaskResult.Done;
+        if (++this.closeAttempts == 1)
+            addon->Close(true);
+        else
+            GameUi.Fire(addon, true, -1);
+        return TaskResult.Running;
     }
 
     public override void Cleanup(TaskContext ctx)
     {
         this.sub?.Cleanup(ctx);
-        if (GameUi.Addon("CollectablesShop") is var a && a != null)
-            a->Close(true);
+        this.sub = null;
+        if (ctx.Ownership.TryGetOwned("CollectablesShop", out var addon))
+        {
+            DebugLog.Current?.Line("操作", "止めたので納品画面を閉じます");
+            addon->Close(true);
+        }
+
+        ctx.Ownership.Clear();
     }
+
+    private readonly record struct Offer(int Row, uint ItemId);
+
+    /// <summary>
+    /// 納品画面の一覧を読む。
+    /// 欠けたまま返すと行番号を取り違えて別の品を渡すので、形が崩れていたら失敗にする。
+    /// </summary>
+    private static bool TryReadOffers(AtkUnitBase* addon, out List<Offer> offers, out string failure)
+    {
+        offers = [];
+        failure = string.Empty;
+        var total = addon->AtkValuesCount;
+        if (addon->AtkValues == null || total <= DisplayRowCountIndex)
+        {
+            failure = "画面の値を読み取れませんでした";
+            return false;
+        }
+
+        var displayRows = ReadUInt(addon->AtkValues[DisplayRowCountIndex]);
+        if (displayRows == 0)
+        {
+            failure = "納品できる品がありません";
+            return false;
+        }
+
+        var seen = new HashSet<uint>();
+        var emptyRun = 0;
+        for (var i = 0u; i < displayRows * 2; i++)
+        {
+            var indexAt = FirstEntry + (int)(i * EntryStride);
+            var itemAt = indexAt + 1;
+            if (itemAt >= total)
+                break;
+
+            var row = ReadUInt(addon->AtkValues[indexAt]);
+            var raw = ReadUInt(addon->AtkValues[itemAt]);
+            if (raw == 0)
+            {
+                // 見出しの行（次の品の番号だけが入る）。一覧の終わりにも続くので、続いたら打ち切る
+                if (offers.Count > 0 && ++emptyRun >= 3)
+                    break;
+                continue;
+            }
+
+            emptyRun = 0;
+            if (raw < CollectableOffset)
+            {
+                failure = $"位置 {i} のアイテムが収集品の形をしていません（値 {raw}）";
+                return false;
+            }
+
+            if (!seen.Add(row))
+            {
+                failure = $"行番号 {row} が複数の位置にあります";
+                return false;
+            }
+
+            offers.Add(new Offer((int)row, raw - CollectableOffset));
+            if (offers.Count >= displayRows)
+            {
+                failure = $"品目の件数が表示行数 {displayRows} を超えました";
+                return false;
+            }
+        }
+
+        if (offers.Count == 0)
+        {
+            failure = "納品できる品を1件も読み取れませんでした";
+            return false;
+        }
+
+        for (var i = 0; i < offers.Count; i++)
+        {
+            if (offers[i].Row != i)
+            {
+                failure = $"行番号が連番になっていません（{i} 番目の行番号が {offers[i].Row}）";
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static uint ReadUInt(AtkValue v) => v.Type switch
+    {
+        AtkValueType.UInt => v.UInt,
+        AtkValueType.Int => v.Int < 0 ? 0u : (uint)v.Int,
+        _ => 0u,
+    };
 
     public static int ScripCap(byte specialId)
     {
@@ -414,25 +860,52 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
 /// <summary>
 /// 紫貨で秘伝書を交換する（アイテム交換画面 InclusionShop）。
 ///
-///  ・系統と種別はエージェント（AgentInclusionShop）で選ぶ。
-///  ・品：AtkValues[298]＝件数、[299+i×18+1]＝ItemId、[+12]＝値段、[+17]＝撃つ値（画面の index）。
-///  ・撃つ：Fire(14, (uint)index, 1u) → ShopExchangeItemDialog の「交換する」（node 18）→ 出れば SelectYesno。
-///  ・成功は「秘伝書が増えた AND 紫貨が減った」。習得済みの本は撃っても何も起きないので、撃つ前に弾く。
+///  ・系統：いま開いている店の系統のうち、秘伝書の店（SpecialShop）を含む系列の系統を、行 ID で選ぶ（500ms おき）。
+///  ・種別：いま選ばれている系列の中で、その店が何番目か（InclusionShopSeries の subrow）をシートから求め、+1 したタブを選ぶ
+///    （先頭に「選択してください」が入るため。700ms おき）。一覧に目的の品が出たのを見てから撃つ。
+///  ・撃つ前：確認窓などが残っていない／index に重複が無い／目的の品がちょうど1件／値段がゲームデータと同じ／
+///    払う通貨が紫貨／画面の通貨の所持数がカバンの紫貨と同じ（ずれていれば少し待つ）／紫貨が足りる／カバンに空きがある。
+///  ・撃つ：Fire(14, (uint)index, 1u)。続いて ShopExchangeItemDialog の「交換する」（node 18）→ 品によって SelectYesno。
+///    SelectYesno は「本文に通貨名と値段がある」か「撃った後に自分の操作で開いたもので、危ない語を含まない」ときだけ「はい」。
+///  ・成功は「秘伝書が増えた AND 紫貨が減った」（15秒まで）。何も動かなければ（習得済みなど）その巻を飛ばす。片方だけなら止める。
 /// </summary>
 public sealed unsafe class ExchangeBooksTask : AutoTask
 {
-    private const uint ExchangeButtonNode = 18; // ShopExchangeItemDialog の「交換する」（ECommons）
+    private enum ExStep { Talk, Select, Fire, Outcome, Close }
+
+    private const int PinnedCurrencyIndex = 297;
+    private const int ItemCountIndex = 298;
+    private const int ItemsBase = 299;
+    private const int ItemStride = 18;
+    private const uint ExchangeButtonNode = 18; // ShopExchangeItemDialog の「交換する」（ECommons と同じ）
+
+    private static readonly TimeSpan OutcomeLimit = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan OwnedDialogWindow = TimeSpan.FromSeconds(10);
+
+    /// <summary>撃つ前に開いていてはいけない画面。</summary>
+    private static readonly string[] BlockingAddons =
+        ["ShopExchangeCurrencyDialog", "ShopExchangeItemDialog", "SelectYesno", "SelectString", "SelectIconString", "Talk"];
+
+    /// <summary>本文にこれが出ていたら、交換の確認ではないとみなして押さない。</summary>
+    private static readonly string[] DangerousWords = ["捨て", "破棄", "削除", "分解", "精製", "売却", "ログアウト", "タイトル", "トレード"];
 
     private readonly BookData data;
     private readonly NpcSpot npc;
     private readonly Queue<BookOffer> queue;
+
+    private ExStep step = ExStep.Talk;
     private AutoTask? sub;
-    private int stage;
     private BookOffer? current;
+    private uint scripItemId;
     private int beforeBooks;
     private int beforeScrips;
     private DateTime firedAt = DateTime.MinValue;
     private DateTime lastClick = DateTime.MinValue;
+    private DateTime lastCategory = DateTime.MinValue;
+    private DateTime lastSubCategory = DateTime.MinValue;
+    private DateTime lastUnmatchedLog = DateTime.MinValue;
+    private DateTime lastClose = DateTime.MinValue;
+    private int closeAttempts;
 
     public ExchangeBooksTask(BookData data, NpcSpot npc, IEnumerable<BookOffer> books)
     {
@@ -443,26 +916,23 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
 
     public override string Name => "秘伝書の交換";
 
+    protected override TaskResult OnStart(TaskContext ctx)
+    {
+        ctx.Ownership.Clear();
+        ctx.Ownership.IsClaiming = true;
+        return TaskResult.Running;
+    }
+
     protected override TaskResult Tick(TaskContext ctx)
     {
-        switch (this.stage)
+        switch (this.step)
         {
-            case 0:
+            case ExStep.Talk:
             {
-                if (this.queue.Count == 0)
+                if (!this.PickNext(ctx))
                     return TaskResult.Done;
 
-                var hints = new List<string>();
-                var cats = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.InclusionShopCategory>();
-                foreach (var c in this.data.BookCategories)
-                    if (cats.TryGetRow(c, out var row))
-                        hints.Add(row.Name.ExtractText());
-                var shops = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.SpecialShop>();
-                foreach (var o in this.queue)
-                    if (shops.TryGetRow(o.ShopId, out var s))
-                        hints.Add(s.Name.ExtractText());
-
-                this.sub ??= new TalkToNpcTask(this.npc, IsShopReady, "スクリップ取引窓口", hints.Distinct());
+                this.sub ??= new TalkToNpcTask(this.npc, IsShopReady, "スクリップ取引窓口", this.MenuHints());
                 var r = this.sub.Step(ctx);
                 this.Status = this.sub.Status;
                 if (r == TaskResult.Running)
@@ -472,20 +942,66 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
                 this.sub = null;
                 if (failed != null)
                     return this.Fail(failed);
-                this.stage = 1;
-                this.NextPhase("系統を選びます");
+                this.Go(ExStep.Select, "系統と種別を選びます");
                 return TaskResult.Running;
             }
 
-            case 1:
-                return this.SelectCategory();
+            case ExStep.Select:
+                return this.TickSelect(ctx);
 
-            case 2:
-                return this.Exchange(ctx);
+            case ExStep.Fire:
+                return this.TickFire(ctx);
+
+            case ExStep.Outcome:
+                return this.TickOutcome(ctx);
 
             default:
-                return this.Close();
+                return this.Close(ctx);
         }
+    }
+
+    private void Go(ExStep s, string status)
+    {
+        this.step = s;
+        this.NextPhase(status);
+    }
+
+    /// <summary>次に交換する巻を決める。習得済み・所持済みは飛ばす。無ければ false。</summary>
+    private bool PickNext(TaskContext ctx)
+    {
+        while (this.current == null || IsLearned(this.current.TomeId) || Inventory.CountNow(this.current.BookItemId) > 0)
+        {
+            if (this.current != null)
+                ctx.Log.Debug("交換", $"{CraftPlanner.ItemName(this.current.BookItemId)} は習得済みか所持済みなので飛ばします");
+            if (this.queue.Count == 0)
+            {
+                this.current = null;
+                return false;
+            }
+
+            this.current = this.queue.Dequeue();
+        }
+
+        return true;
+    }
+
+    /// <summary>会話メニューの手がかり：店の名前（SpecialShop.Name）→ 系統の名前の順。</summary>
+    private IEnumerable<string> MenuHints()
+    {
+        var shops = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.SpecialShop>();
+        var cats = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.InclusionShopCategory>();
+        var offers = new List<BookOffer>();
+        if (this.current != null)
+            offers.Add(this.current);
+        offers.AddRange(this.queue);
+
+        foreach (var o in offers)
+            if (shops.TryGetRow(o.ShopId, out var s))
+                yield return s.Name.ExtractText();
+
+        foreach (var c in this.data.BookCategories)
+            if (cats.TryGetRow(c, out var row))
+                yield return row.Name.ExtractText();
     }
 
     private static bool IsShopReady()
@@ -496,212 +1012,397 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
         return agent != null && agent->IsAgentActive() && agent->Data != null && agent->Data->IsShopReady;
     }
 
-    /// <summary>系統と種別を選び、目的の本が一覧に出るまで待つ。</summary>
-    private TaskResult SelectCategory()
+    // ---- 系統・種別 ----
+
+    private TaskResult TickSelect(TaskContext ctx)
     {
+        if (!this.PickNext(ctx))
+        {
+            this.Go(ExStep.Close, "交換画面を閉じます");
+            return TaskResult.Running;
+        }
+
         if (!IsShopReady())
         {
-            if (this.TimedOut(TimeSpan.FromSeconds(10)))
-                return this.Fail("アイテム交換の画面が閉じられました");
+            if (this.TimedOut(TimeSpan.FromSeconds(30)))
+                return this.Fail("アイテム交換の画面が開いていません");
             return TaskResult.Running;
         }
-
-        if (GameUi.IsReady("InclusionShop", out var addon) && this.FindBook(addon, this.queue.Peek().BookItemId).Index >= 0)
-        {
-            this.stage = 2;
-            this.NextPhase("交換します");
-            return TaskResult.Running;
-        }
-
-        if (this.TimedOut(TimeSpan.FromSeconds(10)))
-            return this.Fail("交換画面に秘伝書が出てきません（系統・種別を選べませんでした）");
-
-        if (DateTime.UtcNow - this.lastClick < TimeSpan.FromMilliseconds(700))
-            return TaskResult.Running;
-        this.lastClick = DateTime.UtcNow;
 
         var agent = AgentInclusionShop.Instance();
         var d = agent->Data;
+        var shopId = this.current!.ShopId;
 
-        // 系統：表示位置 i → 内部の並び → 系統の行
+        // いま開いている店の系統のうち、秘伝書の店を含む系列の系統（表示位置）
+        var series = Svc.Data.GetSubrowExcelSheet<Lumina.Excel.Sheets.InclusionShopSeries>();
+        int targetPos = -1;
+        ushort targetSeries = 0;
         for (byte i = 0; i < d->CategoryCount && i < 30; i++)
         {
             var mapped = d->CategoryIndexMap[i];
             if (mapped >= 30)
                 continue;
             var cat = d->Categories[mapped];
-            if (!this.data.BookCategories.Contains(cat.InclusionShopRowId))
-                continue;
-
-            if (d->SelectedCategoryIndex != i)
+            if (SeriesIndexOf(series, cat.InclusionShopSeriesId, shopId) >= 0)
             {
-                agent->SelectCategory(i);
-                return TaskResult.Running;
+                targetPos = i;
+                targetSeries = cat.InclusionShopSeriesId;
+                break;
+            }
+        }
+
+        if (targetPos < 0)
+            return this.Fail($"この窓口の交換画面に {CraftPlanner.ItemName(this.current.BookItemId)} の店（SpecialShop {shopId}）を含む系統がありません");
+
+        if (d->SelectedCategoryIndex != targetPos)
+        {
+            if (DateTime.UtcNow - this.lastCategory >= TimeSpan.FromMilliseconds(500))
+            {
+                this.lastCategory = DateTime.UtcNow;
+                ctx.Log.Debug("交換", $"系統を選びます（表示位置 {targetPos}）");
+                agent->SelectCategory((byte)targetPos);
             }
 
-            // 種別：その系統の系列で秘伝書の店が何番目か（先頭に「選択してください」が入るので +1）
-            if (this.data.BookSeriesSubrow.TryGetValue(cat.InclusionShopSeriesId, out var subrow))
-            {
-                var tab = (byte)(subrow + 1);
-                if (d->SelectedSubCategoryTab != tab)
-                    d->SelectSubCategory(tab);
-            }
+            return this.TimedOut(TimeSpan.FromSeconds(30)) ? this.Fail("系統を切り替えられませんでした") : TaskResult.Running;
+        }
 
+        // 系統は合っている。目的の品が一覧に出ていれば撃つ段へ
+        if (GameUi.IsReady("InclusionShop", out var addon) && ReadEntries(addon, out var entries, out _, out _)
+            && entries.Any(e => e.ItemId == this.current.BookItemId))
+        {
+            this.Go(ExStep.Fire, "交換の直前確認をしています");
             return TaskResult.Running;
         }
 
-        return this.Fail("この窓口の交換画面に、秘伝書の系統がありません");
+        // 出ていなければ種別を切り替える（切り替えたことを成功にせず、一覧が入れ替わるのを見てから判断する）
+        if (DateTime.UtcNow - this.lastSubCategory >= TimeSpan.FromMilliseconds(700))
+        {
+            this.lastSubCategory = DateTime.UtcNow;
+            var index = SeriesIndexOf(series, targetSeries, shopId);
+            var tab = (byte)(index + 1); // 先頭の「選択してください」の分ずらす
+            if (index < 0 || tab >= d->VisibleSubCategoryCount)
+            {
+                ctx.Log.Debug("交換", $"種別 {tab} は選べません（表示 {d->VisibleSubCategoryCount} 件）");
+            }
+            else if (d->SelectedSubCategoryTab != tab)
+            {
+                ctx.Log.Debug("交換", $"種別を選びます（タブ {tab}）");
+                d->SelectSubCategory(tab);
+            }
+        }
+
+        if (this.TimedOut(TimeSpan.FromSeconds(30)))
+            return this.Fail($"アイテム交換画面に {CraftPlanner.ItemName(this.current.BookItemId)} が出てきませんでした");
+        return TaskResult.Running;
     }
 
-    private (int Index, uint Price) FindBook(AtkUnitBase* addon, uint itemId)
+    /// <summary>系列（InclusionShopSeries の行）の中で、その店が何番目か。無ければ -1。</summary>
+    private static int SeriesIndexOf(Lumina.Excel.SubrowExcelSheet<Lumina.Excel.Sheets.InclusionShopSeries> sheet, uint seriesId, uint shopId)
     {
-        var count = GameUi.AtkInt(addon, 298) ?? 0;
-        for (var i = 0; i < count && i < 60; i++)
-        {
-            var baseIdx = 299 + (i * 18);
-            if (GameUi.AtkInt(addon, baseIdx + 1) != itemId)
-                continue;
-            var price = (uint)(GameUi.AtkInt(addon, baseIdx + 12) ?? 0);
-            var index = (int)(GameUi.AtkInt(addon, baseIdx + 17) ?? -1);
-            return (index, price);
-        }
-
-        return (-1, 0);
+        if (!sheet.TryGetRow(seriesId, out var rows))
+            return -1;
+        for (var i = 0; i < rows.Count; i++)
+            if (rows[i].SpecialShop.RowId == shopId)
+                return i;
+        return -1;
     }
 
-    private TaskResult Exchange(TaskContext ctx)
+    // ---- 撃つ ----
+
+    private TaskResult TickFire(TaskContext ctx)
     {
-        var books = this.current == null ? 0 : Inventory.CountNow(this.current.BookItemId);
-        var scrips = Inventory.CountSpecialCurrency(this.data.RewardSpecialCurrencyId, out var scripItem);
+        var offer = this.current!;
 
-        // 撃ったあとの確認と結果待ち
-        if (this.firedAt != DateTime.MinValue)
+        // 残っている確認窓などがあれば、自分のものは閉じてから。他人のものなら止める（押し合いにしない）
+        foreach (var name in BlockingAddons)
         {
-            if (books > this.beforeBooks && scrips < this.beforeScrips)
+            if (!GameUi.IsReady(name, out _))
+                continue;
+            if (ctx.Ownership.TryGetOwned(name, out var own))
             {
-                ctx.Log.Write("交換", $"{CraftPlanner.ItemName(this.current!.BookItemId)} を交換しました（紫貨 {this.beforeScrips}→{scrips}）");
-                this.firedAt = DateTime.MinValue;
-                this.current = null;
-                return TaskResult.Running;
-            }
-
-            // 確認ダイアログ
-            if (GameUi.IsReady("ShopExchangeItemDialog", out var dialog))
-            {
-                if (DateTime.UtcNow - this.lastClick > TimeSpan.FromMilliseconds(400))
+                if (DateTime.UtcNow - this.lastClose >= TimeSpan.FromMilliseconds(500))
                 {
-                    GameUi.ClickButton(dialog, ExchangeButtonNode);
-                    this.lastClick = DateTime.UtcNow;
+                    this.lastClose = DateTime.UtcNow;
+                    DebugLog.Current?.Line("操作", $"撃つ前に残っていた自分の {name} を閉じます");
+                    GameUi.Fire(own, true, -1);
                 }
 
-                return TaskResult.Running;
+                return this.TimedOut(TimeSpan.FromSeconds(10)) ? this.Fail($"{name} が閉じません") : TaskResult.Running;
             }
 
-            var text = GameUi.YesnoText(out var yesno);
-            if (text != null && DateTime.UtcNow - this.firedAt < TimeSpan.FromSeconds(10))
-            {
-                // 撃った直後に出たもので、通貨名と値段の両方を含むときだけ「はい」
-                var scripName = CraftPlanner.ItemName(scripItem);
-                if (text.Contains(scripName, StringComparison.Ordinal) && text.Contains(this.current!.Price.ToString(), StringComparison.Ordinal)
-                    && DateTime.UtcNow - this.lastClick > TimeSpan.FromMilliseconds(400))
-                {
-                    yesno->FireCallbackInt(0);
-                    this.lastClick = DateTime.UtcNow;
-                }
-
-                return TaskResult.Running;
-            }
-
-            if (DateTime.UtcNow - this.firedAt > TimeSpan.FromSeconds(15))
-            {
-                if (books == this.beforeBooks && scrips == this.beforeScrips)
-                {
-                    ctx.Log.Warn("交換", $"{CraftPlanner.ItemName(this.current!.BookItemId)} の交換がゲームに受け付けられませんでした（習得済みの可能性）。この巻は飛ばします");
-                    this.firedAt = DateTime.MinValue;
-                    this.current = null;
-                    return TaskResult.Running;
-                }
-
-                return this.Fail("交換の結果が片方しか反映されていません（想定外。止めます）");
-            }
-
-            return TaskResult.Running;
-        }
-
-        // 次の巻
-        if (this.current == null)
-        {
-            if (this.queue.Count == 0)
-            {
-                this.stage = 3;
-                this.NextPhase("閉じます");
-                return TaskResult.Running;
-            }
-
-            this.current = this.queue.Dequeue();
-        }
-
-        if (IsLearned(this.current.TomeId) || Inventory.CountNow(this.current.BookItemId) > 0)
-        {
-            this.current = null;
-            return TaskResult.Running;
+            return this.Fail($"{name} が開いています（自分が開いたものではないので触りません）。閉じてから始めてください");
         }
 
         if (!GameUi.IsReady("InclusionShop", out var addon))
             return this.Fail("アイテム交換の画面が閉じられました");
+        if (!ReadEntries(addon, out var entries, out var currencyOnScreen, out var readFailure))
+            return this.Fail(readFailure);
 
-        var (index, price) = this.FindBook(addon, this.current.BookItemId);
-        if (index < 0)
-            return this.Fail($"交換画面に {CraftPlanner.ItemName(this.current.BookItemId)} がありません");
-        if (price != this.current.Price)
-            return this.Fail($"値段がゲームデータと違います（画面 {price} / データ {this.current.Price}）");
-        if (scrips < price)
-            return this.Fail($"紫貨が足りません（{scrips}/{price}）");
+        if (entries.Select(e => e.Index).Distinct().Count() != entries.Count)
+            return this.Fail("交換画面の index に重複があります（配置がずれている可能性）");
 
-        // 画面の所持通貨が紫貨の所持数と一致するか（別の通貨の画面を撃たないための確認）
-        if (GameUi.AtkInt(addon, 297) is { } shown && shown != scrips)
-            return this.Fail($"画面の通貨（{shown}）が紫貨の所持数（{scrips}）と合いません");
+        var matches = entries.Where(e => e.ItemId == offer.BookItemId).ToList();
+        if (matches.Count != 1)
+            return this.Fail(matches.Count == 0
+                ? $"交換画面に {CraftPlanner.ItemName(offer.BookItemId)} がありません（読めたのは {entries.Count} 件）"
+                : $"交換画面に {CraftPlanner.ItemName(offer.BookItemId)} が {matches.Count} 件あり、どれか決められません");
 
-        if (Inventory.FreeBagSlots() < 3)
-            return this.Fail("カバンの空きが足りません（3枠以上空けてください）");
+        var entry = matches[0];
+        if (entry.Cost != offer.Price)
+            return this.Fail($"値段がゲームデータと違います（画面 {entry.Cost} / データ {offer.Price}）");
 
-        this.beforeBooks = Inventory.CountNow(this.current.BookItemId);
+        var scrips = Inventory.CountSpecialCurrency(offer.SpecialCurrencyId, out this.scripItemId);
+        if (ResolveCurrency(entry.CostItem) is not { } costItem || costItem != this.scripItemId)
+            return this.Fail($"払う通貨が紫貨ではありません（画面の値 {entry.CostItem}）");
+
+        // 画面の所持通貨がカバンの紫貨と同じか（別の通貨の画面を撃たないため）。更新が遅れることがあるので少し待つ
+        if (currencyOnScreen != scrips)
+        {
+            this.Status = $"画面の通貨（{currencyOnScreen}）とカバンの紫貨（{scrips}）がそろうのを待っています";
+            return this.TimedOut(TimeSpan.FromSeconds(5))
+                ? this.Fail($"画面の通貨（{currencyOnScreen}）がカバンの紫貨（{scrips}）と合いません")
+                : TaskResult.Running;
+        }
+
+        if (scrips < offer.Price)
+            return this.Fail($"紫貨が足りません（{scrips}/{offer.Price}）");
+        if (Inventory.FreeBagSlots() < 1)
+            return this.Fail("カバンに空きがありません");
+
+        this.beforeBooks = Inventory.CountNow(offer.BookItemId);
         this.beforeScrips = scrips;
-        GameUi.Fire(addon, true, 14, (uint)index, 1u);
+        ctx.Log.Write("交換", $"{CraftPlanner.ItemName(offer.BookItemId)} を交換します（紫貨 {offer.Price}・index {entry.Index}）");
+        GameUi.Fire(addon, true, 14, entry.Index, 1u); // 実測：コマンドは Int、index と個数は UInt
         this.firedAt = DateTime.UtcNow;
+        this.Go(ExStep.Outcome, "確認に答えています");
         return TaskResult.Running;
     }
 
-    private TaskResult Close()
-    {
-        foreach (var name in new[] { "SelectYesno", "ShopExchangeItemDialog" })
-        {
-            if (GameUi.Addon(name) is var a && a != null)
-            {
-                GameUi.Fire(a, true, -1);
-                return TaskResult.Running;
-            }
-        }
+    // ---- 確認と結果 ----
 
-        if (GameUi.Addon("InclusionShop") is var s && s != null)
+    private TaskResult TickOutcome(TaskContext ctx)
+    {
+        var offer = this.current!;
+        var books = Inventory.CountNow(offer.BookItemId);
+        var scrips = Inventory.CountSpecialCurrency(offer.SpecialCurrencyId, out _);
+
+        if (books > this.beforeBooks && scrips <= this.beforeScrips - (int)offer.Price)
         {
-            s->Close(true);
-            if (this.PhaseElapsed > TimeSpan.FromSeconds(10))
-                return TaskResult.Done;
+            ctx.Log.Write("交換", $"{CraftPlanner.ItemName(offer.BookItemId)} を交換しました（紫貨 {this.beforeScrips}→{scrips}）");
+            this.current = null;
+            this.Go(ExStep.Select, string.Empty);
             return TaskResult.Running;
         }
 
-        return TaskResult.Done;
+        // 個数を選ぶ画面は想定外（1個ずつしか撃たない）。閉じて止める
+        if (GameUi.IsReady("ShopExchangeCurrencyDialog", out var qty))
+        {
+            GameUi.Fire(qty, true, -1);
+            return this.Fail("個数を選ぶ画面が出ました（想定外）。閉じて止めました");
+        }
+
+        // 交換の確認（撃った直後に出る）。押しても消えないまま時間が来たら、閉じて止める
+        if (GameUi.IsReady("ShopExchangeItemDialog", out var dialog))
+        {
+            if (DateTime.UtcNow - this.firedAt >= OutcomeLimit)
+            {
+                DebugLog.Current?.Block("交換", "消えない交換の確認", AddonRecorder.Describe(dialog));
+                GameUi.Fire(dialog, true, -1);
+                return this.Fail("交換の確認（交換する）を押しても進みませんでした。確認を閉じて止めました");
+            }
+
+            if (DateTime.UtcNow - this.lastClick >= TimeSpan.FromMilliseconds(400))
+            {
+                this.lastClick = DateTime.UtcNow;
+                GameUi.ClickButton(dialog, ExchangeButtonNode);
+            }
+
+            return TaskResult.Running;
+        }
+
+        // 品によっては、さらに「はい／いいえ」が続く
+        if (this.TryFindConfirm(ctx, offer, out var yesno, out var body))
+        {
+            if (DateTime.UtcNow - this.firedAt >= OutcomeLimit)
+                return this.Fail($"確認に「はい」と答えても進みませんでした：{body}");
+
+            if (DateTime.UtcNow - this.lastClick >= TimeSpan.FromMilliseconds(500))
+            {
+                this.lastClick = DateTime.UtcNow;
+                ctx.Log.Write("交換", $"確認に「はい」と答えます：{body}");
+                if (!GameUi.ClickYes(yesno))
+                    return this.Fail($"確認の「はい」が押せる状態ではありません：{body}");
+            }
+
+            return TaskResult.Running;
+        }
+
+        // 画面が閉じた（話しかけられる距離から外れた等）なら、待っても結果は出ない
+        if (!GameUi.IsVisible("InclusionShop"))
+            return this.Fail("交換の途中でアイテム交換の画面が閉じました（話しかけられる距離から外れた可能性）");
+
+        if (DateTime.UtcNow - this.firedAt < OutcomeLimit)
+            return TaskResult.Running;
+
+        if (books == this.beforeBooks && scrips == this.beforeScrips)
+        {
+            // 何も動いていない＝ゲームが受け付けなかった（習得済みの秘伝書は、確認まで通って何も起きない：実測）
+            ctx.Log.Warn("交換", $"{CraftPlanner.ItemName(offer.BookItemId)} は交換されませんでした（所持数が動いていません。習得済みの可能性）。この巻は飛ばします");
+            this.current = null;
+            this.Go(ExStep.Select, string.Empty);
+            return TaskResult.Running;
+        }
+
+        return this.Fail($"交換の結果が片方しか反映されていません（{CraftPlanner.ItemName(offer.BookItemId)} {this.beforeBooks}→{books}、紫貨 {this.beforeScrips}→{scrips}）");
+    }
+
+    /// <summary>
+    /// 押してよい SelectYesno を2段で探す。
+    ///  1) 本文に通貨名と値段の両方がある。
+    ///  2) 撃った後に自分の操作で開いたもので、撃ってから 10 秒以内、かつ危ない語を含まない（本文は記録に残す）。
+    /// </summary>
+    private bool TryFindConfirm(TaskContext ctx, BookOffer offer, out AtkUnitBase* addon, out string body)
+    {
+        addon = null;
+        body = GameUi.YesnoText(out var yesno) ?? string.Empty;
+        if (yesno == null)
+            return false;
+
+        var currencyName = CraftPlanner.ItemName(this.scripItemId);
+        var shown = body;
+        var priceTexts = new[] { offer.Price.ToString(), offer.Price.ToString("N0") };
+        if (currencyName.Length > 0 && shown.Contains(currencyName, StringComparison.Ordinal)
+            && priceTexts.Any(p => shown.Contains(p, StringComparison.Ordinal)))
+        {
+            addon = yesno;
+            return true;
+        }
+
+        if (DateTime.UtcNow - this.firedAt <= OwnedDialogWindow && ctx.Ownership.TryGetOwnedSince("SelectYesno", this.firedAt, out var own))
+        {
+            var text = body;
+            var bad = DangerousWords.FirstOrDefault(w => text.Contains(w, StringComparison.Ordinal));
+            if (bad != null)
+            {
+                ctx.Log.Warn("交換", $"確認に「{bad}」が含まれるので押しません：{body}");
+                return false;
+            }
+
+            ctx.Log.Warn("交換", $"確認の本文が想定と違いますが、撃った直後に自分の操作で開いたものなので答えます：{body}（探した語：{currencyName}・{offer.Price}）");
+            addon = own;
+            return true;
+        }
+
+        if (DateTime.UtcNow - this.lastUnmatchedLog >= TimeSpan.FromSeconds(5))
+        {
+            this.lastUnmatchedLog = DateTime.UtcNow;
+            ctx.Log.Warn("交換", $"確認が出ていますが、交換のものと判断できないので押しません：{body}");
+        }
+
+        return false;
+    }
+
+    // ---- 閉じる ----
+
+    private TaskResult Close(TaskContext ctx)
+    {
+        if (!GameUi.IsVisible("InclusionShop"))
+            return TaskResult.Done;
+
+        if (!ctx.Ownership.TryGetOwned("InclusionShop", out var addon))
+        {
+            ctx.Log.Warn("交換", "アイテム交換の画面は自分が開いたものではないため閉じません");
+            return TaskResult.Done;
+        }
+
+        if (this.TimedOut(TimeSpan.FromSeconds(10)))
+        {
+            ctx.Log.Warn("交換", "アイテム交換の画面を閉じられませんでした。手で閉じてください");
+            return TaskResult.Done;
+        }
+
+        if (DateTime.UtcNow - this.lastClose < TimeSpan.FromMilliseconds(800))
+            return TaskResult.Running;
+        this.lastClose = DateTime.UtcNow;
+
+        if (++this.closeAttempts == 1)
+            addon->Close(true);
+        else
+            GameUi.Fire(addon, true, -1);
+        return TaskResult.Running;
     }
 
     public override void Cleanup(TaskContext ctx)
     {
         this.sub?.Cleanup(ctx);
-        foreach (var name in new[] { "SelectYesno", "ShopExchangeItemDialog" })
-            if (GameUi.Addon(name) is var a && a != null)
-                GameUi.Fire(a, true, -1);
-        if (GameUi.Addon("InclusionShop") is var s && s != null)
-            s->Close(true);
+        this.sub = null;
+
+        // 自分が開いたものだけを閉じる（確認窓は「いいえ」相当の -1、交換画面は Close）
+        foreach (var name in new[] { "SelectYesno", "ShopExchangeCurrencyDialog", "ShopExchangeItemDialog" })
+        {
+            if (ctx.Ownership.TryGetOwned(name, out var own))
+            {
+                DebugLog.Current?.Line("操作", $"止めたので {name} を閉じます");
+                GameUi.Fire(own, true, -1);
+            }
+        }
+
+        if (ctx.Ownership.TryGetOwned("InclusionShop", out var shop))
+        {
+            DebugLog.Current?.Line("操作", "止めたのでアイテム交換の画面を閉じます");
+            shop->Close(true);
+        }
+
+        ctx.Ownership.Clear();
+    }
+
+    // ---- 画面の読み取り ----
+
+    private readonly record struct Entry(uint ItemId, uint CostItem, uint Cost, uint Index);
+
+    /// <summary>
+    /// 交換画面の品を読む（AddonInclusionShop の配置）。
+    /// [297]＝表示中の通貨の所持数、[298]＝件数、[299+i×18 +1]＝ItemId、[+6]＝払う通貨、[+12]＝値段、[+17]＝撃つ index。
+    /// </summary>
+    private static bool ReadEntries(AtkUnitBase* addon, out List<Entry> entries, out long currencyOnScreen, out string failure)
+    {
+        entries = [];
+        currencyOnScreen = GameUi.AtkInt(addon, PinnedCurrencyIndex) ?? -1;
+        failure = string.Empty;
+
+        if (GameUi.AtkInt(addon, ItemCountIndex) is not { } count)
+        {
+            failure = "交換画面の件数を読めません";
+            return false;
+        }
+
+        for (var i = 0; i < Math.Min(count, 60); i++)
+        {
+            var b = ItemsBase + (i * ItemStride);
+            var item = GameUi.AtkInt(addon, b + 1);
+            if (item is null or 0)
+                continue;
+            var costItem = GameUi.AtkInt(addon, b + 6);
+            var cost = GameUi.AtkInt(addon, b + 12);
+            var index = GameUi.AtkInt(addon, b + 17);
+            if (costItem == null || cost == null || index == null)
+                continue;
+            entries.Add(new Entry((uint)item.Value, (uint)costItem.Value, (uint)cost.Value, (uint)index.Value));
+        }
+
+        return true;
+    }
+
+    /// <summary>画面の「払う通貨」の値をアイテム ID に直す（8 以上ならそのまま、未満なら特殊通貨の番号）。</summary>
+    private static uint? ResolveCurrency(uint value)
+    {
+        if (value >= 8)
+            return value;
+        var cm = CurrencyManager.Instance();
+        if (cm == null)
+            return null;
+        var id = cm->GetItemIdBySpecialId((byte)value);
+        return id == 0 ? null : id;
     }
 
     public static bool IsLearned(uint tomeId)
@@ -719,13 +1420,14 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
 }
 
 /// <summary>
-/// 秘伝書を使って習得する。確認（SelectYesno）が出たら、本の名前を含むときだけ「はい」。
+/// 秘伝書を使って習得する。確認（SelectYesno）が出たら、本の名前を含むときだけ「はい」（押せる状態のボタンだけを押す）。
 /// 成功は「習得済みになった AND 本が減った」。
 /// </summary>
 public sealed unsafe class UseBooksTask : AutoTask
 {
     private readonly Queue<BookOffer> queue;
     private BookOffer? current;
+    private int ownedBefore;
     private DateTime usedAt = DateTime.MinValue;
     private DateTime lastClick = DateTime.MinValue;
 
@@ -736,6 +1438,13 @@ public sealed unsafe class UseBooksTask : AutoTask
 
     public override string Name => "秘伝書を読む";
 
+    protected override TaskResult OnStart(TaskContext ctx)
+    {
+        ctx.Ownership.Clear();
+        ctx.Ownership.IsClaiming = true;
+        return TaskResult.Running;
+    }
+
     protected override TaskResult Tick(TaskContext ctx)
     {
         if (this.current == null)
@@ -744,43 +1453,76 @@ public sealed unsafe class UseBooksTask : AutoTask
                 return TaskResult.Done;
             this.current = this.queue.Dequeue();
             this.usedAt = DateTime.MinValue;
+            this.NextPhase(string.Empty);
         }
 
+        var name = CraftPlanner.ItemName(this.current.BookItemId);
         var learned = ExchangeBooksTask.IsLearned(this.current.TomeId);
         var owned = Inventory.CountNow(this.current.BookItemId);
 
-        if (learned)
-        {
-            if (this.usedAt != DateTime.MinValue)
-                ctx.Log.Write("秘伝書", $"{CraftPlanner.ItemName(this.current.BookItemId)} を読みました");
-            this.current = null;
-            return TaskResult.Running;
-        }
-
         if (this.usedAt == DateTime.MinValue)
         {
-            if (owned == 0)
-                return this.Fail($"{CraftPlanner.ItemName(this.current.BookItemId)} を持っていません");
-            if (!GameUi.PlayerFree())
+            if (learned)
+            {
+                ctx.Log.Debug("秘伝書", $"{name} は習得済みです");
+                this.current = null;
                 return TaskResult.Running;
+            }
 
+            if (owned == 0)
+                return this.Fail($"{name} を持っていません");
+
+            if (!GameUi.PlayerFree())
+            {
+                this.Status = "動ける状態になるのを待っています";
+                return this.TimedOut(TimeSpan.FromSeconds(60)) ? this.Fail("キャラクターが動ける状態にならないため、秘伝書を使えません") : TaskResult.Running;
+            }
+
+            this.ownedBefore = owned;
+            ctx.Log.Write("秘伝書", $"{name} を使います");
             AgentInventoryContext.Instance()->UseItem(this.current.BookItemId);
             this.usedAt = DateTime.UtcNow;
             return TaskResult.Running;
         }
 
+        // 習得済みになった AND 本が減った
+        if (learned && owned < this.ownedBefore)
+        {
+            ctx.Log.Write("秘伝書", $"{name} を読みました");
+            this.current = null;
+            return TaskResult.Running;
+        }
+
         var text = GameUi.YesnoText(out var yesno);
-        if (text != null && text.Contains(CraftPlanner.ItemName(this.current.BookItemId), StringComparison.Ordinal)
+        if (text != null && text.Contains(name, StringComparison.Ordinal)
             && DateTime.UtcNow - this.lastClick > TimeSpan.FromMilliseconds(400))
         {
-            yesno->FireCallbackInt(0);
             this.lastClick = DateTime.UtcNow;
+            ctx.Log.Write("秘伝書", $"確認に「はい」と答えます：{text}");
+            if (!GameUi.ClickYes(yesno))
+                return this.Fail($"確認の「はい」が押せる状態ではありません：{text}");
             return TaskResult.Running;
         }
 
         if (DateTime.UtcNow - this.usedAt > TimeSpan.FromSeconds(15))
-            return this.Fail($"{CraftPlanner.ItemName(this.current.BookItemId)} を読めませんでした");
+        {
+            return this.Fail(learned
+                ? $"{name} は習得済みになりましたが、本が減っていません（想定外）"
+                : $"{name} を読めませんでした（使っても習得済みになりません）");
+        }
 
         return TaskResult.Running;
+    }
+
+    public override void Cleanup(TaskContext ctx)
+    {
+        // 自分が使って出た確認が残っていれば閉じる
+        if (this.usedAt != DateTime.MinValue && ctx.Ownership.TryGetOwnedSince("SelectYesno", this.usedAt, out var own))
+        {
+            DebugLog.Current?.Line("操作", "止めたので秘伝書の確認を閉じます");
+            GameUi.Fire(own, true, -1);
+        }
+
+        ctx.Ownership.Clear();
     }
 }

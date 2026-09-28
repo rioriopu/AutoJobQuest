@@ -87,6 +87,13 @@ public sealed class GoToInnTask : AutoTask
         this.NextPhase("Lifestream に宿屋への移動を頼みました");
         return TaskResult.Running;
     }
+
+    public override void Cleanup(TaskContext ctx)
+    {
+        // こちらが頼んだ宿屋への移動がまだ動いていれば止める（止めたのに宿屋へ向かい続けないように）
+        if (this.requested && !InGridaniaInn() && ctx.Lifestream.IsBusy() == true)
+            ctx.Lifestream.Abort();
+    }
 }
 
 /// <summary>
@@ -106,6 +113,9 @@ public sealed class CraftOneTask : AutoTask
     private bool requested;
     private bool sawBusy;
     private bool collectable;
+
+    // 作る前の材料の所持数（「材料が減った」を確かめるため）
+    private readonly Dictionary<uint, int> ingredientsBefore = [];
 
     public CraftOneTask(PlannedCraft craft)
     {
@@ -135,6 +145,7 @@ public sealed class CraftOneTask : AutoTask
         foreach (var (ing, amount) in CraftPlanner.Ingredients(recipe))
         {
             var have = inv.CountAll(ing);
+            this.ingredientsBefore[ing] = have;
             if (have < amount * this.craft.Crafts)
                 ctx.Log.Warn("製作", $"{CraftPlanner.ItemName(ing)} が {have}/{amount * this.craft.Crafts} しかありません（作れる分だけ作ります）");
         }
@@ -189,8 +200,19 @@ public sealed class CraftOneTask : AutoTask
         this.Made = this.CountMade(inv) - this.beforeAll;
         var madeHq = inv.CountHq(this.craft.ItemId) - this.beforeHq;
 
+        // 減った AND 増えた（完成品の数だけでは、手持ちの移動などを製作と取り違える）
+        var used = this.ingredientsBefore.Where(kv => inv.CountAll(kv.Key) < kv.Value)
+            .Select(kv => $"{CraftPlanner.ItemName(kv.Key)} {kv.Value}→{inv.CountAll(kv.Key)}").ToList();
+
         if (this.Made <= 0)
-            return this.Fail($"{CraftPlanner.ItemName(this.craft.ItemId)} が1つも増えませんでした（材料不足か、Artisan が止まった可能性）");
+        {
+            return this.Fail(used.Count > 0
+                ? $"{CraftPlanner.ItemName(this.craft.ItemId)} が1つも増えませんでしたが、材料は減っています（製作の失敗の可能性：{string.Join("、", used)}）"
+                : $"{CraftPlanner.ItemName(this.craft.ItemId)} が1つも増えませんでした（材料不足か、Artisan が止まった可能性）");
+        }
+
+        if (used.Count == 0 && this.ingredientsBefore.Count > 0)
+            return this.Fail($"{CraftPlanner.ItemName(this.craft.ItemId)} は {this.Made} 個増えましたが、材料が減っていません（製作ではない増え方。想定外なので止めます）");
 
         if (this.Made < this.expected)
             ctx.Log.Warn("製作", $"{CraftPlanner.ItemName(this.craft.ItemId)} は {this.Made}/{this.expected} 個でした");
@@ -209,7 +231,21 @@ public sealed class CraftOneTask : AutoTask
     public override void Cleanup(TaskContext ctx)
     {
         // こちらが頼んだ製作がまだ動いていれば止める（Endurance を OFF）
-        if (this.requested && ctx.Artisan.IsEndurance() == true)
+        if (!this.requested || ctx.Artisan.IsBusy() == false)
+            return;
+
+        if (ctx.Artisan.IsEndurance() == true)
             ctx.Artisan.SetEndurance(false);
+
+        // Artisan の CraftItem は「レシピ選択 → Endurance を ON」を内部の順番待ちに積むので、
+        // 止めた直後に遅れて Endurance が ON になり、製作が進むことがある。
+        // Artisan が空く（IsBusy が false）まで見張り、その間に ON になったら OFF にする。
+        var artisan = ctx.Artisan;
+        ctx.AfterStop.Add(("Artisan の製作を止め切る", DateTime.UtcNow.AddSeconds(30), () =>
+        {
+            if (artisan.IsEndurance() == true)
+                artisan.SetEndurance(false);
+            return artisan.IsBusy() == false;
+        }));
     }
 }

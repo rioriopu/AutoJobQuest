@@ -34,6 +34,11 @@ public sealed class MainWindow : Window
     private JobQuestPlan? plan;
     private List<PreflightItem>? preflight;
     private bool planRequested;
+    private List<ReportSection>? report;
+    private DateTime reportAt;
+    private bool reportRequested = true;
+    private string? lastWritten;
+    private DateTime dataReadyAt = DateTime.MinValue;
 
     public MainWindow(Configuration config, RunLog log, Services services)
         : base("ジョブクエ自動化##AutoJobQuest")
@@ -72,6 +77,12 @@ public sealed class MainWindow : Window
         {
             if (t)
                 this.DrawPreflightTab();
+        }
+
+        using (var t = ImRaii.TabItem("キャラクター"))
+        {
+            if (t)
+                this.DrawCharacterTab();
         }
 
         using (var t = ImRaii.TabItem("記録"))
@@ -224,7 +235,7 @@ public sealed class MainWindow : Window
                 {
                     var items = string.Join("、", q.Items.Select(x => $"{CraftPlanner.ItemName(x.ItemId)}{(x.Hq ? "(HQ)" : string.Empty)}×{x.Count}"));
                     var materia = q.Materia is { } m
-                        ? $"　＋マテリア装着（{(m.MateriaItemId is { } mid ? CraftPlanner.ItemName(mid) : "種類不問")}）"
+                        ? $"　＋マテリア装着（{(m.MateriaItemId is { } mid ? CraftPlanner.ItemName(mid) : $"任意 → {CraftPlanner.ItemName(this.Ctx.Config.AnyMateriaItemId)}")}）"
                         : string.Empty;
                     ImGui.TextUnformatted($"  Lv{q.Level} {q.Name}：{items}{materia}");
                 }
@@ -272,7 +283,19 @@ public sealed class MainWindow : Window
         {
             foreach (var m in p.Materia)
             {
-                var mat = m.MateriaItemId is { } mid ? CraftPlanner.ItemName(mid) : "種類不問（アイテムLvに合う一番安いもの）";
+                string mat;
+                if (m.MateriaItemId is { } mid)
+                {
+                    mat = CraftPlanner.ItemName(mid);
+                }
+                else
+                {
+                    // 任意のマテリア：設定の品（AnyMateriaItemId）。付けられなければ理由を出す
+                    var any = MateriaCatalog.ResolveAny(this.Ctx.Config.AnyMateriaItemId, m.TargetItemId, out var problem);
+                    mat = any is { } a ? $"{CraftPlanner.ItemName(a)}（任意のマテリアの指定）" : $"（付けられません：{problem}）";
+                }
+
+
                 ImGui.TextUnformatted($"  {m.Quest}：{CraftPlanner.ItemName(m.TargetItemId)}{(m.TargetHq ? "(HQ)" : string.Empty)} に {mat}{(m.AlreadyMelded ? "　…装着済み" : string.Empty)}");
             }
         }
@@ -309,6 +332,64 @@ public sealed class MainWindow : Window
         }
     }
 
+    /// <summary>
+    /// キャラクターの状態（プラグインがゲームから読み取って把握している内容）を出す。
+    /// 収集品納品の解放などをキャラクター情報から読み、画面で確認できるように。
+    /// </summary>
+    private void DrawCharacterTab()
+    {
+        var data = this.Ctx.Data;
+        if (ImGui.Button("読み直す"))
+        {
+            data.EnsureBuilding();
+            this.reportRequested = true;
+        }
+
+        ImGui.SameLine();
+        if (data.IsBuilding)
+            ImGui.TextColored(Grey, "ゲームデータを読み込み中…（読み終わると秘伝書・装備の基準も出ます）");
+        else if (this.report != null)
+            ImGui.TextColored(Grey, $"{this.reportAt:HH:mm:ss} に読み取り");
+
+        // データの読み込みが終わった時刻を覚え、それより前に作った一覧なら作り直す
+        if (data.IsReady && data.AllBooks != null && this.dataReadyAt == DateTime.MinValue)
+            this.dataReadyAt = DateTime.Now;
+
+        if (this.reportRequested || (this.report != null && this.dataReadyAt != DateTime.MinValue && this.reportAt < this.dataReadyAt))
+        {
+            data.EnsureBuilding();
+            this.reportRequested = false;
+            this.report = CharacterReport.Build(this.Ctx);
+            this.reportAt = DateTime.Now;
+        }
+
+        if (this.report == null)
+            return;
+
+        using var child = ImRaii.Child("##chara", new Vector2(0, 0), false);
+        if (!child)
+            return;
+
+        foreach (var sec in this.report)
+        {
+            ImGui.TextColored(Green, sec.Title);
+            foreach (var line in sec.Lines)
+            {
+                var color = line.Severity switch
+                {
+                    Severity.Error => Red,
+                    Severity.Warn => Yellow,
+                    _ => new Vector4(1f, 1f, 1f, 1f),
+                };
+                ImGui.PushTextWrapPos(0);
+                ImGui.TextColored(color, $"  {(line.Severity == Severity.Error ? "×" : line.Severity == Severity.Warn ? "！" : "○")} {line.Text}");
+                ImGui.PopTextWrapPos();
+            }
+
+            ImGui.Spacing();
+        }
+    }
+
     private void DrawLogTab()
     {
         if (ImGui.Button("クリップボードへ写す"))
@@ -316,6 +397,36 @@ public sealed class MainWindow : Window
         ImGui.SameLine();
         if (ImGui.Button("消す"))
             this.log.Clear();
+        ImGui.SameLine();
+        if (ImGui.Button("今の状態を書き出す"))
+            this.lastWritten = this.services.WriteSnapshotNow();
+        ImGui.SameLine();
+        if (ImGui.Button("記録のフォルダを開く"))
+        {
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("explorer.exe", $"\"{this.services.Debug.Directory}\"") { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                this.log.Warn("記録", $"フォルダを開けませんでした: {ex.Message}");
+            }
+        }
+
+        ImGui.TextColored(Grey, $"記録の置き場所：{this.services.Debug.Directory}");
+        if (this.services.Debug.RunFile is { } run)
+            ImGui.TextColored(Grey, $"この実行の記録：{System.IO.Path.GetFileName(run)}");
+        if (this.services.Debug.LastFailureReport is { } fail)
+            ImGui.TextColored(Yellow, $"最後に止まったときの報告：{System.IO.Path.GetFileName(fail)}");
+        if (this.lastWritten != null)
+            ImGui.TextColored(Grey, $"書き出しました：{System.IO.Path.GetFileName(this.lastWritten)}");
+
+        var always = this.config.AlwaysRecordAddons;
+        if (ImGui.Checkbox("実行していないときも、ショップ・マーケット等の画面を記録する", ref always))
+        {
+            this.config.AlwaysRecordAddons = always;
+            this.config.Save();
+        }
 
         using var child = ImRaii.Child("##log", new Vector2(0, 0), true);
         if (!child)

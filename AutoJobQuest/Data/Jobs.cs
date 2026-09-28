@@ -62,10 +62,11 @@ public static class Jobs
     /// <summary>
     /// 戦闘ジョブ（クラス含む）の一覧。
     /// 「クラフターでもギャザラーでもなく、経験値の欄を持つもの」を戦闘ジョブとみなす。
+    /// 青魔道士のような制限ジョブ（IsLimitedJob）は、RSR で普通に戦えないので外す。
     /// </summary>
     public static List<ClassJob> CombatJobs()
         => Svc.Data.GetExcelSheet<ClassJob>()
-            .Where(x => x.RowId != 0 && !IsCrafter(x.RowId) && !IsGatherer(x.RowId) && x.ExpArrayIndex >= 0)
+            .Where(x => x.RowId != 0 && !IsCrafter(x.RowId) && !IsGatherer(x.RowId) && x.ExpArrayIndex >= 0 && !x.IsLimitedJob)
             .ToList();
 
     /// <summary>そのジョブのレベル。読めなければ 0。</summary>

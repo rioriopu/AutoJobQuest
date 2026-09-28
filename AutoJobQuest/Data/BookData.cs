@@ -47,6 +47,9 @@ public sealed class BookData
 
     public uint CollectablesShopId { get; private set; }
 
+    /// <summary>納品窓口の店の名前（例「収集品納品」）。話しかけて選択肢が出たときの手がかり。</summary>
+    public string CollectablesShopName { get; private set; } = string.Empty;
+
     /// <summary>納品画面のタブ（ClassJob）。</summary>
     public uint CollectableTabClassJob { get; private set; }
 
@@ -175,6 +178,7 @@ public sealed class BookData
                         if (shop.ShopItems[slot].RowId != row.RowId)
                             continue;
                         this.CollectablesShopId = shop.RowId;
+                        this.CollectablesShopName = shop.Name.ExtractText();
                         this.CollectableTabClassJob = (uint)(8 + slot);
 
                         // 品に必要クエストが無ければ、窓口の解放クエストを使う

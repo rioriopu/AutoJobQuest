@@ -36,8 +36,38 @@ public sealed class RotationSolverIpc : IpcGate
 
     /// <summary>動作モードを切り替える。</summary>
     public bool ChangeOperatingMode(byte mode)
-        => this.TryAction("ChangeOperatingMode",
+        => this.TraceThen($"ChangeOperatingMode({mode})") && this.TryAction("ChangeOperatingMode",
             () => this.Func<byte, object>(Prefix + "ChangeOperatingMode").InvokeAction(mode));
+
+    private bool henchedByMe;
+
+    /// <summary>
+    /// Henched にする（まだこちらが入れていなければ）。入れる前に RSR が動いていたら、利用者が使っていたとみなして記録する
+    /// （IPC ではモードの種類までは読めないので、戻すときは Off にしかできないため）。
+    /// こちらが入れた後に RSR が自分で OFF になった（エリア移動・死亡・着替え）ときは入れ直す。
+    /// </summary>
+    public bool EnsureHenched()
+    {
+        if (this.henchedByMe && this.IsActive() != false)
+            return true;
+
+        if (!this.henchedByMe && this.IsActive() == true)
+            Core.DebugLog.Current?.Line("IPC", "⚠ RSR はこちらが使う前から動いていました。終わったときは Off に戻ります（元のモードは IPC で読めないため）");
+
+        if (!this.ChangeOperatingMode(ModeHenched))
+            return false;
+        this.henchedByMe = true;
+        return true;
+    }
+
+    /// <summary>こちらが Henched にしていたときだけ Off に戻す（利用者が使っていた RSR を勝手に止めないため）。</summary>
+    public void ReleaseHenched()
+    {
+        if (!this.henchedByMe)
+            return;
+        if (this.ChangeOperatingMode(ModeOff))
+            this.henchedByMe = false;
+    }
 
     /// <summary>自動ローテーションが動いているか。読めなければ null。</summary>
     public bool? IsActive()
@@ -47,6 +77,7 @@ public sealed class RotationSolverIpc : IpcGate
     /// <summary>優先して狙うモンスター（名前 ID）を足す。足した ID は覚えておく。</summary>
     public bool AddPriority(uint bnpcNameId)
     {
+        this.Trace($"AddPriorityNameID({bnpcNameId})");
         var ok = this.TryAction("AddPriorityNameID",
             () => this.Func<uint, object>(Prefix + "AddPriorityNameID").InvokeAction(bnpcNameId));
         if (ok)
@@ -59,6 +90,7 @@ public sealed class RotationSolverIpc : IpcGate
     {
         foreach (var id in this.ownPriorities.ToArray())
         {
+            this.Trace($"RemovePriorityNameID({id})");
             if (this.TryAction("RemovePriorityNameID",
                     () => this.Func<uint, object>(Prefix + "RemovePriorityNameID").InvokeAction(id)))
                 this.ownPriorities.Remove(id);

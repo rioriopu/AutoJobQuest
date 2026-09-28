@@ -127,13 +127,25 @@ public static class Preflight
         var needsFish = plan?.Shortfalls.Any(x => x.Route == Route.Fish) ?? false;
         if (needsFish)
         {
+            // 釣りは GBR に一任する。GBR が釣れない設定なら、別の手段に黙って切り替えず始める前に止める
+            var fishItems = string.Join("、", plan!.Shortfalls.Where(x => x.Route == Route.Fish).Select(x => $"{x.Name}×{x.Shortfall}"));
             if (ctx.Gbr.ReadAutoGatherBool("FishDataCollection") != true)
-                list.Add(new PreflightItem(Severity.Warn,
-                    "GBR の「Opt-in to fishing data collection」が OFF のため、GBR は釣りをしません。"
-                    + "これは釣果を GBR の外部サーバーへ送ることへの同意です（ON にするかは利用者の判断です。こちらからは変えません）。"
-                    + "OFF のままなら、釣りの素材は集めずに止まります"));
+                list.Add(new PreflightItem(Severity.Error,
+                    $"釣りで集める素材があります（{fishItems}）が、GBR の「Opt-in to fishing data collection」が OFF のため GBR は釣りをしません。"
+                    + "これは釣果を GBR の外部サーバーへ送ることへの同意なので、こちらからは変えません。"
+                    + "GBR の設定画面の検索欄に「fishing data」と入れると項目が出ます。ON にしてからもう一度始めてください"));
             if (ctx.Gbr.ReadAutoGatherBool("UseAutoHook") == false)
-                list.Add(new PreflightItem(Severity.Warn, "GBR の UseAutoHook が OFF のため、釣りが始まりません"));
+                list.Add(new PreflightItem(Severity.Error, $"釣りで集める素材があります（{fishItems}）が、GBR の UseAutoHook が OFF のため釣りが始まりません"));
+        }
+
+        // 5.5) 任意のマテリア（既定は剛柔のマテリア）が、付ける納品物に付けられるか
+        if (plan != null)
+        {
+            foreach (var m in plan.Materia.Where(m => !m.AlreadyMelded && m.MateriaItemId == null))
+            {
+                if (MateriaCatalog.ResolveAny(ctx.Config.AnyMateriaItemId, m.TargetItemId, out var problem) == null)
+                    list.Add(new PreflightItem(Severity.Error, $"{m.Quest}：{problem}"));
+            }
         }
 
         // 6) Artisan の簡易製作（設定ファイルを読むだけ）

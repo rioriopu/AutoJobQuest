@@ -32,12 +32,12 @@ public sealed class VnavmeshIpc : IpcGate
 
     /// <summary>いまのエリアのナビメッシュを読み込ませる（自動読み込みが OFF の環境向け。設定は変えない）。</summary>
     public bool Reload()
-        => this.TryInvoke("Nav.Reload",
+        => this.TraceThen("Nav.Reload()") && this.TryInvoke("Nav.Reload",
             () => this.Func<bool>("vnavmesh.Nav.Reload").InvokeFunc(), out _);
 
     /// <summary>指定地点の近くまで移動する。fly=true なら飛んでいく（飛行できるエリアのみ）。</summary>
     public bool MoveCloseTo(Vector3 destination, bool fly, float range)
-        => this.TryInvoke("SimpleMove.PathfindAndMoveCloseTo",
+        => this.TraceThen($"PathfindAndMoveCloseTo(({destination.X:0.0},{destination.Y:0.0},{destination.Z:0.0}), 飛行={fly}, 範囲={range:0.0})") && this.TryInvoke("SimpleMove.PathfindAndMoveCloseTo",
                () => this.Func<Vector3, bool, float, bool>("vnavmesh.SimpleMove.PathfindAndMoveCloseTo")
                    .InvokeFunc(destination, fly, range), out var ok)
            && ok;
@@ -81,6 +81,6 @@ public sealed class VnavmeshIpc : IpcGate
 
     /// <summary>移動を止める。自分が始めた移動のときだけ呼ぶこと（全体に効くため）。</summary>
     public bool Stop()
-        => this.TryAction("Path.Stop",
+        => this.TraceThen("Path.Stop()") && this.TryAction("Path.Stop",
             () => this.Func<object>("vnavmesh.Path.Stop").InvokeAction());
 }

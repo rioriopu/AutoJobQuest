@@ -59,7 +59,7 @@ public sealed class QuestionableIpc : IpcGate
         => this.TryInvoke("GetCurrentStepData", () => this.Func<StepData>("Questionable.GetCurrentStepData").InvokeFunc(), out var v) ? v : null;
 
     public bool StartSingleQuest(uint questRowId)
-        => this.TryInvoke("StartSingleQuest",
+        => this.TraceThen($"StartSingleQuest(\"{ToQuestId(questRowId)}\")（Quest 行 {questRowId}）") && this.TryInvoke("StartSingleQuest",
                () => this.Func<string, bool>("Questionable.StartSingleQuest").InvokeFunc(ToQuestId(questRowId)), out var ok)
            && ok;
 
@@ -73,5 +73,5 @@ public sealed class QuestionableIpc : IpcGate
 
     /// <summary>Questionable を止める。自分が始めた進行のときだけ呼ぶこと。</summary>
     public bool Stop(string label)
-        => this.TryInvoke("Stop", () => this.Func<string, bool>("Questionable.Stop").InvokeFunc(label), out _);
+        => this.TraceThen($"Stop(\"{label}\")") && this.TryInvoke("Stop", () => this.Func<string, bool>("Questionable.Stop").InvokeFunc(label), out _);
 }

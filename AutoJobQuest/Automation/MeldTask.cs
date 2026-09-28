@@ -20,7 +20,8 @@ namespace AutoJobQuest.Automation;
 ///   → 装着中の旗が下りる → 「対象のマテリア数 +1 AND カバンのマテリア −1」で確認 → 自分で開いたときだけ閉じる。
 ///
 /// 補足:
-///  ・装着はその装備の修理職（Item.ClassJobRepair）でないとできないので、先に着替える。
+///  ・着替えはしない（パッチ 3.2 から別のクラスのままで装着できる。公式パッチノート）。
+///  ・「種類不問」のときは設定の品（既定は剛柔のマテリア）を付ける。
 ///  ・成功率が 100% 未満なら押さずに「戻る」を押して中止する（通常の装着の1穴目は 100%）。
 ///  ・YesAlready など他のプラグインが先に確認を押しても、結果の確認で成功とみなす。
 ///  ・AgentMateriaAttach の Materia プロパティは誤りがあるので MateriaSorted を使う。一覧は ItemCount / MateriaCount まで回す。
@@ -29,7 +30,7 @@ public sealed unsafe class MeldTask : AutoTask
 {
     private enum MeldStep
     {
-        Prepare, Equip, Open, WaitOpen, SelectCategory, WaitCategory, SelectItem, WaitItemLoaded,
+        Prepare, Open, WaitOpen, SelectCategory, WaitCategory, SelectItem, WaitItemLoaded,
         SelectMateria, WaitDialog, CheckDialog, WaitMeldEnd, Verify, Close,
     }
 
@@ -40,7 +41,6 @@ public sealed unsafe class MeldTask : AutoTask
 
     private readonly MateriaNeed need;
     private MeldStep step = MeldStep.Prepare;
-    private EquipJobTask? equip;
 
     private InventoryType targetType;
     private int targetSlot;
@@ -69,26 +69,11 @@ public sealed unsafe class MeldTask : AutoTask
             case MeldStep.Prepare:
                 return this.Prepare(ctx);
 
-            case MeldStep.Equip:
-            {
-                var r = this.equip!.Step(ctx);
-                this.Status = this.equip.Status;
-                if (r == TaskResult.Running)
-                    return TaskResult.Running;
-                this.equip.Cleanup(ctx);
-                if (r == TaskResult.Failed)
-                    return this.Fail(this.equip.FailReason ?? "着替えに失敗しました");
-                this.Next(MeldStep.Open);
-                return TaskResult.Running;
-            }
-
             case MeldStep.Open:
             {
                 var target = this.LiveTarget;
                 if (target == null || target->ItemId == 0)
                     return this.Fail("対象のアイテムが見つかりません");
-                if (!GameUi.PlayerFree())
-                    return TaskResult.Running;
 
                 this.targetItemIdBefore = target->ItemId;
                 this.materiaCountBefore = target->GetMateriaCount();
@@ -96,9 +81,18 @@ public sealed unsafe class MeldTask : AutoTask
                 if (this.materiaStockBefore <= 0)
                     return this.Fail($"カバンに {CraftPlanner.ItemName(this.materiaItemId)} がありません");
 
+                // 装着の画面がもう開いていればそれを使う（開いている間は PlayerFree が false になるため、先に見る）
                 if (Agent->IsAgentActive())
                 {
                     this.Next(MeldStep.SelectCategory);
+                    return TaskResult.Running;
+                }
+
+                if (!GameUi.PlayerFree())
+                {
+                    this.Status = "動ける状態になるのを待っています";
+                    if (this.TimedOut(TimeSpan.FromSeconds(60)))
+                        return this.Fail("キャラクターが動ける状態にならないため、装着の画面を開けません");
                     return TaskResult.Running;
                 }
 
@@ -154,7 +148,7 @@ public sealed unsafe class MeldTask : AutoTask
                 }
 
                 if (this.TimedOut(TimeSpan.FromSeconds(10)))
-                    return this.Fail("対象のアイテムが装着画面の一覧に出ません");
+                    return this.Fail("対象のアイテムが装着画面の一覧に出ません（装着に要るクラフターのレベルが足りない・穴が埋まっている等）");
                 return TaskResult.Running;
             }
 
@@ -211,7 +205,7 @@ public sealed unsafe class MeldTask : AutoTask
                 var rate = dialog->TypedAtkValues->SuccessRate.Int;
                 if (rate < 100)
                 {
-                    PressButton(dialog, ReturnButtonNodeId);
+                    GameUi.ClickButton((AtkUnitBase*)dialog, ReturnButtonNodeId);
                     return this.Fail($"成功率が {rate}% のため中止しました（100% でないとマテリアを失う恐れがあります）");
                 }
 
@@ -271,32 +265,26 @@ public sealed unsafe class MeldTask : AutoTask
             return this.Fail("アイテムのデータが読めません");
         this.targetLevelItem = target.LevelItem.RowId;
 
-        // 使うマテリア：指定品か、種類不問なら「付けられる候補のうちカバンにあるもの」
+        // 使うマテリア：指定品か、種類不問なら設定の品（AnyMateriaItemId＝剛柔のマテリア）
         if (this.need.MateriaItemId is { } mid)
         {
             this.materiaItemId = mid;
         }
         else
         {
-            var candidates = MateriaCatalog.CandidatesFor(this.need.TargetItemId);
-            this.materiaItemId = candidates.FirstOrDefault(c => CountInBags(c) > 0);
-            if (this.materiaItemId == 0)
-                return this.Fail("付けられるマテリアがカバンにありません");
+            var any = MateriaCatalog.ResolveAny(ctx.Config.AnyMateriaItemId, this.need.TargetItemId, out var problem);
+            if (any == null)
+                return this.Fail(problem ?? "任意のマテリアに使う品を決められません");
+            this.materiaItemId = any.Value;
         }
 
         // 付ける対象のスロット（カバン内・HQ 指定なら HQ・まだ穴が空いているもの）
         if (!this.FindTargetSlot(target.MateriaSlotCount))
             return this.Fail($"{CraftPlanner.ItemName(this.need.TargetItemId)}{(this.need.TargetHq ? "（HQ）" : string.Empty)} がカバンにありません（アーマリーチェストにある場合はカバンに移してください）");
 
-        // 装着はその装備の修理職で行う
-        var repair = target.ClassJobRepair.RowId;
-        if (repair != 0 && Jobs.CurrentClassJob != repair)
-        {
-            this.equip = new EquipJobTask(repair);
-            this.Next(MeldStep.Equip);
-            return TaskResult.Running;
-        }
-
+        // 着替えはしない：パッチ 3.2 から「装着できる能力があれば、別のクラスのままでも装着できる」
+        // （公式パッチノート 3.2。レベルの条件は従来どおり）。対象品の修理職はどれもそのクエストの職と同じで、
+        // クエストを受けられる時点でレベルの条件を満たす（解析ツール repairjob で確認）。
         this.Next(MeldStep.Open);
         return TaskResult.Running;
     }
@@ -316,7 +304,8 @@ public sealed unsafe class MeldTask : AutoTask
                     continue;
                 if (this.need.TargetHq && (s->Flags & InventoryItem.ItemFlags.HighQuality) == 0)
                     continue;
-                if (s->GetMateriaCount() >= Math.Max((byte)1, slotCount))
+                // 穴が無い品には付けられない（禁断は扱わない）。穴が残っているものだけ
+                if (slotCount == 0 || s->GetMateriaCount() >= slotCount)
                     continue;
 
                 this.targetType = type;
@@ -336,7 +325,6 @@ public sealed unsafe class MeldTask : AutoTask
 
     public override void Cleanup(TaskContext ctx)
     {
-        this.equip?.Cleanup(ctx);
         if (this.openedByUs && Agent != null && Agent->IsAgentActive())
             Agent->Hide();
         this.openedByUs = false;
@@ -351,6 +339,7 @@ public sealed unsafe class MeldTask : AutoTask
     /// <summary>GettingTooAttached.cs:146-154 と同じ。値はすべて AtkValueType.Int。</summary>
     private static void SendAgentEvent(ulong eventKind, params int[] values)
     {
+        Core.DebugLog.Current?.Line("操作", $"装着画面へイベント送信: 種類{eventKind}（{string.Join(", ", values)}） 分類={Agent->Category} 品数={Agent->ItemCount} マテリア数={Agent->MateriaCount}");
         var ret = new AtkValue();
         var atkValues = stackalloc AtkValue[values.Length];
         for (var i = 0; i < values.Length; i++)
@@ -366,21 +355,10 @@ public sealed unsafe class MeldTask : AutoTask
     private static void PressMeld(AddonMateriaAttachDialog* dialog)
     {
         var addon = (AtkUnitBase*)dialog;
+        Core.DebugLog.Current?.Line("操作", "装着の確認画面で「装着する」を押します（ButtonClick / 0）");
         var evt = new AtkEvent { Listener = &addon->AtkEventListener, Target = &AtkStage.Instance()->AtkEventTarget };
         var data = new AtkEventData();
         addon->ReceiveEvent(AtkEventType.ButtonClick, 0, &evt, &data);
-    }
-
-    /// <summary>ECommons ClickAddonButton と同じ：ノードに登録済みの先頭イベントを流す。</summary>
-    private static void PressButton(AddonMateriaAttachDialog* dialog, uint nodeId)
-    {
-        var addon = (AtkUnitBase*)dialog;
-        var button = addon->GetComponentButtonById(nodeId);
-        if (button == null || !button->IsEnabled)
-            return;
-        var res = button->AtkComponentBase.OwnerNode->AtkResNode;
-        var evt = res.AtkEventManager.Event;
-        addon->ReceiveEvent(evt->State.EventType, (int)evt->Param, evt);
     }
 
     private static bool IsDialogReady(out AddonMateriaAttachDialog* dialog)

@@ -38,7 +38,10 @@ public sealed record MarketNeed(List<uint> Candidates, int Need, string Label, i
 public static class MarketBoardLocator
 {
     private static HashSet<uint>? mbBaseIds;
-    private static readonly Dictionary<uint, List<Vector3>> Cache = [];
+
+    // 小さい3種（planlive / planevent / planmap）だけで見つかった位置と、bg.lgb まで読んだ位置
+    private static readonly Dictionary<uint, List<Vector3>> SmallCache = [];
+    private static readonly Dictionary<uint, List<Vector3>> BgCache = [];
 
     /// <summary>MB の EObj の行 ID。</summary>
     public static HashSet<uint> BaseIds
@@ -60,30 +63,43 @@ public static class MarketBoardLocator
         }
     }
 
-    /// <summary>そのエリアの MB の位置（無ければ空）。</summary>
-    public static List<Vector3> BoardsIn(uint territory)
+    /// <summary>
+    /// そのエリアの MB の位置（無ければ空）。
+    /// <paramref name="allowBg"/> が false なら小さい3種だけを読む（大きい bg.lgb は、どの街でも見つからなかったときの2周目に回す）。
+    /// </summary>
+    public static List<Vector3> BoardsIn(uint territory, bool allowBg = true)
     {
-        if (Cache.TryGetValue(territory, out var cached))
-            return cached;
-
-        var result = new List<Vector3>();
-        var terr = Svc.Data.GetExcelSheet<TerritoryType>();
-        if (terr.TryGetRow(territory, out var t))
+        var dir = LevelDir(territory);
+        if (!SmallCache.TryGetValue(territory, out var small))
         {
-            var bg = t.Bg.ExtractText();
-            var at = bg.IndexOf("/level/", StringComparison.Ordinal);
-            if (at >= 0)
-            {
-                var dir = bg[..(at + "/level/".Length)];
+            small = [];
+            if (dir != null)
                 foreach (var file in new[] { "planlive.lgb", "planevent.lgb", "planmap.lgb" })
-                    Scan($"bg/{dir}{file}", result);
-                if (result.Count == 0)
-                    Scan($"bg/{dir}bg.lgb", result);
-            }
+                    Scan($"bg/{dir}{file}", small);
+            SmallCache[territory] = small;
         }
 
-        Cache[territory] = result;
-        return result;
+        if (small.Count > 0 || !allowBg)
+            return small;
+
+        if (!BgCache.TryGetValue(territory, out var full))
+        {
+            full = [];
+            if (dir != null)
+                Scan($"bg/{dir}bg.lgb", full);
+            BgCache[territory] = full;
+        }
+
+        return full;
+    }
+
+    private static string? LevelDir(uint territory)
+    {
+        if (!Svc.Data.GetExcelSheet<TerritoryType>().TryGetRow(territory, out var t))
+            return null;
+        var bg = t.Bg.ExtractText();
+        var at = bg.IndexOf("/level/", StringComparison.Ordinal);
+        return at >= 0 ? bg[..(at + "/level/".Length)] : null;
     }
 
     private static void Scan(string path, List<Vector3> into)
@@ -128,16 +144,22 @@ public static class MarketBoardLocator
             return Me.Territory;
 
         var unlocked = Svc.Aetherytes.Select(a => a.AetheryteId).ToHashSet();
+        var towns = new List<uint>();
         foreach (var a in Svc.Data.GetExcelSheet<Aetheryte>())
         {
             if (!a.IsAetheryte || !unlocked.Contains(a.RowId))
                 continue;
             var tid = a.Territory.RowId;
-            if (!terr.TryGetRow(tid, out var tt) || tt.TerritoryIntendedUse.RowId != 0)
+            if (!terr.TryGetRow(tid, out var tt) || tt.TerritoryIntendedUse.RowId != 0 || towns.Contains(tid))
                 continue;
-            if (BoardsIn(tid).Count > 0)
-                return tid;
+            towns.Add(tid);
         }
+
+        // 1周目は小さい配置ファイルだけで探し、見つからなければ2周目で bg.lgb も読む（大きいファイルを先に読まない）
+        foreach (var allowBg in new[] { false, true })
+            foreach (var tid in towns)
+                if (BoardsIn(tid, allowBg).Count > 0)
+                    return tid;
 
         return null;
     }
@@ -200,8 +222,8 @@ public sealed unsafe class MarketBoardWatcher : IDisposable
 ///   → 結果から欲しいアイテムを選択 → 出品一覧から「必要数以上の数が出ていて、合計金額が一番低い」出品を買う
 ///   （例：5個ほしいとき、4個と7個の出品なら7個を買う）→ 買ったら MB を閉じる。
 /// 必ずカバンの所持数を確かめ、不足分だけを買う（呼び出し側が不足数を渡し、ここでも買う直前に数え直す）。
-/// 1回の購入額が設定値（既定 500,000 ギル）を超えるとき、またはこの実行での MB の合計支払額が
-/// 設定値を超えるときは確認窓を出す。「いいえ」で自動動作を止める。
+/// 1回の購入額が設定値（既定 500,000 ギル）を超えるときは確認窓を出す（
+/// 合計ではなく1回ごとで判定）。「いいえ」で自動動作を止める。
 ///
 /// 購入そのものは関数経路（SetLastPurchasedItem → SendPurchaseRequestPacket）で行う。
 /// 画面経路の「行を選ぶ」操作は、どの実装にも撃って動いた記録が無く未確認のため使わない。
@@ -255,6 +277,26 @@ public sealed unsafe class MarketBoardTask : AutoTask
     private int boughtForCurrent;
     private int attempts;
 
+    // 検索の失敗（混雑など）のあと、次に検索してよい時刻。失敗が続くほど間をあける
+    // （SimpleTweaks RefreshMarketPrices と同じ考え方：2秒＋0.5秒×(回数−1)。進む条件ではなく、要求を出しすぎない抑え）
+    private DateTime searchNotBefore = DateTime.MinValue;
+
+    // 検索と検索の最小の間隔（要求を出しすぎない抑え。進む条件ではない）
+    private static readonly TimeSpan MinSearchInterval = TimeSpan.FromSeconds(1);
+
+    // こちらが話しかけて MB を開いたか（止めたときに、自分が開いた画面だけを閉じるため）
+    private bool openedByMe;
+    private DateTime interactAt = DateTime.MinValue;
+
+    // 画面を閉じる操作の間隔（毎フレーム閉じる命令を送らない）
+    private DateTime closeAt = DateTime.MinValue;
+
+    // 買い終えた出品（買った直後の一覧は古いまま残るので、同じ出品を選び直さない）
+    private readonly HashSet<ulong> boughtListings = [];
+
+    // 候補が複数のときの「始めた時点の候補の所持数の合計」（不足数をカバンの増え方で数えるため）
+    private int candidatesOwnedAtStart;
+
     /// <summary>この実行で MB に払った合計（ギル）。</summary>
     public static long SpentThisRun { get; set; }
 
@@ -303,7 +345,8 @@ public sealed unsafe class MarketBoardTask : AutoTask
                     this.board = boards.OrderBy(b => Vector3.Distance(b, Me.Position)).First();
                 }
 
-                return this.RunSub(ctx, () => new MoveToTask(this.board, 2.5f, "マーケットボード"), Phase.Open);
+                // MB の座標は台の中心なので、経路の終点が台の手前で止まることがある。話しかけられる距離（6m 以内）を見込んで 3.5m にする
+                return this.RunSub(ctx, () => new MoveToTask(this.board, 3.5f, "マーケットボード"), Phase.Open);
             }
 
             case Phase.Open:
@@ -373,6 +416,7 @@ public sealed unsafe class MarketBoardTask : AutoTask
     {
         if (GameUi.IsReady("ItemSearch", out _))
         {
+            this.openedByMe = true;
             this.Go(Phase.Next, "マーケットボードを開きました");
             return TaskResult.Running;
         }
@@ -383,9 +427,6 @@ public sealed unsafe class MarketBoardTask : AutoTask
                 return this.Fail("マーケットボードを開けませんでした");
             this.NextPhase("もう一度話しかけます");
         }
-
-        if (this.PhaseElapsed < TimeSpan.FromSeconds(0.5) && this.attempts > 0)
-            return TaskResult.Running;
 
         if (!GameUi.PlayerFree())
             return TaskResult.Running;
@@ -403,8 +444,12 @@ public sealed unsafe class MarketBoardTask : AutoTask
             return TaskResult.Running;
         }
 
-        if (this.Status != "話しかけています")
+        // Interact は「ターゲット → 次の呼び出しで話しかけ」の2段なので、画面が開くまで間をあけて繰り返す
+        // （1秒は操作を連打しない抑え。開いたかどうかは画面の状態で判断する）
+        if (DateTime.UtcNow - this.interactAt >= TimeSpan.FromSeconds(1))
         {
+            this.interactAt = DateTime.UtcNow;
+            this.openedByMe = true;
             GameUi.Interact(obj);
             this.Status = "話しかけています";
         }
@@ -428,6 +473,7 @@ public sealed unsafe class MarketBoardTask : AutoTask
         this.bestByCandidate.Clear();
         this.boughtForCurrent = 0;
         this.buyingItem = 0;
+        this.candidatesOwnedAtStart = this.current.Candidates.Sum(c => Inventory.CountNow(c));
 
         // 買う直前にカバンを数え直し、不足分だけにする
         if (this.RemainingNeed() <= 0)
@@ -454,10 +500,23 @@ public sealed unsafe class MarketBoardTask : AutoTask
         if (!GameUi.IsReady("ItemSearch", out var a))
             return this.Fail("マーケットボードの画面が閉じられました");
 
+        if (DateTime.UtcNow < this.searchNotBefore)
+        {
+            this.Status = "検索の間隔をあけています";
+            return TaskResult.Running;
+        }
+
         // 同じ品の出品一覧が開いたままだと、同じ品をクリックしても再要求されない。先に閉じる
         if (GameUi.Addon("ItemSearchResult") is var isr && isr != null)
         {
-            isr->Close(true);
+            if (DateTime.UtcNow - this.closeAt >= TimeSpan.FromSeconds(0.5))
+            {
+                this.closeAt = DateTime.UtcNow;
+                isr->Close(true);
+            }
+
+            if (this.TimedOut(TimeSpan.FromSeconds(10)))
+                return this.Fail("出品一覧の画面が閉じません");
             return TaskResult.Running;
         }
 
@@ -475,6 +534,8 @@ public sealed unsafe class MarketBoardTask : AutoTask
 
         addon->SetModeFilter(AddonItemSearch.SearchMode.Normal, -1);
         addon->RunSearch(false);
+        this.searchNotBefore = DateTime.UtcNow + MinSearchInterval;
+        ctx.Log.Debug("マーケット", $"検索窓に「{name}」を入れて検索しました");
         this.Go(Phase.WaitResults, $"{name} の検索結果を待っています");
         return TaskResult.Running;
     }
@@ -507,6 +568,9 @@ public sealed unsafe class MarketBoardTask : AutoTask
             return this.Fail("マーケットボードの画面が閉じられました");
 
         var agent = AgentItemSearch.Instance();
+        if (agent == null)
+            return this.Fail("マーケットの検索結果を読めません");
+
         var index = -1;
         for (var i = 0; i < agent->ListingPageItemCount && i < 100; i++)
         {
@@ -542,14 +606,24 @@ public sealed unsafe class MarketBoardTask : AutoTask
         if (this.watcher.LastError != 0)
             return this.Retry(ctx, $"検索が受け付けられませんでした（エラー {this.watcher.LastError}。混雑の可能性）");
 
+        // 全部届いたか：件数だけでなく、先頭から件数ぶんが「いま検索した品で単価が入っている」行になっているかを見る
+        // （前の検索の古い行が残っていると、件数だけでは届いたように見えるため）
         this.expectedCount = Math.Min(this.watcher.LastCount, 100);
-        if (proxy->ListingCount >= this.expectedCount)
+        var filled = 0;
+        for (var i = 0; i < proxy->ListingCount && i < 100; i++)
+        {
+            var l = proxy->Listings[i];
+            if (l.ItemId == this.searching && l.UnitPrice > 0)
+                filled++;
+        }
+
+        if (filled >= this.expectedCount)
         {
             this.Go(Phase.Decide, string.Empty);
             return TaskResult.Running;
         }
 
-        this.Status = $"出品一覧を受信中（{proxy->ListingCount}/{this.expectedCount}件）";
+        this.Status = $"出品一覧を受信中（{filled}/{this.expectedCount}件）";
         if (this.TimedOut(TimeSpan.FromSeconds(20)))
             return this.Retry(ctx, "出品一覧を全部受け取れませんでした");
         return TaskResult.Running;
@@ -560,7 +634,8 @@ public sealed unsafe class MarketBoardTask : AutoTask
         if (this.attempts++ >= 3)
             return this.SkipCandidate(ctx, why);
 
-        ctx.Log.Warn("マーケット", $"{why}。検索し直します");
+        this.searchNotBefore = DateTime.UtcNow + TimeSpan.FromSeconds(2 + (0.5 * (this.attempts - 1)));
+        ctx.Log.Warn("マーケット", $"{why}。少し間をあけて検索し直します（{this.attempts}回目）");
         this.Go(Phase.Search, "検索し直します");
         return TaskResult.Running;
     }
@@ -578,36 +653,21 @@ public sealed unsafe class MarketBoardTask : AutoTask
 
         var listings = this.ReadListings();
 
-        // 候補が複数（種類不問のマテリアなど）のときは、全候補の最安を見てから決める
+        // 読み取った出品を全部記録する（どの出品を選んだかを後から確かめられるように）
+        ctx.Log.Debug("マーケット",
+            $"{CraftPlanner.ItemName(this.searching)} の出品 {listings.Count} 件（必要 {need} 個）："
+            + string.Join(" / ", listings.OrderBy(l => l.Total).Select(l => $"{l.Quantity}個×{l.UnitPrice:N0}＝合計{l.Total:N0}（出品{l.ListingId}）")));
+
+        // 候補が複数のときは、全候補の最安を見てから決める
         if (this.current!.Candidates.Count > 1 && this.buyingItem == 0)
         {
             var best = listings.Where(l => l.Quantity >= need).OrderBy(l => l.Total).FirstOrDefault();
             if (best.ListingId != 0)
                 this.bestByCandidate[this.searching] = best.Total;
-
-            this.candidateIndex++;
-            if (this.candidateIndex < this.current.Candidates.Count)
-            {
-                this.StartSearch(this.current.Candidates[this.candidateIndex]);
-                return TaskResult.Running;
-            }
-
-            if (this.bestByCandidate.Count == 0)
-                return this.GiveUpCurrent(ctx, "どの候補にも必要数以上の出品がありません");
-
-            // 一番安い候補をもう一度検索して、その出品を買う
-            this.buyingItem = this.bestByCandidate.OrderBy(x => x.Value).First().Key;
-            ctx.Log.Write("マーケット", $"{this.current.Label}: 一番安い {CraftPlanner.ItemName(this.buyingItem)}（{this.bestByCandidate[this.buyingItem]:N0}ギル）を買います");
-            if (this.searching != this.buyingItem)
-            {
-                this.StartSearch(this.buyingItem);
-                return TaskResult.Running;
-            }
+            return this.AdvanceCandidate(ctx);
         }
-        else
-        {
-            this.buyingItem = this.searching;
-        }
+
+        this.buyingItem = this.searching;
 
         // 必要数以上の出品のうち、合計金額が一番低いもの
         var pick = listings.Where(l => l.Quantity >= need).OrderBy(l => l.Total).FirstOrDefault();
@@ -623,19 +683,20 @@ public sealed unsafe class MarketBoardTask : AutoTask
         this.buyingListingId = pick.ListingId;
         this.buyingTotal = pick.Total;
         this.buyingQuantity = pick.Quantity;
+        ctx.Log.Debug("マーケット", $"選んだ出品：{CraftPlanner.ItemName(this.buyingItem)} {pick.Quantity}個×{pick.UnitPrice:N0}＝合計{pick.Total:N0}（出品{pick.ListingId}）");
 
         var limit = ctx.Config.ConfirmPurchaseAboveGil;
         var gil = Inventory.Gil();
         if (pick.Total > gil)
             return this.GiveUpCurrent(ctx, $"ギルが足りません（必要 {pick.Total:N0} / 所持 {gil:N0}）");
 
-        if (limit > 0 && (pick.Total > limit || (SpentThisRun <= limit && SpentThisRun + pick.Total > limit)))
+        // 1回の購入額が基準（既定 500,000 ギル）を超えるときだけ確認する
+        if (limit > 0 && pick.Total > limit)
         {
             this.confirmTicket = ctx.Confirm.Ask(
                 "マーケットでの購入額の確認",
                 $"{CraftPlanner.ItemName(this.buyingItem)} ×{pick.Quantity} を {pick.Total:N0} ギル（手数料込み）で買おうとしています。\n"
-                + $"この実行でマーケットに払った額：{SpentThisRun:N0} ギル → 購入後 {SpentThisRun + pick.Total:N0} ギル\n"
-                + $"（確認する基準：{limit:N0} ギル）\n\n"
+                + $"1回の購入額が {limit:N0} ギルを超えています（参考：この実行でマーケットに払った額 {SpentThisRun:N0} ギル）。\n\n"
                 + "本当に購入してよいですか？「はい」で購入して自動動作を続けます。「いいえ」で自動動作を止めます。");
             this.Go(Phase.WaitConfirm, "購入の確認を待っています");
             return TaskResult.Running;
@@ -704,6 +765,7 @@ public sealed unsafe class MarketBoardTask : AutoTask
             var paid = this.gilBefore - gil;
             SpentThisRun += paid;
             this.boughtForCurrent += count - this.countBefore;
+            this.boughtListings.Add(this.buyingListingId);
             ctx.Log.Write("マーケット", $"{CraftPlanner.ItemName(this.buyingItem)} ×{count - this.countBefore} を {paid:N0} ギルで買いました（この実行の合計 {SpentThisRun:N0} ギル）");
 
             if (this.RemainingNeed() > 0)
@@ -717,7 +779,14 @@ public sealed unsafe class MarketBoardTask : AutoTask
         }
 
         if (this.TimedOut(TimeSpan.FromSeconds(15)))
+        {
+            // 片方だけ変わった＝買えたかどうか分からない。もう一度買うと二重購入になりうるので止める
+            if (gil != this.gilBefore || count != this.countBefore)
+                return this.Fail($"購入の結果を確かめられません（ギル {this.gilBefore:N0}→{gil:N0}、{CraftPlanner.ItemName(this.buyingItem)} {this.countBefore}→{count}）。二重に買わないよう止めました");
+
             return this.Retry(ctx, "購入が確認できませんでした（売り切れ・混雑・カバンがいっぱい等）");
+        }
+
         return TaskResult.Running;
     }
 
@@ -725,31 +794,45 @@ public sealed unsafe class MarketBoardTask : AutoTask
     {
         if (this.current == null)
             return 0;
-        if (this.current.Candidates.Count > 1 || this.current.TargetOwned == null)
-            return this.current.Need - this.boughtForCurrent;
 
         // 指定品：「持っていたい総数 − 今の所持数」（カバンを毎回数え直す）
-        return this.current.TargetOwned.Value - Inventory.CountNow(this.current.Candidates[0]);
+        if (this.current.Candidates.Count == 1 && this.current.TargetOwned != null)
+            return this.current.TargetOwned.Value - Inventory.CountNow(this.current.Candidates[0]);
+
+        // 候補が複数：始めた時点からの増えた数を引く（カバンを数え直す）
+        var gained = this.current.Candidates.Sum(c => Inventory.CountNow(c)) - this.candidatesOwnedAtStart;
+        return this.current.Need - Math.Max(gained, this.boughtForCurrent);
+    }
+
+    /// <summary>候補が複数のとき、次の候補へ進む。全部見終えたら一番安い候補を買いに行く。</summary>
+    private TaskResult AdvanceCandidate(TaskContext ctx)
+    {
+        this.candidateIndex++;
+        if (this.candidateIndex < this.current!.Candidates.Count)
+        {
+            this.StartSearch(this.current.Candidates[this.candidateIndex]);
+            return TaskResult.Running;
+        }
+
+        if (this.bestByCandidate.Count == 0)
+            return this.GiveUpCurrent(ctx, "どの候補にも必要数以上の出品がありません");
+
+        this.buyingItem = this.bestByCandidate.OrderBy(x => x.Value).First().Key;
+        ctx.Log.Write("マーケット", $"{this.current.Label}: 一番安い {CraftPlanner.ItemName(this.buyingItem)}（{this.bestByCandidate[this.buyingItem]:N0}ギル）を買います");
+
+        // いま開いている一覧が買う品でなければ、検索し直す
+        if (this.searching != this.buyingItem)
+            this.StartSearch(this.buyingItem);
+        else
+            this.Go(Phase.Decide, string.Empty);
+        return TaskResult.Running;
     }
 
     private TaskResult SkipCandidate(TaskContext ctx, string why)
     {
         ctx.Log.Warn("マーケット", $"{CraftPlanner.ItemName(this.searching)}: {why}");
         if (this.current!.Candidates.Count > 1 && this.buyingItem == 0)
-        {
-            this.candidateIndex++;
-            if (this.candidateIndex < this.current.Candidates.Count)
-            {
-                this.StartSearch(this.current.Candidates[this.candidateIndex]);
-                return TaskResult.Running;
-            }
-
-            if (this.bestByCandidate.Count > 0)
-            {
-                this.Go(Phase.Decide, string.Empty);
-                return TaskResult.Running;
-            }
-        }
+            return this.AdvanceCandidate(ctx);
 
         return this.GiveUpCurrent(ctx, why);
     }
@@ -768,27 +851,58 @@ public sealed unsafe class MarketBoardTask : AutoTask
 
     private TaskResult CloseBoard(TaskContext ctx)
     {
-        if (GameUi.Addon("ItemSearchResult") is var r && r != null)
+        if (!this.openedByMe || !CloseOwnWindows(ref this.closeAt))
+            return TaskResult.Done;
+
+        if (this.TimedOut(TimeSpan.FromSeconds(10)))
         {
-            r->Close(true);
-            return TaskResult.Running;
+            ctx.Log.Warn("マーケット", "マーケットボードの画面が閉じません（開いたまま次へ進みます）");
+            return TaskResult.Done;
         }
 
-        if (GameUi.Addon("ItemSearch") is var s && s != null)
+        return TaskResult.Running;
+    }
+
+    /// <summary>
+    /// MB の画面（出品一覧 → 検索窓の順）を閉じる。まだ開いている画面があれば true。
+    /// 閉じる命令は 0.5 秒に1回まで（毎フレーム送らない）。
+    /// </summary>
+    private static bool CloseOwnWindows(ref DateTime lastClose)
+    {
+        var target = GameUi.Addon("ItemSearchResult");
+        if (target == null)
+            target = GameUi.Addon("ItemSearch");
+        if (target == null)
+            return false;
+
+        if (DateTime.UtcNow - lastClose >= TimeSpan.FromSeconds(0.5))
         {
-            s->Close(true);
-            if (this.TimedOut(TimeSpan.FromSeconds(5)))
-                return TaskResult.Done;
-            return TaskResult.Running;
+            lastClose = DateTime.UtcNow;
+            Core.DebugLog.Current?.Line("操作", $"画面を閉じます: {target->NameString}");
+            target->Close(true);
         }
 
-        return TaskResult.Done;
+        return true;
     }
 
     public override void Cleanup(TaskContext ctx)
     {
         this.sub?.Cleanup(ctx);
         this.sub = null;
+
+        // 途中で止まったとき、こちらが開いた MB の画面を閉じる（開いたままだと
+        // 「ショップ系の画面が開いている間は移動しない」決まりで次の作業が進まない）
+        if (this.openedByMe)
+        {
+            foreach (var name in new[] { "ItemSearchResult", "ItemSearch" })
+            {
+                if (GameUi.Addon(name) is var w && w != null)
+                {
+                    Core.DebugLog.Current?.Line("操作", $"止めたので画面を閉じます: {name}");
+                    w->Close(true);
+                }
+            }
+        }
     }
 
     // ---- 出品の読み取り ----
@@ -813,7 +927,7 @@ public sealed unsafe class MarketBoardTask : AutoTask
             var l = proxy->Listings[i];
             if (l.ItemId != this.searching || l.UnitPrice == 0 || l.Quantity == 0)
                 continue;
-            if (l.IsSellingAsSet || own.Contains(l.RetainerId))
+            if (l.IsSellingAsSet || own.Contains(l.RetainerId) || this.boughtListings.Contains(l.ListingId))
                 continue;
 
             list.Add(new Offer(l.ListingId, (int)l.Quantity, l.UnitPrice, (long)l.UnitPrice * l.Quantity + l.TotalTax));
@@ -825,10 +939,15 @@ public sealed unsafe class MarketBoardTask : AutoTask
     private static HashSet<ulong> OwnRetainers()
     {
         var set = new HashSet<ulong>();
+        // リテイナーの情報がまだ届いていない（IsReady=false）と ID が空なので、自分の出品を見分けられない。
+        // その場合は除外できないことを記録に残す（買っても自分のギルが自分に戻るだけで、実害は手数料のみ）
         var rm = RetainerManager.Instance();
-        if (rm == null)
+        if (rm == null || !rm->IsReady)
+        {
+            Core.DebugLog.Current?.Line("マーケット", "リテイナー情報がまだ読めないので、自分の出品を除外できません");
             return set;
-        var n = rm->GetRetainerCount();
+        }
+
         for (var i = 0; i < 10; i++)
         {
             var r = rm->Retainers[i];

@@ -137,6 +137,7 @@ public class SequenceTask : AutoTask
             {
                 ctx.Log.Warn("段", $"{this.current.Name} で例外: {ex.GetType().Name}: {ex.Message}");
                 Svc.Log.Error(ex, $"[AutoJobQuest] {this.current.Name}");
+                DebugLog.Current?.Exception("段", $"{this.current.Name} で例外", ex);
                 r = TaskResult.Failed;
             }
 

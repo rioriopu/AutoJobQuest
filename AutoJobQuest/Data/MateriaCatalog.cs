@@ -50,46 +50,31 @@ public static class MateriaCatalog
     public static bool IsMateria(uint itemId) => Map.ContainsKey(itemId);
 
     /// <summary>
-    /// 「種類不問」のときに候補にするマテリア（アイテム ID）。
-    ///
-    /// 条件:
-    ///  ・対象装備のアイテムLv 以下のアイテムLv（付けられる等級）
-    ///  ・効果値が 0 でない（剛力など効果値 0 の旧マテリアは今は付けても意味がなく、出品もまず無い）
-    ///  ・対象装備が持っている能力値のマテリアを先に並べる（確実に付けられるものから試す）
-    /// 同じ種類なら等級の低い（安い）ほうだけを候補にする。
+    /// 「種類不問」のときに付けるマテリア（設定 <see cref="Configuration.AnyMateriaItemId"/>。既定は剛柔のマテリア）を、
+    /// その納品物に付けられるか確かめて返す。付けられなければ null と理由。
     /// </summary>
-    public static List<uint> CandidatesFor(uint targetItemId)
+    public static uint? ResolveAny(uint configured, uint targetItemId, out string? problem)
     {
+        problem = null;
         var items = Svc.Data.GetExcelSheet<Item>();
-        if (!items.TryGetRow(targetItemId, out var target))
-            return [];
-
-        var targetLevel = target.LevelItem.RowId;
-        var ownParams = new HashSet<uint>();
-        foreach (var bp in target.BaseParam)
-            if (bp.RowId != 0)
-                ownParams.Add(bp.RowId);
-
-        var preferred = new List<uint>();
-        var others = new List<uint>();
-        foreach (var m in Svc.Data.GetExcelSheet<Materia>())
+        if (configured == 0 || !items.TryGetRow(configured, out var materia))
         {
-            if (m.BaseParam.RowId == 0)
-                continue;
-
-            for (var g = 0; g < m.Item.Count; g++)
-            {
-                var it = m.Item[g].RowId;
-                if (it == 0 || m.Value[g] <= 0)
-                    continue;
-                if (!items.TryGetRow(it, out var mi) || mi.LevelItem.RowId > targetLevel)
-                    continue;
-
-                (ownParams.Contains(m.BaseParam.RowId) ? preferred : others).Add(it);
-                break; // 同じ種類は一番低い等級だけ
-            }
+            problem = $"設定の「任意のマテリアに使う品」（{configured}）がアイテムとして見つかりません";
+            return null;
         }
 
-        return preferred.Concat(others).ToList();
+        if (!IsMateria(configured))
+        {
+            problem = $"設定の「任意のマテリアに使う品」{materia.Name.ExtractText()} はマテリアではありません";
+            return null;
+        }
+
+        if (items.TryGetRow(targetItemId, out var target) && materia.LevelItem.RowId > target.LevelItem.RowId)
+        {
+            problem = $"{materia.Name.ExtractText()}（アイテムLv{materia.LevelItem.RowId}）は {target.Name.ExtractText()}（アイテムLv{target.LevelItem.RowId}）に付けられません";
+            return null;
+        }
+
+        return configured;
     }
 }

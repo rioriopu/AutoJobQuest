@@ -29,6 +29,7 @@ public sealed class JobQuestFlow : AutoTask
         WaitData,
         Preflight,
         WaitPreflightAnswer,
+        WaitSwitchAnswer,
         BookPrep,
         WaitBookData,
         Acquire,
@@ -48,6 +49,10 @@ public sealed class JobQuestFlow : AutoTask
     // 入手に失敗した手段（品目 → 手段）
     private readonly Dictionary<uint, HashSet<Route>> excluded = [];
 
+    // 採集・戦闘などで集めきれず、マーケット購入への切り替えを利用者が「はい」と答えた品目
+    private readonly HashSet<uint> marketSwitchApproved = [];
+    private List<uint> pendingSwitch = [];
+
     // 今の周回で作った作業（終わったあとに失敗した品目を集めるため）
     private readonly List<AutoTask> roundTasks = [];
 
@@ -55,7 +60,7 @@ public sealed class JobQuestFlow : AutoTask
     private Task<BookData>? bookBuild;
     private BookData? books;
     private List<BookOffer> booksToBuy = [];
-    private int collectablesToMake;
+    private int collectablesNeeded;
     private bool booksDone;
 
     public JobQuestFlow(bool[] selected)
@@ -116,6 +121,21 @@ public sealed class JobQuestFlow : AutoTask
                 if (ans == false)
                     return this.Fail("事前点検の確認で「いいえ」が選ばれました");
                 this.stage = Stage.BookPrep;
+                return TaskResult.Running;
+            }
+
+            case Stage.WaitSwitchAnswer:
+            {
+                var ans = ctx.Confirm.Poll(this.confirmTicket);
+                if (ans == null)
+                    return TaskResult.Running;
+                if (ans == false)
+                    return this.Fail("マーケット購入への切り替えの確認で「いいえ」が選ばれました");
+                foreach (var id in this.pendingSwitch)
+                    this.marketSwitchApproved.Add(id);
+                ctx.Log.Write("素材", $"マーケット購入への切り替えが了承されました：{string.Join("、", this.pendingSwitch.Select(CraftPlanner.ItemName))}");
+                this.pendingSwitch = [];
+                this.stage = Stage.Acquire;
                 return TaskResult.Running;
             }
 
@@ -212,6 +232,7 @@ public sealed class JobQuestFlow : AutoTask
         ctx.Log.Write("秘伝書", $"未読の秘伝書：{string.Join("、", bookItems.Select(CraftPlanner.ItemName))}");
         this.bookBuild = Task.Run(() => BookData.Build(bookItems, collectable));
         this.stage = Stage.WaitBookData;
+        this.NextPhase("秘伝書・収集品のデータを調べています");
         return TaskResult.Running;
     }
 
@@ -220,7 +241,9 @@ public sealed class JobQuestFlow : AutoTask
         if (this.bookBuild == null || !this.bookBuild.IsCompleted)
         {
             this.Status = "秘伝書・収集品のデータを調べています";
-            return TaskResult.Running;
+            return this.PhaseElapsed > TimeSpan.FromMinutes(3)
+                ? this.Fail("秘伝書・収集品のデータの計算が3分たっても終わりません")
+                : TaskResult.Running;
         }
 
         if (this.bookBuild.IsFaulted)
@@ -238,27 +261,31 @@ public sealed class JobQuestFlow : AutoTask
         var scripNeed = Math.Max(0, price - scrips);
         var held = Inventory.CountCollectables(this.books.CollectableItemId, this.books.MinCollectability);
 
-        // 1個あたりの報酬は、確実に足りるよう「低」で見積もる（シーダーロングボウは 45。最高評価なら 54）
-        this.collectablesToMake = this.books.RewardLow > 0
-            ? Math.Max(0, (int)Math.Ceiling(scripNeed / (double)this.books.RewardLow) - held)
+        // 1個あたりの報酬は、確実に足りるよう「低」で見積もる（シーダーロングボウは 45。最高評価なら 54）。
+        // 持っていたい総数で覚える（手持ちは計画を立てるたびに1回だけ引く。二重に引かない）
+        this.collectablesNeeded = this.books.RewardLow > 0
+            ? (int)Math.Ceiling(scripNeed / (double)this.books.RewardLow)
             : 0;
 
         ctx.Log.Write("秘伝書",
             $"交換 {this.booksToBuy.Count} 冊（紫貨 {price}）、所持 {scrips}、不足 {scripNeed}。"
-            + $"{CraftPlanner.ItemName(this.books.CollectableItemId)} を {this.collectablesToMake} 個作ります"
-            + $"（1個 {this.books.RewardLow}〜{this.books.RewardHigh}、手持ちの収集品 {held} 個）");
+            + $"{CraftPlanner.ItemName(this.books.CollectableItemId)} が {this.collectablesNeeded} 個要ります"
+            + $"（1個 {this.books.RewardLow}〜{this.books.RewardHigh}、手持ちの収集品 {held} 個 → 作るのは {Math.Max(0, this.collectablesNeeded - held)} 個）");
 
         this.stage = Stage.Acquire;
         return TaskResult.Running;
     }
 
-    /// <summary>素材計画に足す、紫貨のための収集品。</summary>
+    /// <summary>
+    /// 素材計画に足す、紫貨のための収集品。個数は「持っていたい総数」で渡す
+    /// （計画係が手持ちを引くので、ここで引くと二重になる）。
+    /// </summary>
     private IEnumerable<QuestItemReq> ExtraTargets()
     {
-        if (this.booksDone || this.books == null || this.collectablesToMake <= 0)
+        if (this.booksDone || this.books == null || this.collectablesNeeded <= 0)
             yield break;
 
-        yield return new QuestItemReq(this.books.CollectableItemId, this.collectablesToMake, false, "紫貨のための収集品");
+        yield return new QuestItemReq(this.books.CollectableItemId, this.collectablesNeeded, false, "紫貨のための収集品");
     }
 
     // ------------------------------------------------------------------
@@ -276,7 +303,28 @@ public sealed class JobQuestFlow : AutoTask
             .Select(kv => (Item: kv.Key, Need: kv.Value, Routes: this.RoutesFor(ctx, kv.Key)))
             .ToList();
 
-        var marketMateria = MateriaMarketNeeds(plan);
+        var marketMateria = MateriaMarketNeeds(ctx.Config, plan);
+
+        // 採集・戦闘・NPC 購入で集めきれず、次の手段がマーケットになった品目は、買う前に利用者に確かめる
+        // （時間切れや拒否で、聞かずにギルを使う手段へ切り替えない）
+        var switched = raw
+            .Where(r => r.Routes.Count > 0 && r.Routes[0] == Route.MarketBoard
+                        && this.excluded.TryGetValue(r.Item, out var bad) && bad.Count > 0
+                        && !this.marketSwitchApproved.Contains(r.Item))
+            .ToList();
+        if (switched.Count > 0)
+        {
+            this.pendingSwitch = switched.Select(r => r.Item).ToList();
+            var lines = switched.Select(r =>
+                $"・{CraftPlanner.ItemName(r.Item)}×{r.Need}（{string.Join("・", this.excluded[r.Item].Select(Ui.MainWindow.RouteName))} で集めきれませんでした）");
+            this.confirmTicket = ctx.Confirm.Ask(
+                "マーケット購入への切り替えの確認",
+                "次の素材は、予定の手段では集めきれませんでした。\n\n" + string.Join("\n", lines)
+                + "\n\nマーケットボードで買ってよいですか？「はい」で買います（1回の購入額が基準を超えるときは、あらためて確認します）。「いいえ」で自動動作を止めます。");
+            ctx.Log.Warn("素材", "集めきれなかった素材をマーケットで買うか、確認を出しました：" + string.Join(" ", lines));
+            this.stage = Stage.WaitSwitchAnswer;
+            return TaskResult.Running;
+        }
 
         if (raw.Count == 0 && marketMateria.Count == 0)
         {
@@ -330,7 +378,9 @@ public sealed class JobQuestFlow : AutoTask
                 steps.Add(_ => new TeleportTask(terr, firstSpot));
                 steps.Add(_ => this.Track(new CombatTask(terr, needs, spots, TimeSpan.FromMinutes(25))));
 
-                var here = gather.Where(g => ctx.Gbr.GatherableTerritories(g.Item)?.Contains(terr) == true).ToList();
+                // 同じ採集品が複数のマップで採れても、割り当てるのは最初のマップだけ
+                // （複数のマップに同じ不足数で入れると、その数だけ余計に採る）
+                var here = gather.Where(g => !gatheredInMap.Contains(g.Item) && ctx.Gbr.GatherableTerritories(g.Item)?.Contains(terr) == true).ToList();
                 foreach (var g in here)
                     gatheredInMap.Add(g.Item);
                 if (here.Count > 0)
@@ -350,23 +400,19 @@ public sealed class JobQuestFlow : AutoTask
                 rest.Select(g => new GatherNeed(g.Item, g.Need)), null, "採掘・園芸", TimeSpan.FromMinutes(90))));
         }
 
-        // 5) 釣り（GBR の釣果送信の同意が ON のときだけ。OFF なら手を出さずに記録する）
+        // 5) 釣り（GBR に一任）。GBR が釣れない設定なら、別の手段に黙って切り替えずに止める
         var fish = raw.Where(r => r.Routes[0] == Route.Fish).ToList();
         if (fish.Count > 0)
         {
-            if (ctx.Gbr.ReadAutoGatherBool("FishDataCollection") == true)
+            if (ctx.Gbr.ReadAutoGatherBool("FishDataCollection") != true)
             {
-                steps.Add(_ => this.Track(new GatherTask(
-                    fish.Select(f => new GatherNeed(f.Item, f.Need)), null, "釣り", TimeSpan.FromMinutes(90))));
+                return this.Fail(
+                    $"釣りで集める素材（{string.Join("、", fish.Select(f => $"{CraftPlanner.ItemName(f.Item)}×{f.Need}"))}）がありますが、"
+                    + "GBR の「Opt-in to fishing data collection」が OFF のため GBR は釣りをしません（こちらからは変えません）");
             }
-            else
-            {
-                foreach (var f in fish)
-                {
-                    ctx.Log.Warn("釣り", $"{CraftPlanner.ItemName(f.Item)}×{f.Need}：GBR の釣果送信の同意が OFF のため釣れません（GBR の設定で ON にするかは利用者の判断です）");
-                    this.Exclude(f.Item, Route.Fish);
-                }
-            }
+
+            steps.Add(_ => this.Track(new GatherTask(
+                fish.Select(f => new GatherNeed(f.Item, f.Need)), null, "釣り", TimeSpan.FromMinutes(90))));
         }
 
         this.child = new SequenceTask($"素材集め {this.round}周目", steps);
@@ -381,23 +427,21 @@ public sealed class JobQuestFlow : AutoTask
         return routes;
     }
 
-    /// <summary>マテリア装着に要るマテリアのうち、カバンに無いもの（マーケットで買う）。</summary>
-    private static List<MarketNeed> MateriaMarketNeeds(JobQuestPlan plan)
+    /// <summary>
+    /// マテリア装着に要るマテリアのうち、カバンに無いもの（マーケットで買う）。
+    ///
+    /// 「種類不問」（各クラフター Lv20 の納品物）は、設定の品（剛柔のマテリア）を買って付ける。
+    /// 付けられない（設定の品がマテリアでない・アイテムLvが高すぎる）ものは買わずに記録し、事前点検で止める。
+    /// </summary>
+    private static List<MarketNeed> MateriaMarketNeeds(Configuration config, JobQuestPlan plan)
     {
         var list = new List<MarketNeed>();
         var specific = new Dictionary<uint, int>();
         foreach (var m in plan.Materia.Where(m => !m.AlreadyMelded))
         {
-            if (m.MateriaItemId is { } mid)
-            {
-                specific[mid] = specific.GetValueOrDefault(mid) + 1;
-                continue;
-            }
-
-            var candidates = MateriaCatalog.CandidatesFor(m.TargetItemId);
-            if (candidates.Any(c => Inventory.CountNow(c) > 0))
-                continue;
-            list.Add(new MarketNeed(candidates, 1, $"{CraftPlanner.ItemName(m.TargetItemId)} に付けるマテリア（種類不問）"));
+            var mid = m.MateriaItemId ?? MateriaCatalog.ResolveAny(config.AnyMateriaItemId, m.TargetItemId, out _);
+            if (mid is { } id)
+                specific[id] = specific.GetValueOrDefault(id) + 1;
         }
 
         foreach (var (mid, count) in specific)
@@ -481,18 +525,21 @@ public sealed class JobQuestFlow : AutoTask
             steps.Add(_ => new RunQuestTask(b.RequiredQuest, qname));
         }
 
-        if (this.collectablesToMake > 0)
+        if (this.collectablesNeeded > Inventory.CountCollectables(b.CollectableItemId, b.MinCollectability))
         {
             steps.Add(_ => new GoToInnTask());
             steps.Add(c =>
             {
-                // 収集品の製作（中間素材から）。この時点の所持数で計画し直す
+                // 収集品の製作（中間素材から）。この時点の所持数で計画し直す。
+                // 作る数＝要る総数 − 納品の下限を満たす手持ち。計画係は同じ品の手持ち（下限未満も含む）を引くので、その分を足して渡す
                 var held = Inventory.CountCollectables(b.CollectableItemId, b.MinCollectability);
-                var make = Math.Max(0, this.collectablesToMake - held);
+                var make = Math.Max(0, this.collectablesNeeded - held);
                 if (make == 0)
                     return null;
 
-                var plan = c.Data.Planner!.Build([new QuestItemReq(b.CollectableItemId, make, false, string.Empty)], Inventory.Snapshot(), PlanBuilder.IsBookUnlocked);
+                var inv = Inventory.Snapshot();
+                c.Log.Write("秘伝書", $"{CraftPlanner.ItemName(b.CollectableItemId)} を {make} 個作ります（要る {this.collectablesNeeded}・使える手持ち {held}）");
+                var plan = c.Data.Planner!.Build([new QuestItemReq(b.CollectableItemId, make + inv.CountAll(b.CollectableItemId), false, string.Empty)], inv, PlanBuilder.IsBookUnlocked);
                 if (plan.RawShortfall.Count > 0)
                 {
                     c.Log.Warn("秘伝書", $"収集品の素材が足りません：{string.Join("、", plan.RawShortfall.Select(x => $"{CraftPlanner.ItemName(x.Key)}×{x.Value}"))}");
@@ -566,7 +613,7 @@ public sealed class JobQuestFlow : AutoTask
         }
 
         // マテリアが無ければ集め直す
-        if (MateriaMarketNeeds(plan).Count > 0)
+        if (MateriaMarketNeeds(ctx.Config, plan).Count > 0)
         {
             this.stage = Stage.Acquire;
             return TaskResult.Running;
@@ -601,7 +648,9 @@ public sealed class JobQuestFlow : AutoTask
             return TaskResult.Running;
         }
 
-        this.child = new SequenceTask("ジョブクエ", plan.RemainingQuests.Select(q => (Func<TaskContext, AutoTask?>)(_ => new QuestTask(q))));
+        // 1本ずつ進め、終わるたびに計画を立て直す（Questionable が Artisan の既製リストで
+        // 手持ちの材料を使うことがあるので、次のクエストの納品物が残っているかを毎回確かめてから始める）
+        this.child = new QuestTask(plan.RemainingQuests[0]);
         return TaskResult.Running;
     }
 
@@ -639,9 +688,8 @@ public sealed class JobQuestFlow : AutoTask
 
         // 念のため、他プラグインへ頼んでいたことを全部戻す
         ctx.Rotation.ClearOwnPriorities();
-        ctx.Gbr.RestoreGatherLists();
-        ctx.Gbr.RestoreConfig();
+        ctx.Rotation.ReleaseHenched();
+        ctx.Gbr.RestoreIfIdle(ctx.GatherBuddy.IsAutoGatherEnabled(), ctx.Gbr.VendorIsBusy());
         ctx.TextAdvance.ReleaseControl();
-        ctx.YesAlready.Release();
     }
 }

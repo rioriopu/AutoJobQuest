@@ -26,9 +26,12 @@ public sealed class LifestreamIpc : IpcGate
 
     /// <summary>指定のエーテライトへテレポートする。false なら未アクセスかテレポートできない状態。</summary>
     public bool TryTeleport(uint aetheryteId, byte subIndex, out bool accepted)
-        => this.TryInvoke("Teleport",
+    {
+        this.Trace($"Teleport(エーテライト {aetheryteId}, {subIndex})");
+        return this.TryInvoke("Teleport",
             () => this.Func<uint, byte, bool>("Lifestream.Teleport").InvokeFunc(aetheryteId, subIndex),
             out accepted);
+    }
 
     /// <summary>Lifestream が何か処理中か。読めなければ null。</summary>
     public bool? IsBusy()
@@ -38,10 +41,10 @@ public sealed class LifestreamIpc : IpcGate
 
     /// <summary>同じワールドの宿屋へ向かう処理を積む。</summary>
     public bool EnqueueLocalInn(int innIndex)
-        => this.TryAction("EnqueueLocalInnShortcut",
+        => this.TraceThen($"EnqueueLocalInnShortcut({innIndex})") && this.TryAction("EnqueueLocalInnShortcut",
             () => this.Func<int?, object>("Lifestream.EnqueueLocalInnShortcut").InvokeAction(innIndex));
 
     /// <summary>Lifestream の処理を中断する。自分が頼んだ処理のときだけ呼ぶこと。</summary>
     public bool Abort()
-        => this.TryAction("Abort", () => this.Func<object>("Lifestream.Abort").InvokeAction());
+        => this.TraceThen("Abort()") && this.TryAction("Abort", () => this.Func<object>("Lifestream.Abort").InvokeAction());
 }

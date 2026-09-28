@@ -6,8 +6,8 @@ namespace AutoJobQuest.Core;
 /// <summary>
 /// 動作の記録。画面に出すためのもの。
 ///
-/// ファイルには書かない。記録したいのは「いま何が起きているか」で、
-/// 後から追いたいときは Dalamud のログ（/xllog）に同じ内容が流れている。
+/// 同じ内容をファイル（<see cref="DebugLog"/>）と Dalamud のログ（/xllog）にも流す。
+/// 画面に出すほどではない細かい記録は <see cref="Debug"/> でファイルにだけ書く。
 /// </summary>
 public sealed class RunLog
 {
@@ -31,6 +31,14 @@ public sealed class RunLog
         }
 
         Svc.Log.Information($"[{category}] {message}");
+        DebugLog.Current?.Line(category, message);
+    }
+
+    /// <summary>ファイルにだけ書く細かい記録（画面には出さない）。</summary>
+    public void Debug(string category, string message)
+    {
+        DebugLog.Current?.Line(category, message);
+        Svc.Log.Debug($"[{category}] {message}");
     }
 
     /// <summary>警告として記録する。画面では同じ行に並ぶが、/xllog では Warning になる。</summary>
@@ -47,6 +55,7 @@ public sealed class RunLog
         }
 
         Svc.Log.Warning($"[{category}] {message}");
+        DebugLog.Current?.Line(category, "⚠ " + message);
     }
 
     /// <summary>画面表示用に直近の行を返す。</summary>

@@ -39,7 +39,6 @@ public sealed class GatherTask : AutoTask
 
     private readonly Dictionary<uint, uint> targets = [];
     private bool enabledByMe;
-    private bool prepared;
 
     /// <summary>集めきれなかった品目（呼び出し側が次の手段を選ぶのに使う）。</summary>
     public List<uint> Unfinished { get; } = [];
@@ -68,8 +67,12 @@ public sealed class GatherTask : AutoTask
         if (!ctx.GatherBuddy.IsLoaded)
             return this.Fail("GatherBuddyReborn が読み込まれていません");
 
-        if (ctx.GatherBuddy.IsAutoGatherEnabled() == true)
-            return this.Fail("GBR の自動採集がすでに動いています（利用者の操作を横取りしないため止めました）");
+        // 動いている・読めないときは始めない（利用者の操作を横取りしない。fail-closed）
+        var running = ctx.GatherBuddy.IsAutoGatherEnabled();
+        if (running != false)
+            return this.Fail(running == true
+                ? "GBR の自動採集がすでに動いています（利用者の操作を横取りしないため止めました）"
+                : "GBR の自動採集の状態が読めません");
 
         foreach (var n in this.needs)
             this.targets[n.ItemId] = (uint)(GbrCount(n.ItemId) + n.Shortfall);
@@ -82,7 +85,6 @@ public sealed class GatherTask : AutoTask
         if (!ctx.Gbr.PrepareGatherList(entries, out var unsupported))
             return this.Fail(ctx.Gbr.LastError ?? "GBR のリストを用意できませんでした");
 
-        this.prepared = true;
         foreach (var id in unsupported)
         {
             ctx.Log.Warn("採集", $"{CraftPlanner.ItemName(id)} は GBR で扱えない品目でした");
@@ -110,14 +112,16 @@ public sealed class GatherTask : AutoTask
         var on = ctx.GatherBuddy.IsAutoGatherEnabled();
         if (!this.enabledByMe)
         {
+            // ON を頼むのは1回だけ（GBR は断るときその場で断り、毎回チャットに理由を出すため、繰り返さない）
+            this.enabledByMe = true;
             if (!ctx.GatherBuddy.SetAutoGatherEnabled(true))
             {
-                if (this.PhaseElapsed > TimeSpan.FromSeconds(10))
-                    return this.Fail($"GBR の自動採集が ON になりません（{ctx.GatherBuddy.StatusText()}）。知覚不足・ギアセット無しなどが考えられます");
-                return TaskResult.Running;
+                this.enabledByMe = ctx.GatherBuddy.IsAutoGatherEnabled() != false;
+                this.Unfinished.AddRange(remaining.Select(r => r.Key));
+                ctx.Log.Warn("採集", $"GBR の自動採集が ON になりません（{ctx.GatherBuddy.StatusText()}）。知覚不足・ギアセット無し・エサ無しなどが考えられます。別の入手手段にします");
+                return TaskResult.Done;
             }
 
-            this.enabledByMe = true;
             this.NextPhase("GBR が採集中");
             return TaskResult.Running;
         }
@@ -132,9 +136,8 @@ public sealed class GatherTask : AutoTask
             }
 
             this.enabledByMe = false;
-            return this.Unfinished.Count == this.needs.Count
-                ? this.Fail($"GBR が止まりました: {ctx.GatherBuddy.StatusText()}")
-                : TaskResult.Done;
+            ctx.Log.Warn("採集", $"GBR が止まりました（{ctx.GatherBuddy.StatusText()}）。集めきれなかった品目は別の入手手段にします");
+            return TaskResult.Done;
         }
 
         if (this.Elapsed > this.limit)
@@ -151,13 +154,15 @@ public sealed class GatherTask : AutoTask
 
     public override void Cleanup(TaskContext ctx)
     {
-        if (this.enabledByMe && ctx.GatherBuddy.IsAutoGatherEnabled() == true)
+        // こちらが ON にしたなら OFF を頼む（読めないときも頼む）
+        if (this.enabledByMe && ctx.GatherBuddy.IsAutoGatherEnabled() != false)
             ctx.GatherBuddy.SetAutoGatherEnabled(false);
         this.enabledByMe = false;
 
-        if (this.prepared)
-            ctx.Gbr.RestoreGatherLists();
-        ctx.Gbr.RestoreConfig();
+        // 止まったことを確かめられたときだけリストと設定を戻す。戻せなければ控えを残し、
+        // 止まっている間に Services が定期的に戻す
+        if (!ctx.Gbr.RestoreIfIdle(ctx.GatherBuddy.IsAutoGatherEnabled(), ctx.Gbr.VendorIsBusy()))
+            ctx.Log.Warn("採集", "GBR が止まったことを確かめられないので、リストと設定は後で戻します");
     }
 }
 
@@ -205,6 +210,10 @@ public sealed class VendorTask : AutoTask
     {
         if (this.needs.Count == 0)
             return TaskResult.Done;
+
+        // 利用者が GBR の自動採集を使っている・読めないときは始めない（fail-closed）
+        if (ctx.GatherBuddy.IsAutoGatherEnabled() != false)
+            return this.Fail("GBR の自動採集が動いている（または状態が読めない）ので、NPC 購入を始めません");
 
         foreach (var n in this.needs)
             this.targets[n.ItemId] = VendorCount(n.ItemId) + n.Shortfall;
@@ -304,6 +313,11 @@ public sealed class VendorTask : AutoTask
     {
         if (this.started && ctx.Gbr.VendorIsBusy() == true)
             ctx.Gbr.StopVendor();
-        ctx.Gbr.RestoreConfig();
+
+        // 購入が止まっていれば、リストの品目を消し、設定を戻す（動いていれば後で戻す）
+        if (ctx.Gbr.VendorIsBusy() == false)
+            ctx.Gbr.ClearVendorList();
+        if (!ctx.Gbr.RestoreIfIdle(ctx.GatherBuddy.IsAutoGatherEnabled(), ctx.Gbr.VendorIsBusy()))
+            ctx.Log.Warn("購入", "GBR が止まったことを確かめられないので、設定は後で戻します");
     }
 }

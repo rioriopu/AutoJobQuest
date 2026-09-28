@@ -29,7 +29,7 @@ public sealed class QuestTask : AutoTask
     private readonly JobQuest quest;
     private bool started;
     private int restarts;
-    private DateTime notRunningSince = DateTime.MinValue;
+    private int notRunningFrames;
 
     // 報告を自前で行うとき
     private bool manualTurnIn;
@@ -124,26 +124,25 @@ public sealed class QuestTask : AutoTask
             }
         }
 
+        // Questionable の IsRunning は「単体クエストの進行中（SingleQuestA/B）なら true」で、止まるか終わると false になる
+        // （QuestionableIpc.cs:142）。クエストの完了は上で先に見ているので、false が続けば止まったとみなす。
+        // 1フレームのずれを避けるため、続けて3回 false を見てから判断する（時間ではなく状態で判断する）
         var running = ctx.Questionable.IsRunning();
         if (running == false)
         {
-            if (this.notRunningSince == DateTime.MinValue)
-                this.notRunningSince = DateTime.UtcNow;
-
-            // 手順の切れ目で一瞬止まることがあるので、少し続いたら止まったとみなしてやり直す
-            if (DateTime.UtcNow - this.notRunningSince > TimeSpan.FromSeconds(8))
+            if (++this.notRunningFrames >= 3)
             {
                 if (this.restarts++ >= 3)
                     return this.Fail("Questionable が途中で止まりました（3回やり直しても進みません）");
 
                 ctx.Log.Warn("クエスト", "Questionable が止まったので、もう一度始めます");
                 this.started = false;
-                this.notRunningSince = DateTime.MinValue;
+                this.notRunningFrames = 0;
             }
         }
         else
         {
-            this.notRunningSince = DateTime.MinValue;
+            this.notRunningFrames = 0;
         }
 
         return TaskResult.Running;

@@ -47,6 +47,7 @@ public sealed class GatherBuddyIpc : IpcGate
         if (this.IsAutoGatherEnabled() == value)
             return true;
 
+        this.Trace($"SetAutoGatherEnabled({value})");
         this.TryAction("SetAutoGatherEnabled",
             () => this.Func<bool, object>(Prefix + "SetAutoGatherEnabled").InvokeAction(value));
 

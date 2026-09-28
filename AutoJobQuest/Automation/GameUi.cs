@@ -61,7 +61,13 @@ public static unsafe class GameUi
     public static void Fire(AtkUnitBase* addon, bool updateState, params object[] values)
     {
         if (addon == null)
+        {
+            Core.DebugLog.Current?.Line("操作", $"コールバック送信先の画面がありません（値: {string.Join(", ", values)}）");
             return;
+        }
+
+        // 送った操作を記録する（不具合のとき、どの画面に何を送ったかを追えるように）
+        Core.DebugLog.Current?.Line("操作", $"コールバック送信: {addon->NameString}（{string.Join(", ", System.Linq.Enumerable.Select(values, v => $"{v?.GetType().Name}:{v}"))}）更新={updateState}");
 
         var atk = stackalloc AtkValue[values.Length];
         var strings = new System.Collections.Generic.List<nint>();
@@ -129,16 +135,67 @@ public static unsafe class GameUi
 
     public static bool Mounted => Svc.Condition[ConditionFlag.Mounted];
 
-    /// <summary>オブジェクトに話しかける（ターゲットしてインタラクト）。</summary>
+    /// <summary>
+    /// オブジェクトに話しかける。ターゲットが違えば、まずターゲットだけして false を返す（次の呼び出しで話しかける）。
+    /// 視線判定なし（checkLineOfSight: false）で話しかける
+    /// （同じフレームでターゲットと話しかけを行うと効かないことがある）。
+    /// 呼び出し側は1秒程度の間隔を置いて繰り返し呼ぶこと。
+    /// </summary>
     public static bool Interact(Dalamud.Game.ClientState.Objects.Types.IGameObject obj)
     {
         var ts = TargetSystem.Instance();
         if (ts == null)
             return false;
 
+        if (Svc.Targets.Target?.Address != obj.Address)
+        {
+            Svc.Targets.Target = obj;
+            Core.DebugLog.Current?.Line("操作", $"ターゲット: {obj.Name.TextValue}（BaseId {obj.BaseId}、距離 {System.Numerics.Vector3.Distance(obj.Position, Me.Position):0.0}m）");
+            return false;
+        }
+
         var go = (GameObject*)obj.Address;
-        Svc.Targets.Target = obj;
-        return ts->InteractWithObject(go, true) != 0;
+        var ok = ts->InteractWithObject(go, false) != 0;
+        Core.DebugLog.Current?.Line("操作", $"話しかけ: {obj.Name.TextValue}（BaseId {obj.BaseId}、距離 {System.Numerics.Vector3.Distance(obj.Position, Me.Position):0.0}m）→ {(ok ? "受け付け" : "受け付けられず")}");
+        return ok;
+    }
+
+    /// <summary>
+    /// 会話ウィンドウ（Talk）を1つ進める（ECommons AddonMaster.Talk.Click と同じ：MouseDown→MouseClick→MouseUp）。
+    /// </summary>
+    public static bool AdvanceTalk()
+    {
+        if (!IsReady("Talk", out var addon))
+            return false;
+
+        var evt = stackalloc AtkEvent[1];
+        evt[0] = new AtkEvent
+        {
+            Listener = (AtkEventListener*)addon,
+            Target = &AtkStage.Instance()->AtkEventTarget,
+            State = new AtkEventState { StateFlags = (AtkEventStateFlags)132 },
+        };
+        var data = stackalloc AtkEventData[1];
+        for (var i = 0; i < sizeof(AtkEventData); i++)
+            ((byte*)data)[i] = 0;
+
+        Core.DebugLog.Current?.Line("操作", "会話を進めます（Talk）");
+        addon->ReceiveEvent(AtkEventType.MouseDown, 0, evt, data);
+        addon->ReceiveEvent(AtkEventType.MouseClick, 0, evt, data);
+        addon->ReceiveEvent(AtkEventType.MouseUp, 0, evt, data);
+        return true;
+    }
+
+    /// <summary>
+    /// 確認窓（SelectYesno）の「はい」をボタンとして押す。ボタンが無効・非表示なら押さない
+    /// （FireCallbackInt(0) はゲームが押させない場面でも通してしまうため使わない）。
+    /// </summary>
+    public static bool ClickYes(AtkUnitBase* addon)
+    {
+        if (addon == null)
+            return false;
+        var y = (AddonSelectYesno*)addon;
+        return ClickComponentButton(addon, y->YesButton, "はい");
     }
 
     /// <summary>
@@ -149,13 +206,26 @@ public static unsafe class GameUi
     {
         if (addon == null)
             return false;
-        var button = addon->GetComponentButtonById(nodeId);
-        if (button == null || !button->IsEnabled || button->AtkComponentBase.OwnerNode == null)
+        return ClickComponentButton(addon, addon->GetComponentButtonById(nodeId), $"ノード{nodeId}");
+    }
+
+    private static bool ClickComponentButton(AtkUnitBase* addon, AtkComponentButton* button, string label)
+    {
+        if (button == null || !button->IsEnabled || button->AtkComponentBase.OwnerNode == null
+            || !button->AtkComponentBase.OwnerNode->AtkResNode.IsVisible())
+        {
+            Core.DebugLog.Current?.Line("操作", $"ボタンを押せません: {addon->NameString} {label}（{(button == null ? "無い" : "押せない状態か非表示")}）");
             return false;
-        var res = button->AtkComponentBase.OwnerNode->AtkResNode;
-        var evt = res.AtkEventManager.Event;
+        }
+
+        var evt = button->AtkComponentBase.OwnerNode->AtkResNode.AtkEventManager.Event;
         if (evt == null)
+        {
+            Core.DebugLog.Current?.Line("操作", $"ボタンを押せません: {addon->NameString} {label}（イベントが無い）");
             return false;
+        }
+
+        Core.DebugLog.Current?.Line("操作", $"ボタン押下: {addon->NameString} {label}");
         addon->ReceiveEvent(evt->State.EventType, (int)evt->Param, evt);
         return true;
     }
@@ -221,5 +291,9 @@ public static unsafe class GameUi
 
     /// <summary>一般アクション（GeneralAction）を使う。</summary>
     public static bool UseGeneralAction(uint id)
-        => ActionManager.Instance()->UseAction(ActionType.GeneralAction, id);
+    {
+        var ok = ActionManager.Instance()->UseAction(ActionType.GeneralAction, id);
+        Core.DebugLog.Current?.Line("操作", $"一般アクション {id} を使用 → {(ok ? "受け付け" : "拒否")}");
+        return ok;
+    }
 }

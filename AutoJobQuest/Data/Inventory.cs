@@ -179,6 +179,59 @@ public sealed unsafe class Inventory : IInventoryView
         return n;
     }
 
+    /// <summary>
+    /// カバン（Inventory1〜4）にある収集品を、元のアイテムごとに数える（収集価値は問わない）。
+    /// 納品画面の右の一覧（node 31）の行数と突き合わせるのに使う。
+    /// </summary>
+    public static Dictionary<uint, int> HeldCollectables()
+    {
+        var totals = new Dictionary<uint, int>();
+        var im = InventoryManager.Instance();
+        if (im == null)
+            return totals;
+
+        foreach (var type in Bags)
+        {
+            var c = im->GetInventoryContainer(type);
+            if (c == null || !c->IsLoaded)
+                continue;
+            for (var i = 0; i < c->Size; i++)
+            {
+                var s = c->GetInventorySlot(i);
+                if (s == null || s->ItemId == 0 || !s->IsCollectable())
+                    continue;
+                var id = s->GetBaseItemId();
+                totals[id] = totals.GetValueOrDefault(id) + s->Quantity;
+            }
+        }
+
+        return totals;
+    }
+
+    /// <summary>その収集品の手持ち1個ずつの収集価値。</summary>
+    public static List<int> Collectabilities(uint itemId)
+    {
+        var values = new List<int>();
+        var im = InventoryManager.Instance();
+        if (im == null)
+            return values;
+
+        foreach (var type in Bags)
+        {
+            var c = im->GetInventoryContainer(type);
+            if (c == null || !c->IsLoaded)
+                continue;
+            for (var i = 0; i < c->Size; i++)
+            {
+                var s = c->GetInventorySlot(i);
+                if (s != null && s->ItemId != 0 && s->IsCollectable() && s->GetBaseItemId() == itemId)
+                    values.Add(s->GetCollectability());
+            }
+        }
+
+        return values;
+    }
+
     /// <summary>特殊通貨（スクリップなど）の番号からアイテム ID を引き、所持数を返す。</summary>
     public static int CountSpecialCurrency(byte specialId, out uint itemId)
     {

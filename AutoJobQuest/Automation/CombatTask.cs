@@ -44,7 +44,6 @@ public sealed class CombatTask : AutoTask
     private MoveToTask? moving;
     private IBattleNpc? target;
     private uint targetNameId;
-    private bool rsrOn;
     private DateTime spotArrivedAt = DateTime.MinValue;
     private DateTime lastApproach = DateTime.MinValue;
     private DateTime dismountAt = DateTime.MinValue;
@@ -55,6 +54,16 @@ public sealed class CombatTask : AutoTask
     private uint targetHpAtStart;
 
     public List<uint> Unfinished { get; } = [];
+
+    // そろった時刻（そろったあとに残った敵を片づける時間の上限に使う）
+    private DateTime collectedSince = DateTime.MinValue;
+
+    private DateTime CollectedAt()
+    {
+        if (this.collectedSince == DateTime.MinValue)
+            this.collectedSince = DateTime.UtcNow;
+        return this.collectedSince;
+    }
 
     public CombatTask(uint territory, List<CombatNeed> needs, List<Vector2> mapSpots, TimeSpan limit)
     {
@@ -94,9 +103,31 @@ public sealed class CombatTask : AutoTask
         var wanted = this.WantedMobs();
         if (wanted.Count == 0)
         {
+            // そろっても、こちらを狙っている敵が残っていれば片づけてから終わる
+            // （戦闘中のまま次の作業（テレポ・採集）に移ると、そこで失敗する）
+            if (GameUi.InCombat && DateTime.UtcNow - this.CollectedAt() < TimeSpan.FromMinutes(2))
+            {
+                if (this.target != null && IsAlive(this.target))
+                    return this.Engage(ctx);
+                var remaining = FindHater();
+                if (remaining != null)
+                {
+                    this.SetTarget(ctx, remaining);
+                    return TaskResult.Running;
+                }
+
+                this.Status = "戦闘状態が解けるのを待っています";
+                return TaskResult.Running;
+            }
+
+            if (GameUi.InCombat)
+                ctx.Log.Warn("戦闘", "そろったあと2分たっても戦闘状態が解けません。このまま次へ進みます");
+
             ctx.Log.Write("戦闘", $"{TeleportTask.TerritoryName(this.territory)}: そろいました");
             return TaskResult.Done;
         }
+
+        this.collectedSince = DateTime.MinValue;
 
         if (this.Elapsed > this.limit)
         {
@@ -170,12 +201,9 @@ public sealed class CombatTask : AutoTask
             return TaskResult.Running;
         }
 
-        if (!this.rsrOn)
-        {
-            this.rsrOn = ctx.Rotation.ChangeOperatingMode(RotationSolverIpc.ModeHenched);
-            if (!this.rsrOn)
-                return this.Fail("RSR を Henched モードにできませんでした");
-        }
+        // Henched を入れる（こちらが入れていれば送り直さない。RSR が自分で OFF になったときだけ入れ直す）
+        if (!ctx.Rotation.EnsureHenched())
+            return this.Fail("RSR を Henched モードにできませんでした");
 
         // ハードターゲットが外れていたら付け直す
         if (Svc.Targets.Target?.GameObjectId != t.GameObjectId)
@@ -212,18 +240,13 @@ public sealed class CombatTask : AutoTask
         this.targetSince = DateTime.UtcNow;
         this.targetHpAtStart = mob.CurrentHp;
         Svc.Targets.Target = mob;
-        this.rsrOn = false; // Engage で Henched を入れ直す（RSR はエリア移動・死亡・着替えで自動 OFF になるため）
         this.Status = $"{mob.Name} を狙います";
     }
 
     private TaskResult Patrol(TaskContext ctx)
     {
-        if (this.rsrOn)
-        {
-            // 戦っていないので RSR は一旦止める（無関係な敵を殴らないように）
-            ctx.Rotation.ChangeOperatingMode(RotationSolverIpc.ModeOff);
-            this.rsrOn = false;
-        }
+        // Henched はハードターゲットしか殴らないので、出現点を回る間は入れたままでよい
+        // （止めたり入れたりを繰り返すと、RSR の切り替え表示がチャットにあふれる）
 
         if (this.moving != null)
         {
@@ -290,8 +313,7 @@ public sealed class CombatTask : AutoTask
 
         // 止めたら優先指定を消し、RSR を止める（動作停止後は設定を消す）
         ctx.Rotation.ClearOwnPriorities();
-        ctx.Rotation.ChangeOperatingMode(RotationSolverIpc.ModeOff);
-        this.rsrOn = false;
+        ctx.Rotation.ReleaseHenched();
 
         if (this.target != null && Svc.Targets.Target?.GameObjectId == this.target.GameObjectId)
             Svc.Targets.Target = null;

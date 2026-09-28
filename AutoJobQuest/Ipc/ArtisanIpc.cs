@@ -25,8 +25,11 @@ public sealed class ArtisanIpc : IpcGate
     public override string InternalName => "Artisan";
 
     public bool CraftItem(ushort recipeId, int crafts)
-        => this.TryAction("CraftItem",
+    {
+        this.Trace($"CraftItem(レシピ {recipeId}, {crafts}回)");
+        return this.TryAction("CraftItem",
             () => this.Func<ushort, int, object>("Artisan.CraftItem").InvokeAction(recipeId, crafts));
+    }
 
     /// <summary>何か処理中か。読めなければ null（読めないときは「処理中」とみなして待つのが安全）。</summary>
     public bool? IsBusy()
@@ -42,11 +45,11 @@ public sealed class ArtisanIpc : IpcGate
         => this.TryInvoke("GetStopRequest", () => this.Func<bool>("Artisan.GetStopRequest").InvokeFunc(), out var v) ? v : null;
 
     public bool SetStopRequest(bool stop)
-        => this.TryAction("SetStopRequest",
+        => this.TraceThen($"SetStopRequest({stop})") && this.TryAction("SetStopRequest",
             () => this.Func<bool, object>("Artisan.SetStopRequest").InvokeAction(stop));
 
     /// <summary>Endurance を止める（こちらが CraftItem で始めた製作を止めるときだけ使う）。</summary>
     public bool SetEndurance(bool on)
-        => this.TryAction("SetEnduranceStatus",
+        => this.TraceThen($"SetEnduranceStatus({on})") && this.TryAction("SetEnduranceStatus",
             () => this.Func<bool, object>("Artisan.SetEnduranceStatus").InvokeAction(on));
 }

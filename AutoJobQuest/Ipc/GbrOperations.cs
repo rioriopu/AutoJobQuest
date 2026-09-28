@@ -42,6 +42,14 @@ public sealed class GbrOperations
 
     public string? LastError { get; private set; }
 
+    private void SetError(string message)
+    {
+        this.LastError = message;
+        Core.DebugLog.Current?.Line("GBR", "失敗: " + message);
+    }
+
+    private static void Note(string message) => Core.DebugLog.Current?.Line("GBR", message);
+
     // ------------------------------------------------------------------
     // 事前点検（読むだけ）
 
@@ -57,7 +65,7 @@ public sealed class GbrOperations
         }
         catch (Exception ex)
         {
-            this.LastError = $"GBR の設定 {name} を読めません: {ex.Message}";
+            this.SetError($"GBR の設定 {name} を読めません: {ex.Message}");
             return null;
         }
     }
@@ -75,7 +83,7 @@ public sealed class GbrOperations
         }
         catch (Exception ex)
         {
-            this.LastError = $"GBR の収集品設定を読めません: {ex.Message}";
+            this.SetError($"GBR の収集品設定を読めません: {ex.Message}");
             return null;
         }
     }
@@ -95,7 +103,7 @@ public sealed class GbrOperations
         }
         catch (Exception ex)
         {
-            this.LastError = $"GBR の品目データを読めません（{itemId}）: {ex.Message}";
+            this.SetError($"GBR の品目データを読めません（{itemId}）: {ex.Message}");
             return null;
         }
     }
@@ -129,7 +137,7 @@ public sealed class GbrOperations
         var h = this.reflection.Get();
         if (h == null)
         {
-            this.LastError = "GBR に届きません";
+            this.SetError("GBR に届きません");
             return false;
         }
 
@@ -146,45 +154,84 @@ public sealed class GbrOperations
                 this.config.Save();
             }
 
+            Note($"設定 {name} を一時的に {current} → {value}");
             h.SetAutoGatherBool(name, value);
             h.SaveConfig();
             return h.GetAutoGatherBool(name) == value;
         }
         catch (Exception ex)
         {
-            this.LastError = $"GBR の設定 {name} を変えられません: {ex.Message}";
+            this.SetError($"GBR の設定 {name} を変えられません: {ex.Message}");
             return false;
         }
     }
 
+    /// <summary>元に戻すべき一時変更が残っているか。</summary>
+    public bool HasLeftovers
+        => this.config.GbrOwnListActive || this.config.GbrDisabledListRefs.Count > 0 || this.config.GbrConfigOriginals.Count > 0;
+
+    /// <summary>
+    /// GBR の自動採集が止まっているときだけ、リストと設定を元に戻す。
+    ///
+    /// 【止まっていることを確かめる理由】GBR が採集中にリストを戻すと、GBR はそのまま利用者のリストを採り始め、
+    /// 帰宅設定も戻るので終わったときにテレポする（こちらを読み直しただけで GBR の動きが変わる）。
+    /// 止まっていない・読めないときは戻さずに控えを残し、あとで（止まっている間に定期的に）戻す。
+    /// </summary>
+    /// <param name="gbrEnabled">GBR の自動採集の状態（IPC で読んだ値。読めなければ null）。</param>
+    /// <returns>戻し終わったら true。</returns>
+    public bool RestoreIfIdle(bool? gbrEnabled, bool? vendorBusy)
+    {
+        if (!this.HasLeftovers)
+            return true;
+
+        if (gbrEnabled != false || vendorBusy == true)
+        {
+            Note($"GBR が動いている（または状態が読めない）ので、リストと設定はまだ戻しません（自動採集={gbrEnabled?.ToString() ?? "不明"}、購入中={vendorBusy?.ToString() ?? "不明"}）");
+            return false;
+        }
+
+        var lists = this.RestoreGatherLists();
+        var cfg = this.RestoreConfig();
+        return lists && cfg;
+    }
+
     /// <summary>
     /// 一時的に書き換えた設定を戻す。今の値が「こちらが入れた値」のままのときだけ戻す
-    /// （途中で利用者が変えたら、そちらを尊重する）。
+    /// （途中で利用者が変えたら、そちらを尊重する）。GBR が止まっていることを呼び出し側で確かめること。
     /// </summary>
-    public void RestoreConfig()
+    private bool RestoreConfig()
     {
         if (this.config.GbrConfigOriginals.Count == 0)
-            return;
+            return true;
 
         var h = this.reflection.Get();
         if (h == null)
-            return; // 次回起動時に戻す
+            return false; // 届くようになってから戻す
 
         try
         {
             foreach (var (name, original) in this.config.GbrConfigOriginals.ToList())
             {
                 if (h.GetAutoGatherBool(name) == !original)
+                {
+                    Note($"設定 {name} を元の {original} に戻しました");
                     h.SetAutoGatherBool(name, original);
+                }
+                else
+                {
+                    Note($"設定 {name} は途中で変わっていたので戻しません（今の値を尊重）");
+                }
                 this.config.GbrConfigOriginals.Remove(name);
             }
 
             h.SaveConfig();
             this.config.Save();
+            return true;
         }
         catch (Exception ex)
         {
-            this.LastError = $"GBR の設定を戻せませんでした（次回起動時に再試行します）: {ex.Message}";
+            this.SetError($"GBR の設定を戻せませんでした（止まっている間にやり直します）: {Unwrap(ex)}");
+            return false;
         }
     }
 
@@ -201,7 +248,7 @@ public sealed class GbrOperations
         var h = this.reflection.Get();
         if (h == null)
         {
-            this.LastError = "GBR に届きません";
+            this.SetError("GBR に届きません");
             return false;
         }
 
@@ -246,15 +293,19 @@ public sealed class GbrOperations
                 if (!(bool)r.PEnabled.GetValue(l)!)
                     continue;
 
-                var name = (string?)r.PName.GetValue(l) ?? string.Empty;
-                if (!this.config.GbrDisabledLists.Contains(name))
-                    this.config.GbrDisabledLists.Add(name);
+                // 控えは名前とフォルダの組で残す（GBR は同じ名前のリストを許すため、名前だけでは戻し先を取り違える）
+                var reference = new GbrListRef((string?)r.PName.GetValue(l) ?? string.Empty, (string?)r.PFolderPath.GetValue(l) ?? string.Empty);
+                if (!this.config.GbrDisabledListRefs.Contains(reference))
+                    this.config.GbrDisabledListRefs.Add(reference);
                 this.config.Save();
 
                 r.PEnabled.SetValue(l, false);
                 this.disabledByMe.Add(l);
             }
 
+            Note($"自動採集リスト「{OwnListName}」を用意：{string.Join("、", entries.Select(e => $"{Data.CraftPlanner.ItemName(e.ItemId)} 目標{e.TargetOwned}{(e.PreferredTerritory is { } t ? $"（優先エリア {t}）" : string.Empty)}"))}"
+                 + $"／一時的に無効にしたリスト：{(this.disabledByMe.Count == 0 ? "なし" : string.Join("、", this.disabledByMe.Select(l => (string?)r.PName.GetValue(l))))}"
+                 + (unsupported.Count > 0 ? $"／GBR で扱えない品目：{string.Join("、", unsupported.Select(Data.CraftPlanner.ItemName))}" : string.Empty));
             r.PEnabled.SetValue(list, true);
             this.config.GbrOwnListActive = true;
             this.config.Save();
@@ -265,20 +316,25 @@ public sealed class GbrOperations
         }
         catch (Exception ex)
         {
-            this.LastError = $"GBR の採集リストを用意できませんでした: {Unwrap(ex)}";
+            this.SetError($"GBR の採集リストを用意できませんでした: {Unwrap(ex)}");
             return false;
         }
     }
 
-    /// <summary>自分のリストを無効にし、退避したリストを戻す。</summary>
-    public void RestoreGatherLists()
+    /// <summary>
+    /// 自分のリストを無効にし、退避したリストを戻す。GBR が止まっていることを呼び出し側で確かめること。
+    ///
+    /// 戻し方：ふだんは無効にしたリストそのもの（参照）で戻す。参照が無いとき（GBR が読み直された・
+    /// こちらが読み直された・落ちた）だけ、控えの「名前＋フォルダ」で探す。候補が1つに決まらなければ戻さずに記録する。
+    /// </summary>
+    private bool RestoreGatherLists()
     {
-        if (!this.config.GbrOwnListActive && this.config.GbrDisabledLists.Count == 0)
-            return;
+        if (!this.config.GbrOwnListActive && this.config.GbrDisabledListRefs.Count == 0)
+            return true;
 
         var h = this.reflection.Get();
         if (h == null)
-            return; // 次回起動時に戻す
+            return false; // 届くようになってから戻す
 
         try
         {
@@ -293,46 +349,54 @@ public sealed class GbrOperations
             }
 
             var alive = r.AllLists().ToList();
-            foreach (var l in this.disabledByMe)
+            var restored = new List<string>();
+            var aliveRefs = this.disabledByMe.Where(l => alive.Any(x => ReferenceEquals(x, l))).ToList();
+            if (aliveRefs.Count > 0)
             {
-                if (alive.Any(x => ReferenceEquals(x, l)) && !(bool)r.PEnabled.GetValue(l)!)
-                    r.PEnabled.SetValue(l, true);
-            }
-
-            // GBR が読み直されて参照が無効になった場合や、前回落ちた場合は名前で探して戻す
-            foreach (var name in this.config.GbrDisabledLists)
-            {
-                foreach (var l in alive.Where(x => (string?)r.PName.GetValue(x) == name))
+                // ふだんの経路：無効にしたリストそのものを戻す
+                foreach (var l in aliveRefs)
+                {
                     if (!(bool)r.PEnabled.GetValue(l)!)
                         r.PEnabled.SetValue(l, true);
+                    restored.Add((string?)r.PName.GetValue(l) ?? string.Empty);
+                }
+            }
+            else
+            {
+                // 参照が無いとき（読み直し・落ちた後）：控えの「名前＋フォルダ」で探す。1つに決まるときだけ戻す
+                foreach (var reference in this.config.GbrDisabledListRefs)
+                {
+                    var matches = alive
+                        .Where(x => (string?)r.PName.GetValue(x) == reference.Name && ((string?)r.PFolderPath.GetValue(x) ?? string.Empty) == reference.FolderPath)
+                        .ToList();
+                    if (matches.Count == 1)
+                    {
+                        if (!(bool)r.PEnabled.GetValue(matches[0])!)
+                            r.PEnabled.SetValue(matches[0], true);
+                        restored.Add(reference.Name);
+                    }
+                    else
+                    {
+                        Note($"⚠ リスト「{reference.Name}」（フォルダ「{reference.FolderPath}」）は{(matches.Count == 0 ? "見つからない" : $"同じ名前が {matches.Count} 個ある")}ので戻しません。GBR の画面で有効にし直してください");
+                    }
+                }
             }
 
             r.MSetActive.Invoke(r.Manager, [false]);
             r.MSave.Invoke(r.Manager, null);
 
+            Note($"自動採集リストを元に戻しました（戻したリスト：{(restored.Count == 0 ? "なし" : string.Join("、", restored))}）");
             this.disabledByMe.Clear();
-            this.config.GbrDisabledLists.Clear();
+            this.config.GbrDisabledListRefs.Clear();
             this.config.GbrOwnListActive = false;
             this.config.Save();
+            return true;
         }
         catch (Exception ex)
         {
-            this.LastError = $"GBR の採集リストを戻せませんでした（次回起動時に再試行します）: {Unwrap(ex)}";
-        }
-    }
-
-    /// <summary>前回落ちたときに残った一時変更を戻す（起動後、GBR に届いたら1回）。</summary>
-    public bool RestoreLeftovers()
-    {
-        if (!this.config.GbrOwnListActive && this.config.GbrDisabledLists.Count == 0 && this.config.GbrConfigOriginals.Count == 0)
-            return true;
-
-        if (this.reflection.Get() == null)
+            this.SetError($"GBR の採集リストを戻せませんでした（止まっている間にやり直します）: {Unwrap(ex)}");
             return false;
-
-        this.RestoreGatherLists();
-        this.RestoreConfig();
-        return true;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -348,7 +412,7 @@ public sealed class GbrOperations
         var h = this.reflection.Get();
         if (h == null)
         {
-            this.LastError = "GBR に届きません";
+            this.SetError("GBR に届きません");
             return null;
         }
 
@@ -359,7 +423,7 @@ public sealed class GbrOperations
 
             if ((bool)vt.GetProperty("IsBusy", GbrHandle.PubInst)!.GetValue(vblm)!)
             {
-                this.LastError = "GBR の購入が別に動いています";
+                this.SetError("GBR の購入が別に動いています");
                 return null;
             }
 
@@ -376,13 +440,13 @@ public sealed class GbrOperations
             foreach (var e in entryList.Cast<object>().ToList())
                 removeEntry.Invoke(vblm, [(Guid)e.GetType().GetProperty("Id")!.GetValue(e)!]);
 
-            var hasGilRoute = this.GilRouteChecker(h);
+            var gilRoute = this.GilRouteItems(h, entries.Select(e => e.ItemId));
             var trySet = vt.GetMethod("TrySetTarget", GbrHandle.PubInst, null,
                 [typeof(Guid), typeof(uint), typeof(uint), typeof(bool), typeof(bool), typeof(bool)], null)!;
 
             foreach (var (itemId, target) in entries)
             {
-                if (hasGilRoute != null && !hasGilRoute(itemId))
+                if (gilRoute != null && !gilRoute.Contains(itemId))
                 {
                     notGil.Add(itemId);
                     continue;
@@ -407,11 +471,14 @@ public sealed class GbrOperations
                 removeEntry.Invoke(vblm, [(Guid)et.GetProperty("Id")!.GetValue(e)!]);
             }
 
+            var skipped = notGil.ToHashSet();
+            Note($"NPC 購入リストを用意：{string.Join("、", entries.Where(e => !skipped.Contains(e.ItemId)).Select(e => $"{Data.CraftPlanner.ItemName(e.ItemId)} 目標{e.TargetOwned}"))}"
+                 + (skipped.Count > 0 ? $"／ギルの店で自動購入できない：{string.Join("、", skipped.Select(Data.CraftPlanner.ItemName))}" : string.Empty));
             return listId;
         }
         catch (Exception ex)
         {
-            this.LastError = $"GBR の購入リストを用意できませんでした: {Unwrap(ex)}";
+            this.SetError($"GBR の購入リストを用意できませんでした: {Unwrap(ex)}");
             return null;
         }
     }
@@ -426,11 +493,13 @@ public sealed class GbrOperations
         {
             var vblm = h.VendorBuyListManager;
             var start = vblm.GetType().GetMethod("Start", GbrHandle.PubInst)!;
-            return start.Invoke(vblm, [listId, null])?.ToString();
+            var result = start.Invoke(vblm, [listId, null])?.ToString();
+            Note($"NPC 購入を開始 → {result}");
+            return result;
         }
         catch (Exception ex)
         {
-            this.LastError = $"GBR の購入を始められませんでした: {Unwrap(ex)}";
+            this.SetError($"GBR の購入を始められませんでした: {Unwrap(ex)}");
             return null;
         }
     }
@@ -477,19 +546,60 @@ public sealed class GbrOperations
         try
         {
             var vblm = h.VendorBuyListManager;
+            Note("NPC 購入を止めます");
             vblm.GetType().GetMethod("Stop", GbrHandle.PubInst, null, Type.EmptyTypes, null)!.Invoke(vblm, null);
         }
         catch (Exception ex)
         {
-            this.LastError = $"GBR の購入を止められませんでした: {Unwrap(ex)}";
+            this.SetError($"GBR の購入を止められませんでした: {Unwrap(ex)}");
         }
     }
 
     /// <summary>
-    /// 「ギルの店で、自動購入に対応した NPC から買えるか」を判定する関数を作る。
-    /// 店データがまだ読み込み中なら null（判定せず、事後確認だけに頼る）。
+    /// 購入リスト「AutoJobQuest」の品目を消す（実行後に GBR の設定へ品目が残らないように）。
+    /// GBR の購入が動いているときは何もしない。
     /// </summary>
-    private Func<uint, bool>? GilRouteChecker(GbrHandle h)
+    public void ClearVendorList()
+    {
+        var h = this.reflection.Get();
+        if (h == null)
+            return;
+        try
+        {
+            var vblm = h.VendorBuyListManager;
+            var vt = vblm.GetType();
+            if ((bool)vt.GetProperty("IsBusy", GbrHandle.PubInst)!.GetValue(vblm)!)
+                return;
+
+            var def = ((IEnumerable)vt.GetProperty("Lists", GbrHandle.PubInst)!.GetValue(vblm)!).Cast<object>()
+                .FirstOrDefault(d => string.Equals(d.GetType().GetProperty("Name")!.GetValue(d) as string, OwnListName, StringComparison.OrdinalIgnoreCase));
+            if (def == null)
+                return;
+
+            var entryList = (IList)def.GetType().GetProperty("Entries")!.GetValue(def)!;
+            var removeEntry = vt.GetMethod("RemoveEntry", GbrHandle.PubInst, null, [typeof(Guid)], null)!;
+            var n = 0;
+            foreach (var e in entryList.Cast<object>().ToList())
+            {
+                removeEntry.Invoke(vblm, [(Guid)e.GetType().GetProperty("Id")!.GetValue(e)!]);
+                n++;
+            }
+
+            if (n > 0)
+                Note($"NPC 購入リスト「{OwnListName}」の品目を消しました（{n} 件）");
+        }
+        catch (Exception ex)
+        {
+            this.SetError($"NPC 購入リストの品目を消せませんでした: {Unwrap(ex)}");
+        }
+    }
+
+    /// <summary>
+    /// 欲しい品目のうち「ギルの店で、自動購入に対応した NPC から買える」ものの集合を返す。
+    /// 店データがまだ読み込み中なら null（判定せず、事後確認だけに頼る）。
+    /// 全ギル店エントリーを1回だけ走査する（品目ごとに全エントリーを舐めると1フレームが長く止まるため）。
+    /// </summary>
+    private HashSet<uint>? GilRouteItems(GbrHandle h, IEnumerable<uint> wanted)
     {
         var resolver = h.GbrAsm.GetType("GatherBuddy.Vulcan.Vendors.VendorShopResolver", throwOnError: false);
         var vpm = h.GbrAsm.GetType("GatherBuddy.Vulcan.Vendors.VendorPurchaseManager", throwOnError: false);
@@ -506,11 +616,28 @@ public sealed class GbrOperations
         if (isSupported == null || isExcluded == null || entries == null)
             return null;
 
-        var list = entries.Cast<object>().ToList();
-        return itemId => list.Any(e =>
-            (uint)e.GetType().GetProperty("ItemId")!.GetValue(e)! == itemId
-            && ((IEnumerable)e.GetType().GetProperty("Npcs")!.GetValue(e)!).Cast<object>()
-                .Any(n => (bool)isSupported.Invoke(null, [e, n])! && !(bool)isExcluded.Invoke(null, [n])!));
+        var want = wanted.ToHashSet();
+        var result = new HashSet<uint>();
+        PropertyInfo? pItem = null, pNpcs = null;
+        foreach (var e in entries)
+        {
+            pItem ??= e.GetType().GetProperty("ItemId");
+            pNpcs ??= e.GetType().GetProperty("Npcs");
+            var item = (uint)pItem!.GetValue(e)!;
+            if (!want.Contains(item) || result.Contains(item))
+                continue;
+
+            foreach (var n in (IEnumerable)pNpcs!.GetValue(e)!)
+            {
+                if ((bool)isSupported.Invoke(null, [e, n])! && !(bool)isExcluded.Invoke(null, [n])!)
+                {
+                    result.Add(item);
+                    break;
+                }
+            }
+        }
+
+        return result;
     }
 
     private static string Unwrap(Exception ex)
@@ -536,6 +663,7 @@ public sealed class GbrOperations
         public readonly PropertyInfo PItems;
         public readonly PropertyInfo PName;
         public readonly PropertyInfo PDescription;
+        public readonly PropertyInfo PFolderPath;
         public readonly PropertyInfo PEnabled;
         public readonly PropertyInfo PUsesRetainer;
 
@@ -559,6 +687,7 @@ public sealed class GbrOperations
             this.PItems = this.ListType.GetProperty("Items", GbrHandle.PubInst)!;
             this.PName = this.ListType.GetProperty("Name", GbrHandle.PubInst)!;
             this.PDescription = this.ListType.GetProperty("Description", GbrHandle.PubInst)!;
+            this.PFolderPath = this.ListType.GetProperty("FolderPath", GbrHandle.PubInst)!;
             this.PEnabled = this.ListType.GetProperty("Enabled", GbrHandle.PubInst)!;
             this.PUsesRetainer = this.ListType.GetProperty("UsesRetainerInventory", GbrHandle.NonPubInst)!;
         }

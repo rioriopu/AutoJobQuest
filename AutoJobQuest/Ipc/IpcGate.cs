@@ -146,8 +146,12 @@ public abstract class IpcGate
         catch (Exception ex)
         {
             // 相手の中で投げられた例外もここへ来る（Artisan の StartListById などは意図的に投げる）。
-            this.Fail(label, ex.GetType().Name,
-                $"予期しない例外が発生しました: {ex.GetType().Name}: {ex.Message}");
+            // Dalamud は DynamicInvoke で呼ぶので TargetInvocationException に包まれて届く。中身を取り出す
+            var inner = ex;
+            while (inner is System.Reflection.TargetInvocationException { InnerException: { } i })
+                inner = i;
+            this.Fail(label, inner.GetType().Name,
+                $"相手の処理で例外が発生しました: {inner.GetType().Name}: {inner.Message}");
             return false;
         }
     }
@@ -155,6 +159,9 @@ public abstract class IpcGate
     /// <summary>失敗を記録する。ログへ出しつつ、画面表示用にも残す。</summary>
     private void Fail(string label, string kind, string detail)
     {
+        // 同じ失敗が続くときは記録を間引く（WarnThrottled と同じ単位）
+        if (!this.lastErrors.TryGetValue(label, out var prev) || prev != detail)
+            Core.DebugLog.Current?.Line("IPC失敗", $"{this.DisplayName}.{label}: {detail}");
         this.lastErrors[label] = detail;
         this.WarnThrottled($"{label}: {detail}", $"{label}:{kind}");
     }
@@ -166,6 +173,17 @@ public abstract class IpcGate
     /// </summary>
     protected bool TryAction(string label, Action call)
         => this.TryInvoke<bool>(label, () => { call(); return true; }, out _);
+
+    /// <summary>相手の状態を変える呼び出しを記録する（何を頼んだかを後から追えるように）。</summary>
+    protected void Trace(string text)
+        => Core.DebugLog.Current?.Line("IPC", $"{this.DisplayName}: {text}");
+
+    /// <summary>記録してから続けるための小物（式の中で使う。常に true）。</summary>
+    protected bool TraceThen(string text)
+    {
+        this.Trace(text);
+        return true;
+    }
 
     /// <param name="message">出す文言。</param>
     /// <param name="kind">間引きの単位。省略時は文言そのものを単位にする。</param>

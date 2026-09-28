@@ -217,7 +217,15 @@ public static class PlanBuilder
     /// <summary>秘伝書を読んだか。</summary>
     public static unsafe bool IsBookUnlocked(uint secretRecipeBookId)
     {
-        var ps = PlayerState.Instance();
-        return ps != null && ps->IsSecretRecipeBookUnlocked(secretRecipeBookId);
+        try
+        {
+            var ps = PlayerState.Instance();
+            return ps != null && ps->IsSecretRecipeBookUnlocked(secretRecipeBookId);
+        }
+        catch
+        {
+            // 関数が見つからない（パッチ直後など）ときは「未読」とみなす（秘伝書の流れで確かめ直す）
+            return false;
+        }
     }
 }

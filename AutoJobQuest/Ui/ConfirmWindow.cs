@@ -24,7 +24,14 @@ public sealed class ConfirmWindow : Window
         this.runner = runner;
         this.IsOpen = true;
         this.RespectCloseHotkey = false;
+        this.ShowCloseButton = false;
     }
+
+    /// <summary>
+    /// 閉じられても毎回開き直す。× や Esc で閉じると質問が見えなくなり、作業が答えを永久に待つため
+    /// である。表示するかどうかは <see cref="DrawConditions"/>（質問があるか）で決める。
+    /// </summary>
+    public override void PreOpenCheck() => this.IsOpen = true;
 
     public override bool DrawConditions() => this.confirm.Question != null;
 

@@ -32,6 +32,9 @@ public sealed class TextAdvanceIpc : IpcGate
     /// <summary>報告（会話送り・納品の入力・受け渡し）を任せる設定で外部制御を取る。</summary>
     public bool TakeControlForTurnIn()
     {
+        if (this.ownControl)
+            return true;
+
         var cfg = new ExternalTerritoryConfig
         {
             EnableQuestAccept = true,
@@ -45,6 +48,7 @@ public sealed class TextAdvanceIpc : IpcGate
             EnableAutoInteract = false,
         };
 
+        this.Trace("EnableExternalControl（報告用）");
         var ok = this.TryInvoke("EnableExternalControl",
                      () => this.Func<string, ExternalTerritoryConfig, bool>("TextAdvance.EnableExternalControl")
                          .InvokeFunc(Plugin.InternalNameConst, cfg), out var accepted)
@@ -60,9 +64,13 @@ public sealed class TextAdvanceIpc : IpcGate
         if (!this.ownControl)
             return;
 
-        this.TryInvoke("DisableExternalControl",
-            () => this.Func<string, bool>("TextAdvance.DisableExternalControl").InvokeFunc(Plugin.InternalNameConst), out _);
-        this.ownControl = false;
+        this.Trace("DisableExternalControl");
+
+        // 解除できたときだけ「手放した」とする（失敗したら次の呼び出しでやり直す）
+        if (this.TryInvoke("DisableExternalControl",
+                () => this.Func<string, bool>("TextAdvance.DisableExternalControl").InvokeFunc(Plugin.InternalNameConst), out var released)
+            && released)
+            this.ownControl = false;
     }
 
     public bool? IsInExternalControl()
