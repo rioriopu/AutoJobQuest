@@ -29,7 +29,11 @@ public sealed class TextAdvanceIpc : IpcGate
 
     private bool ownControl;
 
-    /// <summary>報告（会話送り・納品の入力・受け渡し）を任せる設定で外部制御を取る。</summary>
+    /// <summary>
+    /// 報告（会話送り・受注・完了・報酬選び）を任せる設定で外部制御を取る。
+    /// 納品窓への入力と受け渡し（RequestFill / RequestHandin）は任せない：こちらの RequestFill.cs が
+    /// 条件（HQ 等）に合う品を選んで入れて渡すため（同じ窓を2つが取り合わないように）。
+    /// </summary>
     public bool TakeControlForTurnIn()
     {
         if (this.ownControl)
@@ -40,11 +44,11 @@ public sealed class TextAdvanceIpc : IpcGate
             EnableQuestAccept = true,
             EnableQuestComplete = true,
             EnableRewardPick = true,
-            EnableRequestHandin = true,
+            EnableRequestHandin = false,
             EnableCutsceneEsc = true,
             EnableCutsceneSkipConfirm = true,
             EnableTalkSkip = true,
-            EnableRequestFill = true,
+            EnableRequestFill = false,
             EnableAutoInteract = false,
         };
 

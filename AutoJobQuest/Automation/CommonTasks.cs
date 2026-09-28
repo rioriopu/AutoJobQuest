@@ -256,6 +256,7 @@ public sealed class EquipJobTask : AutoTask
 {
     private readonly uint classJob;
     private bool requested;
+    private int requests;
 
     public EquipJobTask(uint classJob)
     {
@@ -269,17 +270,21 @@ public sealed class EquipJobTask : AutoTask
         if (Jobs.CurrentClassJob == this.classJob)
             return TaskResult.Done;
 
-        if (this.Elapsed > TimeSpan.FromSeconds(20))
-            return this.Fail($"{Jobs.Name(this.classJob)} に着替えられませんでした");
-
+        // 動けない間（戦闘中・会話中など）の待ちは長めの上限で別に数える
+        // （以前は全体 20 秒の中に含めていたため、戦闘が 20 秒以上続くと着替えに失敗していた）
         if (GameUi.InCombat || !GameUi.PlayerFree())
         {
             this.Status = "動ける状態になるのを待っています";
-            return TaskResult.Running;
+            return this.Elapsed > TimeSpan.FromMinutes(5)
+                ? this.Fail($"5分たっても動ける状態にならず、{Jobs.Name(this.classJob)} に着替えられませんでした")
+                : TaskResult.Running;
         }
 
+        // 着替えを頼んでから 3 秒たっても変わらなければ頼み直す（ゲームの応答を待つ間隔）。頼むのは 5 回まで
         if (this.requested && this.PhaseElapsed < TimeSpan.FromSeconds(3))
             return TaskResult.Running;
+        if (this.requests >= 5)
+            return this.Fail($"{Jobs.Name(this.classJob)} に着替えられませんでした（5 回頼んでも変わりません）");
 
         var idx = GearCheck.FindGearset(this.classJob);
         if (idx < 0)
@@ -287,6 +292,7 @@ public sealed class EquipJobTask : AutoTask
 
         RaptureGearsetModule.Instance()->EquipGearset(idx);
         this.requested = true;
+        this.requests++;
         this.NextPhase("着替え中");
         return TaskResult.Running;
     }
