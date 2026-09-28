@@ -260,6 +260,10 @@ public sealed unsafe class MeldTask : AutoTask
         if (Inventory.HasMelded(this.need.TargetItemId, this.need.TargetHq, this.need.MateriaItemId))
             return TaskResult.Done;
 
+        // 解放は実行の最初の「機能の解放」の段で行う。ここで未解放なら、そこで解放できなかったということ
+        if (!Unlocks.IsUnlocked(Unlocks.Meld))
+            return this.Fail($"マテリア装着が未解放です（クエスト「{Unlocks.QuestName(Unlocks.UnlockQuest(Unlocks.Meld))}」で解放されます）");
+
         var items = Svc.Data.GetExcelSheet<Item>();
         if (!items.TryGetRow(this.need.TargetItemId, out var target))
             return this.Fail("アイテムのデータが読めません");

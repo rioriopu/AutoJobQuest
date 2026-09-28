@@ -14,6 +14,8 @@ namespace AutoJobQuest.Automation;
 ///
 ///   ① ゲームデータの読み込みを待つ
 ///   ② 事前点検（レベル・装備・プラグイン等）。動作保証外の項目があれば確認窓を出す
+///   ②' 機能の解放：マテリア装着（付けるマテリアが残っていれば必須）・精選（霊砂を精選で集める計画なら）が
+///      未解放なら、解放クエストを Questionable で進める（前提のメインクエスト等が未完了なら自動では進めない）
 ///   ③ 秘伝書が要るか調べる（要るなら、紫貨のための収集品の個数を逆算して素材の計画に足す）
 ///   ④ 素材集め（周回）：マーケット → NPC購入 → マップごとに戦闘→採集 → 残りの採集 → 釣り
 ///      周回ごとに計画を立て直し、失敗した入手手段は次の周回で別の手段にする
@@ -29,6 +31,7 @@ public sealed class JobQuestFlow : AutoTask
         WaitData,
         Preflight,
         WaitPreflightAnswer,
+        Unlock,
         WaitSwitchAnswer,
         BookPrep,
         WaitBookData,
@@ -78,6 +81,7 @@ public sealed class JobQuestFlow : AutoTask
     protected override TaskResult OnStart(TaskContext ctx)
     {
         MarketBoardTask.SpentThisRun = 0;
+        Unlocks.GaveUp.Clear();
         ctx.Data.EnsureBuilding();
         return TaskResult.Running;
     }
@@ -125,9 +129,12 @@ public sealed class JobQuestFlow : AutoTask
                     return TaskResult.Running;
                 if (ans == false)
                     return this.Fail("事前点検の確認で「いいえ」が選ばれました");
-                this.stage = Stage.BookPrep;
+                this.stage = Stage.Unlock;
                 return TaskResult.Running;
             }
+
+            case Stage.Unlock:
+                return this.StartUnlock(ctx);
 
             case Stage.WaitSwitchAnswer:
             {
@@ -213,7 +220,35 @@ public sealed class JobQuestFlow : AutoTask
             return TaskResult.Running;
         }
 
-        this.stage = Stage.BookPrep;
+        this.stage = Stage.Unlock;
+        return TaskResult.Running;
+    }
+
+    // ------------------------------------------------------------------
+    // ②' 機能の解放（動かす前に解放済みか確かめ、未解放なら Questionable で解放する）
+
+    private TaskResult StartUnlock(TaskContext ctx)
+    {
+        var plan = this.Plan(ctx);
+        var steps = new List<Func<TaskContext, AutoTask?>>();
+
+        // マテリア装着：付けるマテリアが残っていれば必須（解放できなければ止める）
+        if (plan.Materia.Any(m => !m.AlreadyMelded) && !Unlocks.IsUnlocked(Unlocks.Meld))
+            steps.Add(_ => new UnlockFeatureTask(Unlocks.Meld, required: true));
+
+        // 精選：霊砂などを精選で集められる計画なら試す（解放できなければ、霊砂はマーケットに回す。確認窓あり）
+        var sources = ctx.Data.Sources!;
+        var wantsReduce = plan.Craft.RawShortfall.Keys.Any(k => sources.Get(k).CanReduce && ReduceTask.UsableSources(sources, k).Count > 0);
+        if (wantsReduce && !Unlocks.IsUnlocked(Unlocks.Reduction))
+            steps.Add(_ => new UnlockFeatureTask(Unlocks.Reduction, required: false));
+
+        if (steps.Count == 0)
+        {
+            this.stage = Stage.BookPrep;
+            return TaskResult.Running;
+        }
+
+        this.child = new SequenceTask("機能の解放", steps);
         return TaskResult.Running;
     }
 
@@ -319,16 +354,20 @@ public sealed class JobQuestFlow : AutoTask
 
         // 採集・戦闘・NPC 購入で集めきれず、次の手段がマーケットになった品目は、買う前に利用者に確かめる
         // （時間切れや拒否で、聞かずにギルを使う手段へ切り替えない）
+        // 精選で集めるはずだった品（霊砂など）が、精選を使えずマーケットに回る場合も同じく確かめる（霊砂は精選で得る）
+        var sourcesIdx = ctx.Data.Sources!;
         var switched = raw
             .Where(r => r.Routes.Count > 0 && r.Routes[0] == Route.MarketBoard
-                        && this.excluded.TryGetValue(r.Item, out var bad) && bad.Count > 0
+                        && ((this.excluded.TryGetValue(r.Item, out var bad) && bad.Count > 0) || sourcesIdx.Get(r.Item).CanReduce)
                         && !this.marketSwitchApproved.Contains(r.Item))
             .ToList();
         if (switched.Count > 0)
         {
             this.pendingSwitch = switched.Select(r => r.Item).ToList();
             var lines = switched.Select(r =>
-                $"・{CraftPlanner.ItemName(r.Item)}×{r.Need}（{string.Join("・", this.excluded[r.Item].Select(Ui.MainWindow.RouteName))} で集めきれませんでした）");
+                this.excluded.TryGetValue(r.Item, out var bad) && bad.Count > 0
+                    ? $"・{CraftPlanner.ItemName(r.Item)}×{r.Need}（{string.Join("・", bad.Select(Ui.MainWindow.RouteName))} で集めきれませんでした）"
+                    : $"・{CraftPlanner.ItemName(r.Item)}×{r.Need}（精選が使えません：{(Unlocks.IsUnlocked(Unlocks.Reduction) ? "元の収集品を採れる採集職のレベルが足りない" : "精選が未解放")}）");
             this.confirmTicket = ctx.Confirm.Ask(
                 "マーケット購入への切り替えの確認",
                 "次の素材は、予定の手段では集めきれませんでした。\n\n" + string.Join("\n", lines)
@@ -695,6 +734,9 @@ public sealed class JobQuestFlow : AutoTask
     {
         switch (this.stage)
         {
+            case Stage.Unlock:
+                this.stage = Stage.BookPrep;
+                break;
             case Stage.Acquire:
                 // 失敗した手段を記録し、立て直す（足りていれば StartAcquire の中で次の段へ進む）
                 this.CollectFailures(ctx);

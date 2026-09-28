@@ -39,9 +39,6 @@ public sealed unsafe class ReduceTask : AutoTask
 {
     private enum ReduceStep { Decide, Gather, Reduce, WaitResult }
 
-    /// <summary>一般アクション 21＝精選（ゲームデータで確認：解析ツール jqa genact）。解放の判定に使う。</summary>
-    private const uint GeneralActionReduction = 21;
-
     /// <summary>精選の結果の窓の「閉じる」ボタン（ECommons・GBR の AddonMaster.PurifyResult と同じ）。</summary>
     private const uint PurifyResultCloseNode = 20;
 
@@ -77,20 +74,24 @@ public sealed unsafe class ReduceTask : AutoTask
 
     private int Owned => Inventory.CountNow(this.need.ItemId);
 
-    /// <summary>精選が解放済みか（一般アクション 21 の解放条件をゲームに聞く）。</summary>
-    public static bool IsUnlocked()
+    /// <summary>精選が解放済みか（一般アクション 21 の解放条件をゲームに聞く。Unlocks.IsUnlocked）。</summary>
+    public static bool IsUnlocked() => Unlocks.IsUnlocked(Unlocks.Reduction);
+
+    /// <summary>
+    /// 精選を使える見込みがあるか：解放済み、または解放クエストを自動で進められる（前提のメインクエスト等が済んでいる）
+    /// うえに、この実行で解放をあきらめていない。実行の最初の「機能の解放」の段で解放する。
+    /// </summary>
+    public static bool Usable()
     {
-        try
-        {
-            var ui = UIState.Instance();
-            return ui != null
-                   && Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.GeneralAction>().TryGetRow(GeneralActionReduction, out var row)
-                   && ui->IsUnlockLinkUnlockedOrQuestCompleted(row.UnlockLink);
-        }
-        catch
-        {
+        if (IsUnlocked())
+            return true;
+        if (Unlocks.GaveUp.Contains(Unlocks.Reduction))
             return false;
-        }
+        var quest = Unlocks.UnlockQuest(Unlocks.Reduction);
+        if (quest == 0)
+            return false;
+        Unlocks.ChainToRun(quest, out var blocked);
+        return blocked == null;
     }
 
     /// <summary>精選の元のうち、いまの採掘師・園芸師のレベルで採れるもの（採れる見込みの高い順）。</summary>

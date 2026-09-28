@@ -117,12 +117,12 @@ public static class CharacterReport
                 lines.Add(new ReportLine(Severity.Warn, "収集品の納品：ゲームデータの読み込み後に出ます"));
             }
 
-            // マテリア装着：一般アクション 12 が使えるか
+            // マテリア装着・精選：解放済みか（一般アクションの解放条件）と、未解放なら解放クエストを自動で進められるか
+            lines.Add(UnlockLine(Unlocks.Meld, "付けるマテリアが残っていれば、開始時に Questionable で解放します"));
+            lines.Add(UnlockLine(Unlocks.Reduction, "霊砂を精選で集める計画なら、開始時に Questionable で解放します"));
+
             unsafe
             {
-                var status = ActionManager.Instance()->GetActionStatus(ActionType.GeneralAction, 12);
-                lines.Add(new ReportLine(status == 0 ? Severity.Ok : Severity.Warn,
-                    status == 0 ? "マテリア装着：使えます" : $"マテリア装着：いまは使えません（状態 {status}。未解放か、戦闘中・移動中など）"));
 
                 // 宿屋：Lifestream と同じ判定（Lifestream/Utils.cs IsInnUnlocked の3クエスト）
                 var ui = UIState.Instance();
@@ -131,11 +131,6 @@ public static class CharacterReport
             }
 
             lines.Add(new ReportLine(GoToInnTask.InGridaniaInn() ? Severity.Ok : Severity.Ok, GoToInnTask.InGridaniaInn() ? "いまグリダニアの宿屋にいます" : "いまはグリダニアの宿屋の外です（製作の前に移動します）"));
-
-            // 精選：一般アクション 21 の解放条件（霊砂を「採集→精選」で集めるのに要る）
-            var reduce = ReduceTask.IsUnlocked();
-            lines.Add(new ReportLine(reduce ? Severity.Ok : Severity.Warn,
-                reduce ? "精選：解放済み（霊砂は収集品を採って精選で集めます）" : "精選：未解放（霊砂はマーケットで買います。切り替えの前に確認窓を出します）"));
         });
 
         Add("霊砂（採集→精選で集める）", lines =>
@@ -286,6 +281,24 @@ public static class CharacterReport
         });
 
         return sections;
+    }
+
+    /// <summary>機能の解放の1行：解放済みか、未解放なら解放クエストと、自動で進められるか（進められない理由）。</summary>
+    private static ReportLine UnlockLine(uint generalAction, string whenLocked)
+    {
+        var name = Unlocks.Name(generalAction);
+        var quest = Unlocks.UnlockQuest(generalAction);
+        var questName = quest == 0 ? "（解放クエストが見つかりません）" : $"「{Unlocks.QuestName(quest)}」";
+        if (Unlocks.IsUnlocked(generalAction))
+            return new ReportLine(Severity.Ok, $"{name}：解放済み（クエスト{questName}）");
+
+        if (quest == 0)
+            return new ReportLine(Severity.Error, $"{name}：未解放。解放するクエストがゲームデータから見つかりません");
+
+        var chain = Unlocks.ChainToRun(quest, out var blocked);
+        return blocked != null
+            ? new ReportLine(Severity.Warn, $"{name}：未解放。クエスト{questName}は自動では進められません（{blocked}）")
+            : new ReportLine(Severity.Warn, $"{name}：未解放。{whenLocked}（{string.Join(" → ", chain.Select(Unlocks.QuestName))}）");
     }
 
     private static string QuestName(uint rowId)

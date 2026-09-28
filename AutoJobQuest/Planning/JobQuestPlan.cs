@@ -199,7 +199,8 @@ public static class PlanBuilder
             routes.Remove(Route.Vendor);
         if (routes.Contains(Route.Combat) && !Automation.CombatPlanner.HasReachableSpawn(sources, itemId))
             routes.Remove(Route.Combat);
-        if (routes.Contains(Route.Reduce) && (!Automation.ReduceTask.IsUnlocked() || Automation.ReduceTask.UsableSources(sources, itemId).Count == 0))
+        // 精選：解放済みか、実行の最初に解放できる見込みがあり、元の収集品を採れる採集職のレベルがあるときだけ
+        if (routes.Contains(Route.Reduce) && (!Automation.ReduceTask.Usable() || Automation.ReduceTask.UsableSources(sources, itemId).Count == 0))
             routes.Remove(Route.Reduce);
         return routes;
     }

@@ -25,6 +25,10 @@ public sealed class RunQuestTask : AutoTask
     private int restarts;
     private int notRunningFrames;
 
+    // 受注できる職への着替え（クエストごとに対象の職が違う：クラフター・ギャザラー・全クラス等）
+    private bool jobChecked;
+    private EquipJobTask? equip;
+
     public RunQuestTask(uint questRowId, string label)
     {
         this.questRowId = questRowId;
@@ -43,6 +47,33 @@ public sealed class RunQuestTask : AutoTask
 
         if (!this.started)
         {
+            // 受注の対象でない職のままだと受けられないので、先に着替える（レベルが足りてギアセットのある職）
+            if (!this.jobChecked)
+            {
+                this.jobChecked = true;
+                var job = Unlocks.PickJobFor(this.questRowId);
+                if (job == null)
+                    ctx.Log.Warn("クエスト", $"「{this.label}」を受けられる職（レベルが足りてギアセットのあるもの）が見つかりません。このまま Questionable に任せます");
+                else if (job.Value != Jobs.CurrentClassJob)
+                {
+                    ctx.Log.Write("クエスト", $"「{this.label}」を受けるため、{Jobs.Name(job.Value)} に着替えます");
+                    this.equip = new EquipJobTask(job.Value);
+                }
+            }
+
+            if (this.equip != null)
+            {
+                var r = this.equip.Step(ctx);
+                this.Status = this.equip.Status;
+                if (r == TaskResult.Running)
+                    return TaskResult.Running;
+                this.equip.Cleanup(ctx);
+                var failed = r == TaskResult.Failed ? this.equip.FailReason : null;
+                this.equip = null;
+                if (failed != null)
+                    return this.Fail(failed);
+            }
+
             if (ctx.Questionable.IsRunning() == true)
                 return this.Fail("Questionable がすでに動いています");
             if (!GameUi.PlayerFree())
@@ -75,9 +106,99 @@ public sealed class RunQuestTask : AutoTask
 
     public override void Cleanup(TaskContext ctx)
     {
+        this.equip?.Cleanup(ctx);
+        this.equip = null;
         if (this.started && ctx.Questionable.IsRunning() == true
             && ctx.Questionable.GetCurrentQuestId() == QuestionableIpc.ToQuestId(this.questRowId))
             ctx.Questionable.Stop(Plugin.InternalNameConst);
+    }
+}
+
+/// <summary>
+/// 機能（マテリア装着・精選）を、解放クエストを Questionable で進めて解放する。
+///  ・解放済みなら何もしない。
+///  ・解放クエストと、その未完了の前提（同じ区分のもの）を古い順に進める（Unlocks.ChainToRun）。
+///  ・自動で進められない前提（メインクエスト等）や、Questionable が進められなかったとき：
+///    必須（マテリア装着）なら止める。必須でない（精選）なら記録してあきらめる（霊砂はマーケットに回る。確認窓あり）。
+///  ・最後に解放されたかをゲームに聞いて確かめる。
+/// </summary>
+public sealed class UnlockFeatureTask : AutoTask
+{
+    private readonly uint generalAction;
+    private readonly bool required;
+    private readonly Queue<uint> chain = new();
+    private RunQuestTask? sub;
+
+    public UnlockFeatureTask(uint generalAction, bool required)
+    {
+        this.generalAction = generalAction;
+        this.required = required;
+    }
+
+    public override string Name => $"解放: {Unlocks.Name(this.generalAction)}";
+
+    protected override TaskResult OnStart(TaskContext ctx)
+    {
+        if (Unlocks.IsUnlocked(this.generalAction))
+            return TaskResult.Done;
+
+        var quest = Unlocks.UnlockQuest(this.generalAction);
+        if (quest == 0)
+            return this.GiveUp(ctx, $"{Unlocks.Name(this.generalAction)} を解放するクエストがゲームデータから見つかりません");
+
+        var list = Unlocks.ChainToRun(quest, out var blocked);
+        if (blocked != null)
+            return this.GiveUp(ctx, $"{Unlocks.Name(this.generalAction)} を解放するクエスト「{Unlocks.QuestName(quest)}」を進められません：{blocked}");
+
+        foreach (var q in list)
+            this.chain.Enqueue(q);
+        ctx.Log.Write("解放", $"{Unlocks.Name(this.generalAction)} が未解放なので、Questionable で次のクエストを進めます：{string.Join(" → ", list.Select(Unlocks.QuestName))}");
+        return TaskResult.Running;
+    }
+
+    protected override TaskResult Tick(TaskContext ctx)
+    {
+        if (this.sub == null)
+        {
+            if (this.chain.Count == 0)
+            {
+                if (Unlocks.IsUnlocked(this.generalAction))
+                {
+                    ctx.Log.Write("解放", $"{Unlocks.Name(this.generalAction)} を解放しました");
+                    return TaskResult.Done;
+                }
+
+                return this.GiveUp(ctx, $"解放クエストを終えましたが、{Unlocks.Name(this.generalAction)} が解放されていません");
+            }
+
+            var q = this.chain.Dequeue();
+            this.sub = new RunQuestTask(q, Unlocks.QuestName(q));
+        }
+
+        var r = this.sub.Step(ctx);
+        this.Status = $"{this.sub.Name}: {this.sub.Status}";
+        if (r == TaskResult.Running)
+            return TaskResult.Running;
+        this.sub.Cleanup(ctx);
+        var failed = r == TaskResult.Failed ? this.sub.FailReason : null;
+        this.sub = null;
+        return failed == null ? TaskResult.Running : this.GiveUp(ctx, failed);
+    }
+
+    private TaskResult GiveUp(TaskContext ctx, string why)
+    {
+        if (this.required)
+            return this.Fail(why);
+
+        Unlocks.GaveUp.Add(this.generalAction);
+        ctx.Log.Warn("解放", $"{why}（{Unlocks.Name(this.generalAction)} は使わずに進めます）");
+        return TaskResult.Done;
+    }
+
+    public override void Cleanup(TaskContext ctx)
+    {
+        this.sub?.Cleanup(ctx);
+        this.sub = null;
     }
 }
 
