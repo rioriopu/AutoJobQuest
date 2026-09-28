@@ -44,6 +44,18 @@ public sealed class GatherTask : AutoTask
     public List<uint> Unfinished { get; } = [];
 
     /// <summary>
+    /// これが true になったら、目標に届いていなくても採集をやめる（例：精選で霊砂が足りた。
+    /// 欲しい霊砂が手に入ったら、GBR のリストから外す）。
+    /// </summary>
+    public Func<bool>? StopWhen { get; init; }
+
+    /// <summary>
+    /// 採った収集品を GBR に納品させない（精選に使うため）。true なら採集の間だけ GBR の
+    /// 「収集品の自動納品」（CollectableConfig.AutoTurnInCollectables）を OFF にする。控えを取り、終わったら元に戻る。
+    /// </summary>
+    public bool KeepCollectables { get; init; }
+
+    /// <summary>
     /// この作業がどの手段か（採集か釣りか）。集めきれなかったときに、どの手段を外すかをこれで決める
     /// （品目の性質で決めると、採集でも釣りでも取れる品で、失敗した手段と違う手段を外してしまう）。
     /// </summary>
@@ -60,10 +72,20 @@ public sealed class GatherTask : AutoTask
 
     public override string Name => $"採集: {this.label}";
 
+    /// <summary>
+    /// GBR と同じ数え方の所持数（GBR の GatherableExtensions.GetInventoryCount と同じ）：
+    /// 普通の品（最低収集価値 0）＋ 収集品になりうる品なら収集品（最低収集価値 1）も足す。
+    /// 収集品を数えないと、GBR が目標まで採って止まったのに「0 個のまま止まった」と誤って判定する。
+    /// </summary>
     public static unsafe int GbrCount(uint itemId)
     {
         var im = InventoryManager.Instance();
-        return im == null ? 0 : im->GetInventoryItemCount(itemId, false, false, false, 0);
+        if (im == null)
+            return 0;
+        var count = im->GetInventoryItemCount(itemId, false, false, false, 0);
+        if (Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Item>().TryGetRow(itemId, out var row) && row.IsCollectable)
+            count += im->GetInventoryItemCount(itemId, false, false, false, 1);
+        return count;
     }
 
     protected override TaskResult OnStart(TaskContext ctx)
@@ -88,6 +110,10 @@ public sealed class GatherTask : AutoTask
         if (!ctx.Gbr.OverrideBool("GoHomeWhenDone", false) || !ctx.Gbr.OverrideBool("GoHomeWhenIdle", false))
             ctx.Log.Warn("採集", $"GBR の帰宅設定を一時的に切れませんでした: {ctx.Gbr.LastError}");
 
+        // 精選に使う収集品を、GBR が収集品納品窓口へ持っていかないように（GBR は収集品が溜まると納品しに行く：AutoGather.cs:1062）
+        if (this.KeepCollectables && !ctx.Gbr.OverrideBool(GbrHandle.CollectablePrefix + "AutoTurnInCollectables", false))
+            return this.Fail($"GBR の収集品の自動納品を一時的に切れませんでした（採った収集品を納品されてしまうため止めます）: {ctx.Gbr.LastError}");
+
         var entries = this.targets.Select(t => new GbrGatherEntry(t.Key, t.Value, this.preferredTerritory)).ToList();
         if (!ctx.Gbr.PrepareGatherList(entries, out var unsupported))
             return this.Fail(ctx.Gbr.LastError ?? "GBR のリストを用意できませんでした");
@@ -109,6 +135,12 @@ public sealed class GatherTask : AutoTask
 
     protected override TaskResult Tick(TaskContext ctx)
     {
+        if (this.StopWhen?.Invoke() == true)
+        {
+            ctx.Log.Write("採集", $"{this.label}: 目的のものが手に入ったので、採集をやめます");
+            return TaskResult.Done;
+        }
+
         var remaining = this.targets.Where(t => GbrCount(t.Key) < t.Value).ToList();
         if (remaining.Count == 0)
         {

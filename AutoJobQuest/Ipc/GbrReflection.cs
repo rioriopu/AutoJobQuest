@@ -151,11 +151,29 @@ public sealed class GbrHandle
     public void SaveConfig()
         => this.Config.GetType().GetMethod("Save", PubInst, null, Type.EmptyTypes, null)!.Invoke(this.Config, null);
 
+    /// <summary>名前の頭に付けると、収集品の設定（CollectableConfig）の項目を指す（例："Collectable.AutoTurnInCollectables"）。</summary>
+    public const string CollectablePrefix = "Collectable.";
+
+    /// <summary>
+    /// GBR の真偽値の設定を読む。既定は採集の設定（AutoGatherConfig）。<see cref="CollectablePrefix"/> 付きなら収集品の設定。
+    /// 一時変更の控え（GbrConfigOriginals）も同じ名前で持つので、戻すときも同じ経路になる。
+    /// </summary>
     public bool GetAutoGatherBool(string name)
-        => (bool)this.AutoGatherConfig.GetType().GetProperty(name, PubInst)!.GetValue(this.AutoGatherConfig)!;
+    {
+        var (obj, prop) = this.ResolveBool(name);
+        return (bool)obj.GetType().GetProperty(prop, PubInst)!.GetValue(obj)!;
+    }
 
     public void SetAutoGatherBool(string name, bool value)
-        => this.AutoGatherConfig.GetType().GetProperty(name, PubInst)!.SetValue(this.AutoGatherConfig, value);
+    {
+        var (obj, prop) = this.ResolveBool(name);
+        obj.GetType().GetProperty(prop, PubInst)!.SetValue(obj, value);
+    }
+
+    private (object Obj, string Prop) ResolveBool(string name)
+        => name.StartsWith(CollectablePrefix, StringComparison.Ordinal)
+            ? (this.CollectableConfig, name[CollectablePrefix.Length..])
+            : (this.AutoGatherConfig, name);
 
     /// <summary>
     /// アイテム ID から GBR の IGatherable（採集品か魚）を引く。

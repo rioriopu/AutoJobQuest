@@ -353,16 +353,32 @@ public sealed class CombatTask : AutoTask
             .FirstOrDefault();
     }
 
-    /// <summary>こちらを狙っている敵。</summary>
-    private static IBattleNpc? FindHater()
+    /// <summary>
+    /// こちらと戦闘状態にある敵（指定外でも倒す。倒さないとマウントにもテレポにも移れないため）。
+    /// ゲームの敵視リスト（UIState.Hater。画面の敵リストと同じ。BossMod の AggroPlayer の実体）で拾う。
+    /// 自分を狙っていない敵（チョコボを狙っている等）も、敵視リストに載っていれば戦闘状態の原因なので含める。
+    /// 敵視リストが読めないときは、自分を狙っている敵で代える。
+    /// </summary>
+    private static unsafe IBattleNpc? FindHater()
     {
         var meId = Svc.Objects.LocalPlayer?.GameObjectId ?? 0;
         if (meId == 0 || !GameUi.InCombat)
             return null;
 
+        var haters = new HashSet<uint>();
+        var ui = FFXIVClientStructs.FFXIV.Client.Game.UI.UIState.Instance();
+        if (ui != null)
+        {
+            ref var hater = ref ui->Hater;
+            for (var i = 0; i < hater.HaterCount && i < hater.Haters.Length; i++)
+                if (hater.Haters[i].EntityId != 0)
+                    haters.Add(hater.Haters[i].EntityId);
+        }
+
         return Svc.Objects
             .OfType<IBattleNpc>()
-            .Where(o => o.BattleNpcKind == BattleNpcSubKind.Combatant && IsAlive(o) && o.TargetObjectId == meId)
+            .Where(o => o.BattleNpcKind == BattleNpcSubKind.Combatant && IsAlive(o)
+                        && (haters.Contains(o.EntityId) || o.TargetObjectId == meId))
             .OrderBy(o => Vector3.Distance(o.Position, Me.Position))
             .FirstOrDefault();
     }

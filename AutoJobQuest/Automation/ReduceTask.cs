@@ -1,0 +1,337 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using AutoJobQuest.Core;
+using AutoJobQuest.Data;
+using AutoJobQuest.Planning;
+using Dalamud.Game.ClientState.Conditions;
+using FFXIVClientStructs.FFXIV.Client.Game;
+using FFXIVClientStructs.FFXIV.Client.Game.UI;
+using FFXIVClientStructs.FFXIV.Client.UI.Agent;
+
+namespace AutoJobQuest.Automation;
+
+/// <summary>精選で集める1品目。</summary>
+/// <param name="ItemId">欲しい品（霊砂など）。</param>
+/// <param name="TargetOwned">持っていたい総数（今の所持数＋不足数）。</param>
+/// <param name="Sources">精選の元にする採集品（採れる見込みの高い順）。</param>
+public sealed record ReduceNeed(uint ItemId, int TargetOwned, List<uint> Sources);
+
+/// <summary>
+/// 収集品を GBR に採らせ、こちらで精選して、欲しい品（霊砂など）を集める。
+///
+/// GBR の自動精選に任せない理由（GBR のソースで確認）:
+///  ・GBR の精選の設定（DoReduce）は既定で OFF（AutoGather.Config.cs:27）。
+///  ・ON でも、精選するのは「空き枠が 20 未満」か「空き枠 0」のときだけ（AutoGather.cs:680-714, 890）。
+///    空きの多いキャラでは、採集の途中で精選されない。
+///  ・GBR は精選できる収集品を全部精選する（利用者が別の目的で持っている収集品まで）。
+///
+/// こちらのやり方（AutoHook の Tasks/AetherialReduction.cs と同じ）:
+///  ・AgentPurify.ReduceItem(カバンの枠) で、元の収集品の枠だけを1個ずつ精選する（選択の窓を通さない）。
+///  ・結果の窓（PurifyResult）は「閉じる」（node 20。ECommons・GBR の AddonMaster と同じ）で閉じる。
+///  ・1個ごとに「元の収集品が減った AND 欲しい品が増えた」を確かめる。欲しい数に届いたらそこでやめる
+///    （1個から出る数は1〜4で幅があるので、精選しすぎない）。
+///  ・元の収集品が無ければ、GBR に少しずつ採らせる（足りない数の半分ずつ）。採っている途中でも、
+///    欲しい数に届いたら GBR を止める。
+///    採っている間は GBR の収集品の自動納品を切る（納品されると精選できないため）。
+/// </summary>
+public sealed unsafe class ReduceTask : AutoTask
+{
+    private enum ReduceStep { Decide, Gather, Reduce, WaitResult }
+
+    /// <summary>一般アクション 21＝精選（ゲームデータで確認：解析ツール jqa genact）。解放の判定に使う。</summary>
+    private const uint GeneralActionReduction = 21;
+
+    /// <summary>精選の結果の窓の「閉じる」ボタン（ECommons・GBR の AddonMaster.PurifyResult と同じ）。</summary>
+    private const uint PurifyResultCloseNode = 20;
+
+    private const int MaxGatherCycles = 8;
+
+    private readonly ReduceNeed need;
+    private readonly List<uint> sources;
+
+    private ReduceStep step = ReduceStep.Decide;
+    private GatherTask? gather;
+    private uint gatheringSource;
+    private int gatherCycles;
+
+    private uint reducingItem;
+    private int sourceBefore;
+    private int wantedBefore;
+    private DateTime reducedAt = DateTime.MinValue;
+    private DateTime lastClose = DateTime.MinValue;
+    private DateTime lastDismount = DateTime.MinValue;
+    private int oddResults;
+    private int reducedCount;
+
+    /// <summary>集めきれなかった品目（呼び出し側が次の手段を選ぶのに使う）。</summary>
+    public List<uint> Unfinished { get; } = [];
+
+    public ReduceTask(ReduceNeed need)
+    {
+        this.need = need;
+        this.sources = [.. need.Sources];
+    }
+
+    public override string Name => $"精選: {CraftPlanner.ItemName(this.need.ItemId)}";
+
+    private int Owned => Inventory.CountNow(this.need.ItemId);
+
+    /// <summary>精選が解放済みか（一般アクション 21 の解放条件をゲームに聞く）。</summary>
+    public static bool IsUnlocked()
+    {
+        try
+        {
+            var ui = UIState.Instance();
+            return ui != null
+                   && Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.GeneralAction>().TryGetRow(GeneralActionReduction, out var row)
+                   && ui->IsUnlockLinkUnlockedOrQuestCompleted(row.UnlockLink);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>精選の元のうち、いまの採掘師・園芸師のレベルで採れるもの（採れる見込みの高い順）。</summary>
+    public static List<uint> UsableSources(SourceIndex sources, uint itemId)
+        => sources.Get(itemId).ReducedFrom
+            .Where(src => sources.Get(src).Gather.Any(g => Jobs.Level(g.Mining ? Jobs.Gatherers[0] : Jobs.Gatherers[1]) >= g.GatheringLevel))
+            .ToList();
+
+    protected override TaskResult OnStart(TaskContext ctx)
+    {
+        if (!IsUnlocked())
+        {
+            this.Unfinished.Add(this.need.ItemId);
+            ctx.Log.Warn("精選", "精選が未解放なので、精選では集められません");
+            return TaskResult.Done;
+        }
+
+        ctx.Log.Write("精選", $"{CraftPlanner.ItemName(this.need.ItemId)} を {this.need.TargetOwned} 個まで集めます（今 {this.Owned} 個）。元にする収集品：{string.Join("、", this.sources.Select(CraftPlanner.ItemName))}");
+        return TaskResult.Running;
+    }
+
+    protected override TaskResult Tick(TaskContext ctx)
+    {
+        if (this.Elapsed > TimeSpan.FromMinutes(120))
+        {
+            this.Unfinished.Add(this.need.ItemId);
+            ctx.Log.Warn("精選", $"2時間たっても {CraftPlanner.ItemName(this.need.ItemId)} が集まりませんでした（{this.Owned}/{this.need.TargetOwned}）");
+            return TaskResult.Done;
+        }
+
+        return this.step switch
+        {
+            ReduceStep.Decide => this.TickDecide(ctx),
+            ReduceStep.Gather => this.TickGather(ctx),
+            ReduceStep.Reduce => this.TickReduce(ctx),
+            _ => this.TickWaitResult(ctx),
+        };
+    }
+
+    private TaskResult TickDecide(TaskContext ctx)
+    {
+        if (this.Owned >= this.need.TargetOwned)
+        {
+            ctx.Log.Write("精選", $"{CraftPlanner.ItemName(this.need.ItemId)} がそろいました（{this.Owned}/{this.need.TargetOwned}、精選 {this.reducedCount} 回）");
+            return TaskResult.Done;
+        }
+
+        // 元の収集品を持っていれば精選する
+        if (this.FindSourceSlot() != null)
+        {
+            this.Go(ReduceStep.Reduce, "精選します");
+            return TaskResult.Running;
+        }
+
+        // 持っていなければ採らせる
+        if (this.sources.Count == 0 || this.gatherCycles >= MaxGatherCycles)
+        {
+            this.Unfinished.Add(this.need.ItemId);
+            ctx.Log.Warn("精選", this.sources.Count == 0
+                ? $"精選の元にする収集品を採れませんでした（{this.Owned}/{this.need.TargetOwned}）"
+                : $"{MaxGatherCycles} 回採りに行っても {CraftPlanner.ItemName(this.need.ItemId)} がそろいませんでした（{this.Owned}/{this.need.TargetOwned}）");
+            return TaskResult.Done;
+        }
+
+        this.gatherCycles++;
+        this.gatheringSource = this.sources[0];
+        var remaining = this.need.TargetOwned - this.Owned;
+        var count = Math.Max(1, (int)Math.Ceiling(remaining / 2.0)); // 1個から1〜4個出るので、半分ずつ採っては精選して確かめる
+        var target = this.need.TargetOwned;
+        var wanted = this.need.ItemId;
+        this.gather = new GatherTask(
+            [new GatherNeed(this.gatheringSource, count)], null,
+            $"精選用の {CraftPlanner.ItemName(this.gatheringSource)}", TimeSpan.FromMinutes(60), Route.Reduce)
+        {
+            StopWhen = () => Inventory.CountNow(wanted) >= target,
+            KeepCollectables = true,
+        };
+        ctx.Log.Write("精選", $"{CraftPlanner.ItemName(this.gatheringSource)} を {count} 個採ります（{this.gatherCycles} 回目。{CraftPlanner.ItemName(wanted)} は あと {remaining} 個）");
+        this.Go(ReduceStep.Gather, "精選用の収集品を採っています");
+        return TaskResult.Running;
+    }
+
+    private TaskResult TickGather(TaskContext ctx)
+    {
+        var r = this.gather!.Step(ctx);
+        this.Status = this.gather.Status;
+        if (r == TaskResult.Running)
+            return TaskResult.Running;
+
+        this.gather.Cleanup(ctx);
+        var failed = r == TaskResult.Failed ? this.gather.FailReason : null;
+        var unfinished = this.gather.Unfinished.Contains(this.gatheringSource);
+        this.gather = null;
+        if (failed != null)
+            return this.Fail(failed);
+
+        // 1個も採れずに止まった元は候補から外す（次の元を試す）
+        if (unfinished && this.FindSourceSlot() == null)
+        {
+            ctx.Log.Warn("精選", $"{CraftPlanner.ItemName(this.gatheringSource)} を採れなかったので、別の元を試します");
+            this.sources.Remove(this.gatheringSource);
+        }
+
+        this.Go(ReduceStep.Decide, string.Empty);
+        return TaskResult.Running;
+    }
+
+    private TaskResult TickReduce(TaskContext ctx)
+    {
+        // 前の結果の窓が残っていれば先に閉じる
+        if (GameUi.IsReady("PurifyResult", out var result))
+        {
+            this.CloseResult(result);
+            return TaskResult.Running;
+        }
+
+        // 騎乗中は精選できない（GBR も騎乗中は精選しない：AutoGather.Purify.cs:15）
+        if (GameUi.Mounted)
+        {
+            if (DateTime.UtcNow - this.lastDismount >= TimeSpan.FromSeconds(1))
+            {
+                this.lastDismount = DateTime.UtcNow;
+                GameUi.UseGeneralAction(23); // 降りる（GeneralAction 23：ゲームデータで確認）
+            }
+
+            this.Status = "マウントから降りています";
+            return TaskResult.Running;
+        }
+
+        if (!GameUi.PlayerFree() || Svc.Condition[ConditionFlag.Occupied39])
+        {
+            this.Status = "動ける状態になるのを待っています";
+            return this.TimedOut(TimeSpan.FromSeconds(60)) ? this.Fail("キャラクターが動ける状態にならないため、精選できません") : TaskResult.Running;
+        }
+
+        var slot = this.FindSourceSlot();
+        if (slot == null)
+        {
+            this.Go(ReduceStep.Decide, string.Empty);
+            return TaskResult.Running;
+        }
+
+        var agent = AgentPurify.Instance();
+        if (agent == null)
+            return this.Fail("精選の仕組み（AgentPurify）に届きません");
+
+        this.reducingItem = slot->GetBaseItemId();
+        this.sourceBefore = Inventory.HeldCollectables().GetValueOrDefault(this.reducingItem);
+        this.wantedBefore = this.Owned;
+        DebugLog.Current?.Line("操作", $"精選: {CraftPlanner.ItemName(this.reducingItem)}（{slot->Container} の {slot->Slot} 番、収集価値 {slot->GetCollectability()}）");
+        agent->ReduceItem(slot);
+        this.reducedAt = DateTime.UtcNow;
+        this.Go(ReduceStep.WaitResult, $"{CraftPlanner.ItemName(this.reducingItem)} を精選しています");
+        return TaskResult.Running;
+    }
+
+    private TaskResult TickWaitResult(TaskContext ctx)
+    {
+        if (GameUi.IsReady("PurifyResult", out var result))
+        {
+            this.CloseResult(result);
+            return TaskResult.Running;
+        }
+
+        var sourceNow = Inventory.HeldCollectables().GetValueOrDefault(this.reducingItem);
+        var wantedNow = this.Owned;
+        var busy = Svc.Condition[ConditionFlag.Occupied39] || !GameUi.PlayerFree();
+
+        // 減った AND 増えた
+        if (!busy && sourceNow < this.sourceBefore && wantedNow > this.wantedBefore)
+        {
+            this.reducedCount++;
+            ctx.Log.Write("精選", $"{CraftPlanner.ItemName(this.reducingItem)} を精選しました → {CraftPlanner.ItemName(this.need.ItemId)} +{wantedNow - this.wantedBefore}（{wantedNow}/{this.need.TargetOwned}）");
+            this.Go(ReduceStep.Decide, string.Empty);
+            return TaskResult.Running;
+        }
+
+        if (this.PhaseElapsed < TimeSpan.FromSeconds(15))
+            return TaskResult.Running;
+
+        if (sourceNow < this.sourceBefore)
+        {
+            // 精選はされたが、欲しい品が増えなかった（別の品だけが出た等）。続けるが、続くようなら止める
+            if (++this.oddResults > 3)
+                return this.Fail($"精選しても {CraftPlanner.ItemName(this.need.ItemId)} が出ないことが続きました（精選の対応表が違う可能性）");
+            ctx.Log.Warn("精選", $"{CraftPlanner.ItemName(this.reducingItem)} を精選しましたが、{CraftPlanner.ItemName(this.need.ItemId)} は増えませんでした");
+            this.Go(ReduceStep.Decide, string.Empty);
+            return TaskResult.Running;
+        }
+
+        return this.Fail($"精選が受け付けられませんでした（{CraftPlanner.ItemName(this.reducingItem)} {this.sourceBefore}→{sourceNow}、{CraftPlanner.ItemName(this.need.ItemId)} {this.wantedBefore}→{wantedNow}）");
+    }
+
+    private void CloseResult(FFXIVClientStructs.FFXIV.Component.GUI.AtkUnitBase* result)
+    {
+        if (DateTime.UtcNow - this.lastClose < TimeSpan.FromMilliseconds(500))
+            return;
+        this.lastClose = DateTime.UtcNow;
+        if (!GameUi.ClickButton(result, PurifyResultCloseNode))
+            GameUi.Fire(result, true, -1);
+    }
+
+    /// <summary>カバンの中の、精選の元にする収集品の枠（最初の1つ）。</summary>
+    private InventoryItem* FindSourceSlot()
+    {
+        var im = InventoryManager.Instance();
+        if (im == null)
+            return null;
+        foreach (var type in Inventory.Bags)
+        {
+            var c = im->GetInventoryContainer(type);
+            if (c == null || !c->IsLoaded)
+                continue;
+            for (var i = 0; i < c->Size; i++)
+            {
+                var s = c->GetInventorySlot(i);
+                if (s != null && s->ItemId != 0 && s->IsCollectable() && this.need.Sources.Contains(s->GetBaseItemId()))
+                    return s;
+            }
+        }
+
+        return null;
+    }
+
+    private void Go(ReduceStep s, string status)
+    {
+        this.step = s;
+        this.NextPhase(status);
+    }
+
+    public override void Cleanup(TaskContext ctx)
+    {
+        this.gather?.Cleanup(ctx);
+        this.gather = null;
+
+        // 自分の精選で出た結果の窓が残っていれば閉じる
+        if (this.reducedAt != DateTime.MinValue && GameUi.IsReady("PurifyResult", out var result))
+        {
+            DebugLog.Current?.Line("操作", "止めたので精選の結果の窓を閉じます");
+            if (!GameUi.ClickButton(result, PurifyResultCloseNode))
+                GameUi.Fire(result, true, -1);
+        }
+    }
+}

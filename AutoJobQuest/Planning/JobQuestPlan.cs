@@ -27,6 +27,12 @@ public enum Route
 
     /// <summary>モンスターを倒して集める。</summary>
     Combat,
+
+    /// <summary>
+    /// 収集品を GBR に採らせ、こちらで精選して得る（霊砂など）。
+    /// マーケットより先に試す。精選が未解放・採集職のレベル不足なら候補から外す。
+    /// </summary>
+    Reduce,
 }
 
 /// <summary>製作しない素材1品目の必要数と入手手段。</summary>
@@ -193,6 +199,8 @@ public static class PlanBuilder
             routes.Remove(Route.Vendor);
         if (routes.Contains(Route.Combat) && !Automation.CombatPlanner.HasReachableSpawn(sources, itemId))
             routes.Remove(Route.Combat);
+        if (routes.Contains(Route.Reduce) && (!Automation.ReduceTask.IsUnlocked() || Automation.ReduceTask.UsableSources(sources, itemId).Count == 0))
+            routes.Remove(Route.Reduce);
         return routes;
     }
 
@@ -224,6 +232,8 @@ public static class PlanBuilder
             list.Add(Route.Fish);
         if (s.DropMobs.Any(m => sources.SpawnsOf(m).Count > 0))
             list.Add(Route.Combat);
+        if (s.CanReduce)
+            list.Add(Route.Reduce);
         if (s.Marketable)
             list.Add(Route.MarketBoard);
 

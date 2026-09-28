@@ -451,6 +451,7 @@ public sealed class MainWindow : Window
         Route.Gather => "採集",
         Route.Fish => "釣り",
         Route.Combat => "戦闘",
+        Route.Reduce => "採集→精選",
         _ => "入手手段なし",
     };
 }

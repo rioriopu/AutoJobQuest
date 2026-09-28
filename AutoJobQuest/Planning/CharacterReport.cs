@@ -131,6 +131,36 @@ public static class CharacterReport
             }
 
             lines.Add(new ReportLine(GoToInnTask.InGridaniaInn() ? Severity.Ok : Severity.Ok, GoToInnTask.InGridaniaInn() ? "いまグリダニアの宿屋にいます" : "いまはグリダニアの宿屋の外です（製作の前に移動します）"));
+
+            // 精選：一般アクション 21 の解放条件（霊砂を「採集→精選」で集めるのに要る）
+            var reduce = ReduceTask.IsUnlocked();
+            lines.Add(new ReportLine(reduce ? Severity.Ok : Severity.Warn,
+                reduce ? "精選：解放済み（霊砂は収集品を採って精選で集めます）" : "精選：未解放（霊砂はマーケットで買います。切り替えの前に確認窓を出します）"));
+        });
+
+        Add("霊砂（採集→精選で集める）", lines =>
+        {
+            if (data.Sources == null || data.ReducibleMaterials == null)
+            {
+                lines.Add(new ReportLine(Severity.Warn, "ゲームデータの読み込み後に出ます"));
+                return;
+            }
+
+            // ジョブクエの素材のうち精選で得られる品と、その元になる収集品（精選の対応表：LuminaSupplemental ItemSupplement.csv）
+            foreach (var id in data.ReducibleMaterials)
+            {
+                var name = CraftPlanner.ItemName(id);
+                var all = data.Sources.Get(id).ReducedFrom;
+                var usable = ReduceTask.UsableSources(data.Sources, id);
+                var need = all.Count == 0 ? "（精選の元が見つかりません）" : string.Join("、", all.Select(s =>
+                {
+                    var g = data.Sources.Get(s).Gather;
+                    var lv = g.Count == 0 ? 0 : g.Min(x => x.GatheringLevel);
+                    var job = g.Count > 0 && g[0].Mining ? "採掘" : "園芸";
+                    return $"{CraftPlanner.ItemName(s)}（{job}Lv{lv}{(usable.Contains(s) ? "・採れます" : "・レベル不足")}）";
+                }));
+                lines.Add(new ReportLine(usable.Count > 0 ? Severity.Ok : Severity.Warn, $"{name}：手持ち {Inventory.CountNow(id)} 個 ← {need}"));
+            }
         });
 
         Add("秘伝書（8職のジョブクエ Lv60 までで要るもの）", lines =>

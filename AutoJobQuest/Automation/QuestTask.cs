@@ -24,7 +24,7 @@ namespace AutoJobQuest.Automation;
 ///    ここに来たら、装着済みを確かめてから Questionable を止め、報告だけこちらで行う
 ///    （報告先の NPC＝Quest.TargetEnd、位置＝その手順の座標。会話と納品の入力は TextAdvance に任せる）。
 /// </summary>
-public sealed class QuestTask : AutoTask
+public sealed unsafe class QuestTask : AutoTask
 {
     private readonly JobQuest quest;
     private bool started;
@@ -36,6 +36,9 @@ public sealed class QuestTask : AutoTask
     private MoveToTask? moving;
     private Vector3? turnInPos;
     private DateTime interactedAt = DateTime.MinValue;
+
+    // 品を入れた納品窓（同じ窓に二度入れないため。窓が閉じたら 0 に戻す）
+    private nint requestHandled;
 
     public QuestTask(JobQuest quest)
     {
@@ -60,7 +63,7 @@ public sealed class QuestTask : AutoTask
                 return this.Fail($"納品物 {CraftPlanner.ItemName(r.ItemId)}{(r.Hq ? "(HQ)" : string.Empty)} が {have}/{r.Count} しかありません");
 
             if (r.Hq && inv.CountNq(r.ItemId) > 0)
-                ctx.Log.Warn("クエスト", $"{CraftPlanner.ItemName(r.ItemId)} を NQ でも持っています。納品の自動入力（TextAdvance）は一覧の先頭を選ぶため、NQ が選ばれると納品できません（未確認）");
+                ctx.Log.Debug("クエスト", $"{CraftPlanner.ItemName(r.ItemId)} を NQ でも持っています（納品窓ではこちらが HQ を選んで入れます）");
         }
 
         if (this.quest.Materia is { } m)
@@ -87,6 +90,22 @@ public sealed class QuestTask : AutoTask
         {
             ctx.Log.Write("クエスト", $"{this.quest} を完了しました");
             return TaskResult.Done;
+        }
+
+        // 納品窓が開いたら、条件（HQ・マテリア）に合う品をこちらで自動で入れて渡す（窓1つにつき1回。確認は出さない）。
+        // TextAdvance は一覧の先頭を入れるので、NQ と HQ を両方持っていると NQ が入る恐れがあった
+        if (GameUi.IsReady("Request", out var request))
+        {
+            if ((nint)request != this.requestHandled)
+            {
+                this.requestHandled = (nint)request;
+                if (RequestFill.TryFill(out var detail) && detail.Length > 0)
+                    ctx.Log.Write("納品", detail);
+            }
+        }
+        else
+        {
+            this.requestHandled = 0;
         }
 
         if (this.Elapsed > TimeSpan.FromMinutes(30))

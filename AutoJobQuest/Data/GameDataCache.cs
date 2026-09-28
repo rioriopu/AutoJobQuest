@@ -40,6 +40,9 @@ public sealed class GameDataCache
     /// <summary>8職のジョブクエ（Lv60 まで）全部を作るのに要る秘伝書（完了済みかどうかに関わらず）。</summary>
     public List<BookNeed>? AllBooks { get; private set; }
 
+    /// <summary>全ジョブクエの素材のうち、精選で得られる品（霊砂など）。</summary>
+    public List<uint>? ReducibleMaterials { get; private set; }
+
     /// <summary>上の秘伝書すべてについての交換店・収集品・窓口の情報。</summary>
     public BookData? Books { get; private set; }
 
@@ -81,6 +84,9 @@ public sealed class GameDataCache
                     .OrderBy(b => b.TomeId)
                     .ToList();
                 this.Books = BookData.Build(this.AllBooks.Select(b => b.BookItemId).Where(x => x != 0), collectable);
+
+                // 全ジョブクエの素材のうち、精選で得られる品（霊砂など。キャラクタータブの表示用）
+                this.ReducibleMaterials = all.RawTotal.Keys.Where(k => sources.Get(k).CanReduce).OrderBy(k => k).ToList();
 
                 var log = Core.DebugLog.Current;
                 log?.Line("データ", $"ゲームデータを読みました（{(DateTime.UtcNow - started).TotalSeconds:0.0}秒）：ジョブクエ {quests.Quests.Count} 本、秘伝書 {this.AllBooks.Count} 冊");

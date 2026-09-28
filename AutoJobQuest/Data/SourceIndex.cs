@@ -59,6 +59,14 @@ public sealed class ItemSources
     public bool CanGather => this.Gather.Count > 0;
 
     public bool CanGatherUntimed => this.Gather.Any(x => !x.Timed);
+
+    /// <summary>
+    /// 精選するとこの品が出る、採掘・園芸で採れる品（精選の元。採集点のレベルの低い順）。
+    /// 例：微光の霊砂 ← ファイアグラベル・赤玉土など（霊砂は収集品を採って精選で得る）。
+    /// </summary>
+    public List<uint> ReducedFrom { get; } = [];
+
+    public bool CanReduce => this.ReducedFrom.Count > 0;
 }
 
 /// <summary>
@@ -95,7 +103,44 @@ public sealed class SourceIndex
         idx.BuildVendors();
         idx.BuildMarket();
         idx.BuildCombat();
+        idx.BuildReduction();
         return idx;
+    }
+
+    /// <summary>
+    /// 精選（Aetherial Reduction）の対応：どの品を精選すると何が出るか。ゲームデータには無いので、
+    /// LuminaSupplemental 同梱の ItemSupplement.csv（種類 Reduction）を使う（Allagan Tools も同じデータ：
+    /// AllaganLib ItemInfoCache.cs:1657）。元の品は、採掘・園芸で採れるもの（GBR に採らせられるもの）だけを残す。
+    /// 採集より後に作ること（CanGather を見るため）。
+    /// </summary>
+    private void BuildReduction()
+    {
+        try
+        {
+            var rows = CsvLoader.LoadResource<ItemSupplement>(CsvLoader.ItemSupplementResourceName, true, out var failed, out _);
+            foreach (var r in rows)
+            {
+                if (r.ItemSupplementSource != ItemSupplementSource.Reduction || r.ItemId == 0 || r.SourceItemId == 0)
+                    continue;
+                var src = this.Get(r.SourceItemId);
+                if (!src.CanGather)
+                    continue;
+                var dst = this.Get(r.ItemId);
+                if (!dst.ReducedFrom.Contains(r.SourceItemId))
+                    dst.ReducedFrom.Add(r.SourceItemId);
+            }
+
+            // 採集点のレベルの低い順（採れる見込みの高い順）
+            foreach (var s in this.map.Values.Where(x => x.ReducedFrom.Count > 1))
+                s.ReducedFrom.Sort((a, b) => this.Get(a).Gather.Min(g => g.GatheringLevel).CompareTo(this.Get(b).Gather.Min(g => g.GatheringLevel)));
+
+            if (failed.Count > 0)
+                this.notes.Add($"精選のデータで読めない行がありました（{failed.Count} 行）");
+        }
+        catch (Exception ex)
+        {
+            this.notes.Add($"精選のデータを読めませんでした: {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     /// <summary>入手元。データに無い品でも空の情報を返す（null にはしない）。</summary>

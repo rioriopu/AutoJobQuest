@@ -420,6 +420,13 @@ public sealed class JobQuestFlow : AutoTask
                 rest.Select(g => new GatherNeed(g.Item, g.Need)), null, "採掘・園芸", TimeSpan.FromMinutes(90))));
         }
 
+        // 4.5) 採集→精選（霊砂など。収集品を GBR に採らせて精選で得る）
+        foreach (var r in raw.Where(r => r.Routes[0] == Route.Reduce))
+        {
+            var reduceNeed = new ReduceNeed(r.Item, inv.CountAll(r.Item) + r.Need, ReduceTask.UsableSources(ctx.Data.Sources!, r.Item));
+            steps.Add(_ => this.Track(new ReduceTask(reduceNeed)));
+        }
+
         // 5) 釣り（GBR に一任）。GBR が釣れない設定なら、別の手段に黙って切り替えずに止める
         var fish = raw.Where(r => r.Routes[0] == Route.Fish).ToList();
         if (fish.Count > 0)
@@ -517,6 +524,10 @@ public sealed class JobQuestFlow : AutoTask
                     // 採集と釣りのどちらで失敗したかは、作業の種類で決める（品目の性質で決めると、両方で取れる品で取り違える）
                     foreach (var id in g.Unfinished)
                         this.Exclude(id, g.Route);
+                    break;
+                case ReduceTask rt:
+                    foreach (var id in rt.Unfinished)
+                        this.Exclude(id, Route.Reduce);
                     break;
             }
         }
