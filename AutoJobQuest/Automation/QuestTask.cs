@@ -28,6 +28,7 @@ public sealed unsafe class QuestTask : AutoTask
 {
     private readonly JobQuest quest;
     private bool started;
+    private bool everStarted; // 一度でも Questionable に頼んだか（やり直し待ちの間も納品窓を扱えるように）
     private int restarts;
     private int notRunningFrames;
 
@@ -37,12 +38,20 @@ public sealed unsafe class QuestTask : AutoTask
     private Vector3? turnInPos;
     private DateTime interactedAt = DateTime.MinValue;
 
-    // 品を入れた納品窓（同じ窓に二度入れないため。窓が閉じたら 0 に戻す）
-    private nint requestHandled;
+    // 納品窓の扱い（窓ごとに状態を持つ。準備待ちなら次のフレームで続きから）
+    private readonly RequestFiller filler = new();
+    private readonly HashSet<uint> questItems;
+    private DateTime claimedAt = DateTime.MinValue;
+    private bool foreignRequestLogged;
+
+    // 渡す操作を送った後の確かめ（求めた品が減ったか）
+    private DateTime? submittedAt;
+    private Dictionary<uint, int> countsBeforeSubmit = [];
 
     public QuestTask(JobQuest quest)
     {
         this.quest = quest;
+        this.questItems = quest.Items.Select(i => i.ItemId).ToHashSet();
     }
 
     public override string Name => $"クエスト: {Jobs.Name(this.quest.ClassJobId)} {this.quest}";
@@ -81,6 +90,15 @@ public sealed unsafe class QuestTask : AutoTask
         if (ctx.Questionable.IsRunning() == true)
             return this.Fail("Questionable がすでに動いています（利用者の操作を横取りしないため止めました）");
 
+        // 始める前から開いている納品窓は、利用者か他の操作のもの。触らない。
+        // 開いたままだと Questionable が進めないので、閉じてもらう
+        if (GameUi.IsVisible("Request"))
+            return this.Fail("クエストの納品窓が開いています（こちらが始めたクエストのものではないので触りません）。閉じてからやり直してください");
+
+        // ここから開いた納品窓を「自分のクエストの窓」の候補として記録する（要求品の照合と合わせて判断する）
+        ctx.Ownership.Clear();
+        ctx.Ownership.IsClaiming = true;
+        this.claimedAt = DateTime.UtcNow;
         return TaskResult.Running;
     }
 
@@ -92,21 +110,10 @@ public sealed unsafe class QuestTask : AutoTask
             return TaskResult.Done;
         }
 
-        // 納品窓が開いたら、条件（HQ・マテリア）に合う品をこちらで自動で入れて渡す（窓1つにつき1回。確認は出さない）。
+        // 納品窓が開いたら、条件（HQ・マテリア）に合う品をこちらで自動で入れて渡す（確認は出さない）。
         // TextAdvance は一覧の先頭を入れるので、NQ と HQ を両方持っていると NQ が入る恐れがあった
-        if (GameUi.IsReady("Request", out var request))
-        {
-            if ((nint)request != this.requestHandled)
-            {
-                this.requestHandled = (nint)request;
-                if (RequestFill.TryFill(out var detail) && detail.Length > 0)
-                    ctx.Log.Write("納品", detail);
-            }
-        }
-        else
-        {
-            this.requestHandled = 0;
-        }
+        if (this.HandleRequest(ctx) is { } requestFailure)
+            return this.Fail(requestFailure);
 
         if (this.Elapsed > TimeSpan.FromMinutes(30))
             return this.Fail("30分たってもクエストが完了しません");
@@ -123,6 +130,7 @@ public sealed unsafe class QuestTask : AutoTask
                 return this.Fail("Questionable がこのクエストを始められませんでした（経路データが無い・受注条件を満たしていない等）");
 
             this.started = true;
+            this.everStarted = true;
             this.NextPhase("Questionable が進めています");
             return TaskResult.Running;
         }
@@ -165,6 +173,76 @@ public sealed unsafe class QuestTask : AutoTask
         }
 
         return TaskResult.Running;
+    }
+
+    /// <summary>
+    /// 納品窓を扱う。扱うのは次の全部を満たす窓だけ：
+    ///  ・こちらがクエストを始めた（Questionable に頼んだ・報告に向かった）後であること
+    ///  ・窓がこのクエストの間に開いたこと（AddonOwnership の記録。始める前から開いていた窓は OnStart で止めている）
+    ///  ・窓が求める品が、このクエストの納品物に含まれること（RequestFiller が確かめる）
+    /// 失敗（条件に合う品が無い等）なら理由を返す。
+    /// </summary>
+    private string? HandleRequest(TaskContext ctx)
+    {
+        // 渡した後：求めた品が減ったかを確かめる（渡す操作を送ったことを「納品した」とはしない）
+        if (this.submittedAt is { } at)
+        {
+            var inv = Inventory.Snapshot();
+            var dropped = this.countsBeforeSubmit.Where(kv => inv.CountAll(kv.Key) < kv.Value).ToList();
+            if (dropped.Count > 0)
+            {
+                this.submittedAt = null;
+                ctx.Log.Write("納品", $"納品を確かめました（{string.Join("、", dropped.Select(kv => $"{CraftPlanner.ItemName(kv.Key)} {kv.Value}→{inv.CountAll(kv.Key)}"))}）");
+            }
+            else if (DateTime.UtcNow - at > TimeSpan.FromSeconds(15))
+            {
+                // 二度は送らない（二重に渡さないため）。クエストが進まなければ、全体の上限で止まる
+                this.submittedAt = null;
+                ctx.Log.Warn("納品", "渡す操作を送ってから15秒たっても、納品物の所持数が減っていません（渡せていない可能性。同じ窓にはもう一度は送りません）");
+            }
+        }
+
+        if (!GameUi.IsReady("Request", out var request))
+        {
+            // 窓が閉じた。次に開く窓は新しい窓として扱う
+            this.filler.Reset();
+            this.foreignRequestLogged = false;
+            return null;
+        }
+
+        var openedAt = DateTime.MinValue;
+        var ours = (this.everStarted || this.manualTurnIn)
+                   && ctx.Ownership.TryGetOwnedSince("Request", this.claimedAt, out var own, out openedAt) && own == request;
+        if (!ours)
+        {
+            if (!this.foreignRequestLogged)
+            {
+                this.foreignRequestLogged = true;
+                ctx.Log.Warn("納品", "納品窓が開いていますが、このクエストを始めた後に開いたものと確かめられないので触りません");
+            }
+
+            return null;
+        }
+
+        var result = this.filler.Tick((nint)request, openedAt, this.questItems, out var detail);
+        switch (result)
+        {
+            case RequestFiller.Outcome.Submitted:
+                this.submittedAt = DateTime.UtcNow;
+                this.countsBeforeSubmit = new Dictionary<uint, int>(this.filler.CountsBeforeSubmit);
+                ctx.Log.Write("納品", detail);
+                break;
+            case RequestFiller.Outcome.NotOurs:
+                ctx.Log.Warn("納品", detail);
+                break;
+            case RequestFiller.Outcome.Failed:
+                return detail;
+            case RequestFiller.Outcome.Busy:
+                this.Status = "納品窓で別の操作が選択中なので待っています";
+                break;
+        }
+
+        return null;
     }
 
     /// <summary>報告だけを自前で行う（NPC の前まで移動して話しかける。会話と納品は TextAdvance）。</summary>
@@ -248,6 +326,7 @@ public sealed unsafe class QuestTask : AutoTask
             ctx.Questionable.Stop(Plugin.InternalNameConst);
 
         ctx.TextAdvance.ReleaseControl();
+        ctx.Ownership.Clear();
     }
 
     /// <summary>

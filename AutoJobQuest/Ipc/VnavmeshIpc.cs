@@ -79,6 +79,16 @@ public sealed class VnavmeshIpc : IpcGate
         return false;
     }
 
+    /// <summary>
+    /// 経路をたどって実際に動いている最中か（Path.IsRunning だけ。経路の計算中は含まない）。
+    /// Path.Stop が止められるのはこれだけ。計算中の経路は取り消せず、計算が終わると遅れて動き出す
+    /// （vnavmesh の IPCProvider.cs：Path.Stop は FollowPath の停止だけ。SimpleMove の計算は別）。
+    /// </summary>
+    public bool IsFollowingPath()
+        => this.TryInvoke("Path.IsRunning",
+               () => this.Func<bool>("vnavmesh.Path.IsRunning").InvokeFunc(), out var running)
+           && running;
+
     /// <summary>移動を止める。自分が始めた移動のときだけ呼ぶこと（全体に効くため）。</summary>
     public bool Stop()
         => this.TraceThen("Path.Stop()") && this.TryAction("Path.Stop",

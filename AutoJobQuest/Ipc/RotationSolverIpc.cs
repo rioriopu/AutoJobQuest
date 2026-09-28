@@ -43,28 +43,42 @@ public sealed class RotationSolverIpc : IpcGate
     private bool henchedByMe;
     private DateTime lastHenchedSend = DateTime.MinValue;
     private int unanswered;
+    private int unreadable;
 
     /// <summary>
-    /// Henched を送っても RSR が動作中にならないことが続いたか（3回）。
+    /// Henched を送っても RSR が動作中にならない（false）か、状態が読めない（null）ことが続いたか（それぞれ3回）。
     /// RSR の AutorotationActive は Henched で true になる（State と IsManual が立つ：RSR の RSCommands_StateSpecialCommand.cs・
     /// DataCenter.IsActivatedIPC）。これが続くのは IPC が効いていないということ
     /// （BeastHelper の作者は「自前の enum で呼んだら黙って効かなかった」と記録している。Dalamud は型が違う引数を
     /// JSON で変換するので byte は通るはずだが、実機では未確認のため、黙って送り続けずに気づけるようにする）。
+    ///
+    /// 【true だけを成功とみなす】以前は「読めない（null）」も成功側に数えていたので、
+    /// 状態の読み出しだけが壊れていると、攻撃しないまま近づき続け、3回で止める仕組みも働かなかった。
+    /// なお AutorotationActive は「State か IsManual」なので、true でも Henched になったことまでは証明しない
+    /// （IPC にモードを読む口が無いため。RSR の IPCProvider.cs:274・DataCenter.cs:246）。
     /// </summary>
-    public bool HenchedUnresponsive => this.unanswered >= 3;
+    public bool HenchedUnresponsive => this.unanswered >= 3 || this.unreadable >= 3;
+
+    /// <summary><see cref="HenchedUnresponsive"/> のときの理由（記録と停止の文言用）。</summary>
+    public string HenchedProblem => this.unreadable >= 3
+        ? $"RSR の動作状態（AutorotationActive）を {this.unreadable} 回続けて読めませんでした（IPC が変わった可能性）"
+        : $"RSR に Henched への切り替えを {this.unanswered} 回送っても動作中になりません（IPC が効いていない可能性）";
 
     /// <summary>
     /// Henched にする（まだこちらが入れていなければ）。入れる前に RSR が動いていたら、利用者が使っていたとみなして記録する
     /// （IPC ではモードの種類までは読めないので、戻すときは Off にしかできないため）。
     /// こちらが入れた後に RSR が自分で OFF になった（エリア移動・死亡・着替え）ときは入れ直す。
+    /// 状態が読めないときも入れ直す（RSR の ChangeOperatingMode は切り替えではなく「そのモードにする」なので、
+    /// 同じモードを送っても OFF にはならない：RSR の IPCProvider.cs:125 → RSCommands.UpdateState）。
     /// 送るのは3秒に1回まで（反映を待たずに毎フレーム送ると、RSR の切り替え表示がチャットにあふれる）。
     /// </summary>
     public bool EnsureHenched()
     {
         var active = this.IsActive();
-        if (this.henchedByMe && active != false)
+        if (this.henchedByMe && active == true)
         {
             this.unanswered = 0;
+            this.unreadable = 0;
             return true;
         }
 
@@ -76,6 +90,9 @@ public sealed class RotationSolverIpc : IpcGate
 
         if (this.henchedByMe && active == false && ++this.unanswered >= 3)
             Core.DebugLog.Current?.Line("IPC", $"⚠ RSR に Henched を {this.unanswered} 回送っても動作中になりません");
+
+        if (this.henchedByMe && active == null && ++this.unreadable >= 3)
+            Core.DebugLog.Current?.Line("IPC", $"⚠ RSR の動作状態を {this.unreadable} 回続けて読めません");
 
         if (!this.ChangeOperatingMode(ModeHenched))
             return false;
@@ -93,6 +110,7 @@ public sealed class RotationSolverIpc : IpcGate
         {
             this.henchedByMe = false;
             this.unanswered = 0;
+            this.unreadable = 0;
             this.lastHenchedSend = DateTime.MinValue;
         }
     }

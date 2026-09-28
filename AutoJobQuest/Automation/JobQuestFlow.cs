@@ -47,9 +47,15 @@ public sealed class JobQuestFlow : AutoTask
     private Stage stage = Stage.WaitData;
     private AutoTask? child;
     private int confirmTicket = -1;
-    // 周回の回数（素材集めと製作で別々に数える。共有すると製作の作り直しが素材集めの上限を食う）
+    // 周回の回数（素材集めと製作で別々に数える。共有すると製作の作り直しが素材集めの上限を食う）。
+    // どちらも「進まなかった周回」を数える：製作が進んだ（残りの製作回数が減った）ら両方 0 に戻す
+    // （途中で打ち切って立て直す形にしたので、全体の回数で数えると正常な多レシピの計画でも上限に当たる）
     private int acquireRound;
     private int craftRound;
+    private int lastCraftRemaining = int.MaxValue;
+
+    // 製作の列の打ち切り（材料が予定より少ないレシピに来たら、古い計画のまま進めず、残りを捨てて立て直す）
+    private string? craftCut;
 
     // マーケットで買えなかった回数（品目ごと。2回で手段から外す）
     private readonly Dictionary<uint, int> marketFailures = [];
@@ -67,9 +73,11 @@ public sealed class JobQuestFlow : AutoTask
     // 秘伝書
     private Task<BookData>? bookBuild;
     private BookData? books;
+    private List<uint> requiredBookItems = [];
     private List<BookOffer> booksToBuy = [];
     private int collectablesNeeded;
     private bool booksDone;
+    private int booksRound;
 
     public JobQuestFlow(bool[] selected)
     {
@@ -267,7 +275,12 @@ public sealed class JobQuestFlow : AutoTask
         }
 
         var sheet = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.SecretRecipeBook>();
-        var bookItems = tomes.Select(t => sheet.TryGetRow(t, out var r) ? r.Item.RowId : 0).Where(x => x != 0).ToList();
+        var missingItem = tomes.Where(t => !sheet.TryGetRow(t, out var r) || r.Item.RowId == 0).ToList();
+        if (missingItem.Count > 0)
+            return this.Fail($"秘伝書（SecretRecipeBook {string.Join("・", missingItem)}）のアイテムがゲームデータから引けません");
+
+        var bookItems = tomes.Select(t => sheet.GetRow(t).Item.RowId).ToList();
+        this.requiredBookItems = bookItems;
         var collectable = ctx.Config.ScripCollectableItemId;
         ctx.Log.Write("秘伝書", $"未読の秘伝書：{string.Join("、", bookItems.Select(CraftPlanner.ItemName))}");
         this.bookBuild = Task.Run(() => BookData.Build(bookItems, collectable));
@@ -293,27 +306,73 @@ public sealed class JobQuestFlow : AutoTask
         foreach (var n in this.books.Notes)
             ctx.Log.Warn("秘伝書", n);
 
-        var offers = this.books.Offers.Values.Where(o => !ExchangeBooksTask.IsLearned(o.TomeId)).ToList();
-        this.booksToBuy = offers.Where(o => Inventory.CountNow(o.BookItemId) == 0).ToList();
+        // 秘伝書の流れに欠かせないデータ（交換の店・報酬・通貨・窓口）がそろっているか。欠けていれば素材を集める前に止める
+        var problems = this.books.Validate(this.requiredBookItems);
+        if (problems.Count > 0)
+            return this.Fail($"秘伝書のデータが足りないため始めません：{string.Join(" / ", problems)}");
 
-        var price = this.booksToBuy.Sum(o => (int)o.Price);
-        var scrips = this.booksToBuy.Count > 0 ? Inventory.CountSpecialCurrency(this.booksToBuy[0].SpecialCurrencyId, out _) : 0;
-        var scripNeed = Math.Max(0, price - scrips);
-        var held = Inventory.CountCollectables(this.books.CollectableItemId, this.books.MinCollectability);
+        this.RecomputeBookNeeds(ctx);
 
-        // 1個あたりの報酬は、確実に足りるよう「低」で見積もる（シーダーロングボウは 45。最高評価なら 54）。
-        // 持っていたい総数で覚える（手持ちは計画を立てるたびに1回だけ引く。二重に引かない）
-        this.collectablesNeeded = this.books.RewardLow > 0
-            ? (int)Math.Ceiling(scripNeed / (double)this.books.RewardLow)
-            : 0;
-
-        ctx.Log.Write("秘伝書",
-            $"交換 {this.booksToBuy.Count} 冊（紫貨 {price}）、所持 {scrips}、不足 {scripNeed}。"
-            + $"{CraftPlanner.ItemName(this.books.CollectableItemId)} が {this.collectablesNeeded} 個要ります"
-            + $"（1個 {this.books.RewardLow}〜{this.books.RewardHigh}、手持ちの収集品 {held} 個 → 作るのは {Math.Max(0, this.collectablesNeeded - held)} 個）");
+        // 紫貨のための収集品は、中間素材まで別の職で作る（例：シーダーロングボウ＝木工・鍛冶・裁縫）。
+        // その職のギアセットが無ければ、素材を集める前に止める（以前は開始時の点検が
+        // 収集品そのものの職しか見ていなかったので、中間素材の段で止まりえた）
+        var extra = this.ExtraTargets().ToList();
+        if (extra.Count > 0)
+        {
+            var plan = this.Plan(ctx);
+            var craftAll = ctx.Data.Planner!.Build(plan.RemainingQuests.SelectMany(q => q.Items).Concat(extra), Inventory.Snapshot(), PlanBuilder.IsBookUnlocked);
+            if (MissingGearsets(craftAll) is { } missing)
+                return this.Fail($"紫貨のための収集品を作る職のギアセットがありません：{missing}");
+        }
 
         this.stage = Stage.Acquire;
         return TaskResult.Running;
+    }
+
+    /// <summary>
+    /// 秘伝書の残り（交換が要る冊・紫貨の不足・要る収集品の数）を今の所持から計算し直す。
+    /// 1個あたりの報酬は、確実に足りるよう「低」で見積もる（シーダーロングボウは 45。最高評価なら 54）。
+    /// 収集品は持っていたい総数で覚える（手持ちは計画を立てるたびに1回だけ引く。二重に引かない）。
+    /// 秘伝書は最大7冊×各100紫貨＝700で、紫貨の上限（4,000）を超えない（解析ツール jqa bookdata で確認）。
+    /// </summary>
+    private void RecomputeBookNeeds(TaskContext ctx)
+    {
+        var b = this.books!;
+        var offers = b.Offers.Values.Where(o => !ExchangeBooksTask.IsLearned(o.TomeId)).ToList();
+        this.booksToBuy = offers.Where(o => Inventory.CountNow(o.BookItemId) == 0).ToList();
+
+        var price = this.booksToBuy.Sum(o => (int)o.Price);
+        var scrips = Inventory.CountSpecialCurrency(b.RewardSpecialCurrencyId, out _);
+        var scripNeed = Math.Max(0, price - scrips);
+        var held = Inventory.CountCollectables(b.CollectableItemId, b.MinCollectability);
+        this.collectablesNeeded = b.RewardLow > 0 ? (int)Math.Ceiling(scripNeed / (double)b.RewardLow) : 0;
+
+        ctx.Log.Write("秘伝書",
+            $"交換 {this.booksToBuy.Count} 冊（紫貨 {price}）、所持 {scrips}、不足 {scripNeed}。"
+            + $"{CraftPlanner.ItemName(b.CollectableItemId)} が {this.collectablesNeeded} 個要ります"
+            + $"（1個 {b.RewardLow}〜{b.RewardHigh}、手持ちの収集品 {held} 個 → 作るのは {Math.Max(0, this.collectablesNeeded - held)} 個）");
+    }
+
+    /// <summary>
+    /// 納品で貯めたい紫貨（まだ交換していない秘伝書の値段の合計）。これに届いたら納品をやめる
+    /// （以前は必要な紫貨に届いても、手持ちの収集品がある限り納品を続けていた）。
+    /// </summary>
+    private int ScripTarget()
+        => this.books == null
+            ? 0
+            : this.books.Offers.Values
+                .Where(o => !ExchangeBooksTask.IsLearned(o.TomeId) && Inventory.CountNow(o.BookItemId) == 0)
+                .Sum(o => (int)o.Price);
+
+    /// <summary>計画で使う職のうち、ギアセットの無いもの（「職（品）」の並び）。全部あれば null。</summary>
+    private static string? MissingGearsets(CraftPlan plan)
+    {
+        var missing = plan.Crafts
+            .GroupBy(c => c.ClassJobId)
+            .Where(g => GearCheck.FindGearset(g.Key) < 0)
+            .Select(g => $"{Jobs.Name(g.Key)}（{string.Join("・", g.Select(c => CraftPlanner.ItemName(c.ItemId)).Distinct())}）")
+            .ToList();
+        return missing.Count == 0 ? null : string.Join("、", missing);
     }
 
     /// <summary>
@@ -407,8 +466,8 @@ public sealed class JobQuestFlow : AutoTask
         if (market.Count > 0)
             steps.Add(c => this.Track(new MarketBoardTask(market, c.MarketWatcher)));
 
-        // 2) NPC 購入
-        var vendor = raw.Where(r => r.Routes[0] == Route.Vendor).Select(r => new VendorNeed(r.Item, r.Need)).ToList();
+        // 2) NPC 購入（持っていたい総数で渡す。買う数は作業を始めるときの所持数から決まる）
+        var vendor = raw.Where(r => r.Routes[0] == Route.Vendor).Select(r => new VendorNeed(r.Item, inv.CountAll(r.Item) + r.Need)).ToList();
         if (vendor.Count > 0)
             steps.Add(_ => this.Track(new VendorTask(vendor)));
 
@@ -445,7 +504,7 @@ public sealed class JobQuestFlow : AutoTask
                 if (here.Count > 0)
                 {
                     steps.Add(_ => this.Track(new GatherTask(
-                        here.Select(g => new GatherNeed(g.Item, g.Need)), terr,
+                        here.Select(g => new GatherNeed(g.Item, inv.CountAll(g.Item) + g.Need)), terr,
                         $"{TeleportTask.TerritoryName(terr)} で採集", TimeSpan.FromMinutes(40))));
                 }
             }
@@ -456,7 +515,7 @@ public sealed class JobQuestFlow : AutoTask
         if (rest.Count > 0)
         {
             steps.Add(_ => this.Track(new GatherTask(
-                rest.Select(g => new GatherNeed(g.Item, g.Need)), null, "採掘・園芸", TimeSpan.FromMinutes(90))));
+                rest.Select(g => new GatherNeed(g.Item, inv.CountAll(g.Item) + g.Need)), null, "採掘・園芸", TimeSpan.FromMinutes(90))));
         }
 
         // 4.5) 採集→精選（霊砂など。収集品を GBR に採らせて精選で得る）
@@ -481,7 +540,7 @@ public sealed class JobQuestFlow : AutoTask
             }
 
             steps.Add(_ => this.Track(new GatherTask(
-                fish.Select(f => new GatherNeed(f.Item, f.Need)), null, "釣り", TimeSpan.FromMinutes(90), Route.Fish)));
+                fish.Select(f => new GatherNeed(f.Item, inv.CountAll(f.Item) + f.Need)), null, "釣り", TimeSpan.FromMinutes(90), Route.Fish)));
         }
 
         this.child = new SequenceTask($"素材集め {this.acquireRound}周目", steps);
@@ -620,11 +679,27 @@ public sealed class JobQuestFlow : AutoTask
                                         + string.Join("、", plan.RawShortfall.Select(x => $"{CraftPlanner.ItemName(x.Key)}×{x.Value}")));
                 }
 
-                return new SequenceTask("収集品の製作", plan.Crafts.Select(pc => (Func<TaskContext, AutoTask?>)(_ => new CraftOneTask(pc))));
+                if (MissingGearsets(plan) is { } missing)
+                    return new StopTask($"紫貨のための収集品を作る職のギアセットがありません：{missing}");
+
+                this.craftCut = null;
+                return new SequenceTask("収集品の製作", plan.Crafts.Select(pc => (Func<TaskContext, AutoTask?>)(cc => this.NextCraft(cc, pc))));
             });
         }
 
-        steps.Add(_ => new DeliverCollectablesTask(b, town.Value.Collect));
+        // 納品は、交換に要る紫貨に届いたらやめる。すでに足りていれば納品しない
+        steps.Add(c =>
+        {
+            var target = this.ScripTarget();
+            var have = Inventory.CountSpecialCurrency(b.RewardSpecialCurrencyId, out _);
+            if (have >= target)
+            {
+                c.Log.Write("秘伝書", $"交換に要る紫貨はもう足りています（{have}/{target}）。収集品は納品しません");
+                return null;
+            }
+
+            return new DeliverCollectablesTask(b, town.Value.Collect, this.ScripTarget);
+        });
         steps.Add(_ =>
         {
             var left = this.booksToBuy.Where(o => !ExchangeBooksTask.IsLearned(o.TomeId) && Inventory.CountNow(o.BookItemId) == 0).ToList();
@@ -662,16 +737,61 @@ public sealed class JobQuestFlow : AutoTask
         if (plan.Craft.LockedBySecretBook.Count > 0)
             return this.Fail($"秘伝書が未読のため作れない品があります：{string.Join("、", plan.Craft.LockedBySecretBook.Select(c => CraftPlanner.ItemName(c.ItemId)))}");
 
-        // 素材集め（+2 以上で止める）と同じ書き方にそろえる：製作は MaxRetryRounds+4 周まで（既定 7 周）
-        if (this.craftRound++ >= ctx.Config.MaxRetryRounds + 4)
-            return this.Fail("何度作っても納品物がそろいません（HQ ができない等）");
+        // 製作が進んだか（残りの製作回数が前の周回より減ったか）。進んでいれば周回の数を 0 に戻す。
+        // 進まない周回（HQ ができない等）が MaxRetryRounds+4 回（既定 7 回）続いたら止める。
+        // 素材集めの周回も、製作が進んだら数え直す（HQ の作り直しで材料を集め直すのは「集めきれない」ではないため）
+        var remaining = plan.Craft.Crafts.Sum(c => c.Crafts);
+        if (remaining < this.lastCraftRemaining)
+        {
+            this.craftRound = 0;
+            this.acquireRound = 0;
+        }
+        else if (++this.craftRound >= ctx.Config.MaxRetryRounds + 4)
+        {
+            return this.Fail($"何度作っても納品物がそろいません（HQ ができない等。残りの製作 {remaining} 回のまま {this.craftRound} 周進みませんでした）"
+                             + (this.craftCut != null ? $"。直前の打ち切り：{this.craftCut}" : string.Empty));
+        }
+
+        this.lastCraftRemaining = remaining;
+
+        if (MissingGearsets(plan.Craft) is { } missing)
+            return this.Fail($"製作に使う職のギアセットがありません：{missing}");
 
         var steps = new List<Func<TaskContext, AutoTask?>> { _ => new GoToInnTask() };
+        this.craftCut = null;
         foreach (var c in plan.Craft.Crafts)
-            steps.Add(_ => new CraftOneTask(c));
+            steps.Add(cc => this.NextCraft(cc, c));
 
         this.child = new SequenceTask("グリダニアの宿屋で製作", steps);
         return TaskResult.Running;
+    }
+
+    /// <summary>
+    /// 製作の列の次の1レシピ。材料が計画どおりにそろっていなければ（前のレシピが予定より少なくできた等）、
+    /// 古い計画のまま進めず、この先の列を打ち切る（段が終わったら計画を立て直す）。
+    ///
+    /// 以前は全レシピを1本の列に積み、終わってから立て直していた。中間素材が予定より
+    /// 少なくできると、それを使う後のレシピが1個も作れずに失敗し、素材を集め直す前に全体が止まっていた。
+    /// </summary>
+    private AutoTask? NextCraft(TaskContext ctx, PlannedCraft c)
+    {
+        if (this.craftCut != null)
+            return null;
+
+        var inv = Inventory.Snapshot();
+        var recipe = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Recipe>().GetRow(c.RecipeId);
+        var lacking = CraftPlanner.Ingredients(recipe)
+            .Where(x => inv.CountAll(x.Item) < x.Amount * c.Crafts)
+            .Select(x => $"{CraftPlanner.ItemName(x.Item)} {inv.CountAll(x.Item)}/{x.Amount * c.Crafts}")
+            .ToList();
+        if (lacking.Count > 0)
+        {
+            this.craftCut = $"{CraftPlanner.ItemName(c.ItemId)} の材料が計画より少ない（{string.Join("、", lacking)}）";
+            ctx.Log.Warn("製作", $"{this.craftCut}ので、ここで製作の列を打ち切って計画を立て直します");
+            return null;
+        }
+
+        return new CraftOneTask(c);
     }
 
     // ------------------------------------------------------------------
@@ -723,9 +843,31 @@ public sealed class JobQuestFlow : AutoTask
             return TaskResult.Running;
         }
 
+        // 前提のクエストが未完了なら、先にそれを進める（納品物の無いクエストは一覧に入らないので、
+        // 蒼天の Lv50 クエスト「槍の持ち主を訪ねて」等＝Lv53 の直接の前提が抜けていた。jqa qinfo で8職とも確認）。
+        // 前提は同じ区分（クラス・ジョブ）のものだけ自動で進める。メインクエスト等が未完了なら理由を出して止める
+        // （前提の結合条件＝PreviousQuestJoin の意味はソースで確かめられなかったので、全部そろえる側＝止まる側に倒す）
+        var next = plan.RemainingQuests[0];
+        var chain = Unlocks.ChainToRun(next.RowId, out var blocked);
+        if (blocked != null)
+            return this.Fail($"{Jobs.Name(next.ClassJobId)} {next} の前提を進められません：{blocked}");
+
+        var before = chain.Where(id => id != next.RowId).ToList();
+        if (before.Count > 0)
+        {
+            // 納品のあるジョブクエ（選んでいない職のもの等）は、納品物の用意も納品窓の扱いも無いまま進めない
+            var withItems = ctx.Data.Quests!.Quests.FirstOrDefault(q => q.RowId == before[0]);
+            if (withItems != null)
+                return this.Fail($"{next} の前提「{withItems}」（{Jobs.Name(withItems.ClassJobId)}）は納品のあるジョブクエです。その職も選んで始めてください");
+
+            ctx.Log.Write("クエスト", $"{next} の前に、未完了の前提クエストを進めます：{string.Join(" → ", before.Select(Unlocks.QuestName))}");
+            this.child = new RunQuestTask(before[0], Unlocks.QuestName(before[0]));
+            return TaskResult.Running;
+        }
+
         // 1本ずつ進め、終わるたびに計画を立て直す（Questionable が Artisan の既製リストで
         // 手持ちの材料を使うことがあるので、次のクエストの納品物が残っているかを毎回確かめてから始める）
-        this.child = new QuestTask(plan.RemainingQuests[0]);
+        this.child = new QuestTask(next);
         return TaskResult.Running;
     }
 
@@ -743,9 +885,26 @@ public sealed class JobQuestFlow : AutoTask
                 this.CollectFailures(ctx);
                 break;
             case Stage.Books:
-                this.booksDone = true;
-                this.stage = Stage.Craft;
+            {
+                // 全部読めたかを確かめてから先へ進む（以前は段が終われば読めた扱いにしていたので、製作の段で
+                // 「秘伝書が未読」という別の理由で止まっていた）。
+                // 残っていれば（収集品の製作を途中で打ち切った・紫貨が足りなかった等）、素材集めからやり直す
+                var left = this.books!.Offers.Values.Where(o => !ExchangeBooksTask.IsLearned(o.TomeId)).ToList();
+                if (left.Count == 0)
+                {
+                    this.booksDone = true;
+                    this.stage = Stage.Craft;
+                    break;
+                }
+
+                if (++this.booksRound >= 3)
+                    return this.Fail($"秘伝書の段を {this.booksRound} 回やり直しても、読めていない秘伝書が残っています：{string.Join("、", left.Select(o => CraftPlanner.ItemName(o.BookItemId)))}");
+
+                ctx.Log.Warn("秘伝書", $"まだ読めていない秘伝書があるので、素材集めからやり直します：{string.Join("、", left.Select(o => CraftPlanner.ItemName(o.BookItemId)))}");
+                this.RecomputeBookNeeds(ctx);
+                this.stage = Stage.Acquire;
                 break;
+            }
             case Stage.Meld:
                 this.stage = Stage.Quests;
                 break;

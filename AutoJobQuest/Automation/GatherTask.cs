@@ -10,8 +10,13 @@ namespace AutoJobQuest.Automation;
 
 /// <summary>採集・釣りで集める1品目。</summary>
 /// <param name="ItemId">アイテム。</param>
-/// <param name="Shortfall">あと何個要るか。</param>
-public sealed record GatherNeed(uint ItemId, int Shortfall);
+/// <param name="TargetOwned">
+/// 持っていたい総数（計画と同じ数え方＝Inventory.Snapshot。収集品は数えない）。採る数は作業を始めるときに
+/// 「総数 − その時点の所持数」で決める（以前は計画時の不足数を開始時の所持数に足していたので、
+/// その間に別の手段で手に入った分まで余計に採っていた）。
+/// </param>
+/// <param name="ExtraFromNow">総数ではなく「今から何個採るか」で頼むとき（精選の元にする収集品。0 なら TargetOwned を使う）。</param>
+public sealed record GatherNeed(uint ItemId, int TargetOwned, int ExtraFromNow = 0);
 
 /// <summary>
 /// GBR の自動採集で素材を集める（採掘・園芸・釣り・シャード）。
@@ -63,7 +68,7 @@ public sealed class GatherTask : AutoTask
 
     public GatherTask(IEnumerable<GatherNeed> needs, uint? preferredTerritory, string label, TimeSpan limit, Planning.Route route = Planning.Route.Gather)
     {
-        this.needs = needs.Where(x => x.Shortfall > 0).ToList();
+        this.needs = needs.ToList();
         this.preferredTerritory = preferredTerritory;
         this.label = label;
         this.limit = limit;
@@ -103,12 +108,39 @@ public sealed class GatherTask : AutoTask
                 ? "GBR の自動採集がすでに動いています（利用者の操作を横取りしないため止めました）"
                 : "GBR の自動採集の状態が読めません");
 
+        // NPC 購入が動いている・読めないときも始めない（購入と採集を取り合わない）
+        var vendorBusy = ctx.Gbr.VendorIsBusy();
+        if (vendorBusy != false)
+            return this.Fail(vendorBusy == true
+                ? "GBR の NPC 購入が動いています（終わってから採集を始めます）"
+                : "GBR の NPC 購入の状態が読めません（GBR の版が変わった可能性）");
+
+        // 採る数は、いまの所持数から決める。GBR には GBR の数え方（収集品も含む）での目標を渡す
+        var inv = Inventory.Snapshot();
         foreach (var n in this.needs)
-            this.targets[n.ItemId] = (uint)(GbrCount(n.ItemId) + n.Shortfall);
+        {
+            var add = n.ExtraFromNow > 0 ? n.ExtraFromNow : n.TargetOwned - inv.CountAll(n.ItemId);
+            if (add <= 0)
+            {
+                ctx.Log.Write("採集", $"{CraftPlanner.ItemName(n.ItemId)} はもう足りています（{inv.CountAll(n.ItemId)}/{n.TargetOwned}）");
+                continue;
+            }
+
+            this.targets[n.ItemId] = (uint)(GbrCount(n.ItemId) + add);
+        }
+
+        if (this.targets.Count == 0)
+            return TaskResult.Done;
 
         // 終わったとき・待機のときに勝手に帰宅（テレポ）しないように
         if (!ctx.Gbr.OverrideBool("GoHomeWhenDone", false) || !ctx.Gbr.OverrideBool("GoHomeWhenIdle", false))
             ctx.Log.Warn("採集", $"GBR の帰宅設定を一時的に切れませんでした: {ctx.Gbr.LastError}");
+
+        // GBR の自動精選を切る（GBR の精選は、カバンにある精選できる収集品を全部対象にする
+        // ＝AutoGather.Purify.cs:13-48 の HasReducibleItems は採集リストの品に限らない。利用者が別の目的で持っている
+        // 収集品まで精選されないように。精選はこちらの ReduceTask が品と数を決めて行う）。切れなければ始めない
+        if (!ctx.Gbr.OverrideBool("DoReduce", false))
+            return this.Fail($"GBR の自動精選（DoReduce）を一時的に切れませんでした（手持ちの収集品を精選されうるため止めます）: {ctx.Gbr.LastError}");
 
         // 精選に使う収集品を、GBR が収集品納品窓口へ持っていかないように（GBR は収集品が溜まると納品しに行く：AutoGather.cs:1062）
         if (this.KeepCollectables && !ctx.Gbr.OverrideBool(GbrHandle.CollectablePrefix + "AutoTurnInCollectables", false))
@@ -206,7 +238,12 @@ public sealed class GatherTask : AutoTask
 }
 
 /// <summary>NPC から買う1品目。</summary>
-public sealed record VendorNeed(uint ItemId, int Shortfall);
+/// <param name="ItemId">アイテム。</param>
+/// <param name="TargetOwned">
+/// 持っていたい総数（計画と同じ数え方＝Inventory.Snapshot）。買う数は作業を始めるときに「総数 − その時点の所持数」で決める
+/// （計画時の不足数を開始時の所持数に足すと、その間に手に入った分まで余計に買ってギルを使う）。
+/// </param>
+public sealed record VendorNeed(uint ItemId, int TargetOwned);
 
 /// <summary>
 /// GBR の購入機能で NPC から買う（NPC で買える素材・魚は買う。ギルの店だけ）。
@@ -228,12 +265,18 @@ public sealed class VendorTask : AutoTask
     private bool started;
     private int retries;
 
+    // 止めるよう頼んだ（GBR の Stop は中止待ちを立てるだけなので、IsBusy が false になるまで待つ：VendorBuyListManager.cs:468-481）
+    private bool stopRequested;
+
+    // 購入の状態が読めなくなった時刻（読めないまま続けば止める。読めない＝止まった、とはみなさない）
+    private DateTime unknownSince = DateTime.MinValue;
+
     /// <summary>買えなかった品目（次の周回で別の手段にする）。</summary>
     public List<uint> Unfinished { get; } = [];
 
     public VendorTask(IEnumerable<VendorNeed> needs)
     {
-        this.needs = needs.Where(x => x.Shortfall > 0).ToList();
+        this.needs = needs.ToList();
     }
 
     public override string Name => "NPC 購入";
@@ -256,11 +299,23 @@ public sealed class VendorTask : AutoTask
         if (ctx.GatherBuddy.IsAutoGatherEnabled() != false)
             return this.Fail("GBR の自動採集が動いている（または状態が読めない）ので、NPC 購入を始めません");
 
+        // 買う数は、いまの所持数から決める。GBR には購入の数え方（手持ち＋アーマリー、NQ＋HQ）での目標を渡す
+        var inv = Inventory.Snapshot();
         foreach (var n in this.needs)
         {
+            var add = n.TargetOwned - inv.CountAll(n.ItemId);
+            if (add <= 0)
+            {
+                ctx.Log.Write("購入", $"{CraftPlanner.ItemName(n.ItemId)} はもう足りています（{inv.CountAll(n.ItemId)}/{n.TargetOwned}）");
+                continue;
+            }
+
             this.before[n.ItemId] = VendorCount(n.ItemId);
-            this.targets[n.ItemId] = this.before[n.ItemId] + n.Shortfall;
+            this.targets[n.ItemId] = this.before[n.ItemId] + add;
         }
+
+        if (this.targets.Count == 0)
+            return TaskResult.Done;
 
         this.gilBefore = Inventory.Gil();
 
@@ -324,19 +379,38 @@ public sealed class VendorTask : AutoTask
         }
 
         var busy = ctx.Gbr.VendorIsBusy();
+
+        // 読めない＝止まった、とはみなさない。読めないまま 30 秒続けば止める（購入が続いているか分からないまま次へ進まない）
+        if (busy == null)
+        {
+            if (this.unknownSince == DateTime.MinValue)
+                this.unknownSince = DateTime.UtcNow;
+            this.Status = "GBR の購入の状態が読めません（読めるようになるのを待っています）";
+            return DateTime.UtcNow - this.unknownSince > TimeSpan.FromSeconds(30)
+                ? this.Fail("GBR の NPC 購入の状態を 30 秒読めません（購入が続いているか分からないので止めます。GBR の版が変わった可能性）")
+                : TaskResult.Running;
+        }
+
+        this.unknownSince = DateTime.MinValue;
+
         if (busy == true)
         {
-            if (this.Elapsed > TimeSpan.FromMinutes(25))
+            if (!this.stopRequested && this.Elapsed > TimeSpan.FromMinutes(25))
             {
                 ctx.Gbr.StopVendor();
-                ctx.Log.Warn("購入", "25分たっても購入が終わらないので止めました");
-                return this.Finish(ctx);
+                this.stopRequested = true;
+                ctx.Log.Warn("購入", "25分たっても購入が終わらないので止めるよう頼みました（止まったのを確かめてから次へ進みます）");
+                this.NextPhase("GBR の購入が止まるのを待っています");
             }
 
-            this.Status = $"GBR: {ctx.Gbr.VendorStatusText()}";
+            if (this.stopRequested && this.PhaseElapsed > TimeSpan.FromMinutes(1))
+                return this.Fail("GBR の NPC 購入を止めるよう頼みましたが、1分たっても止まりません");
+
+            this.Status = this.stopRequested ? "GBR の購入が止まるのを待っています" : $"GBR: {ctx.Gbr.VendorStatusText()}";
             return TaskResult.Running;
         }
 
+        // busy == false：止まったことを確かめられた
         return this.Finish(ctx);
     }
 

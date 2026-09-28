@@ -114,7 +114,18 @@ public sealed class Services : IDisposable
 
                 if (finished || DateTime.UtcNow > until)
                 {
-                    this.Debug.Line("見張り", $"{name}：{(finished ? "終わりました" : "期限が来たので見張りを外しました")}");
+                    if (finished)
+                    {
+                        this.Debug.Line("見張り", $"{name}：終わりました");
+                    }
+                    else
+                    {
+                        // 期限切れは「止まったと確かめられた」ではない。利用者に確かめてもらう
+                        this.Debug.Line("見張り", $"⚠ {name}：期限までに止まったことを確かめられませんでした");
+                        this.Log.Warn("見張り", $"{name}：期限までに止まったことを確かめられませんでした。相手のプラグインが止まっているか確かめてから始めてください");
+                        Svc.Chat.Print($"[AutoJobQuest] {name}：止まったことを確かめられませんでした。相手のプラグインが止まっているか確かめてから始めてください");
+                    }
+
                     this.Ctx.AfterStop.RemoveAt(i);
                 }
             }
@@ -143,6 +154,28 @@ public sealed class Services : IDisposable
     {
         // 他プラグインの状態（GBR の ON/OFF・リスト・Questionable 等）には触らない。
         // 停止要求の共有データ（YesAlready）だけは自分の要求を外して手放す（残すと相手が止まったままになる）。
+        //
+        // 【実行中に読み込みが解除されたとき】「アンロード経路では相手に触れない」ので、こちらが頼んだ処理
+        // （GBR の自動採集・NPC 購入、Questionable、Artisan の製作、RSR の Henched、移動）も止めない
+        // （こちらを更新・再読み込みしただけで相手の動作が変わる事故が、別のプラグインで実際に起きたため）。
+        // その代わり、何が残りうるかを利用者に知らせる（止め方は「先に停止ボタンを押す」）。
+        // GBR の一時変更（リスト・設定）は控えを保存してあり、次に読み込んだとき GBR が止まっていれば戻す。
+        if (this.Runner.IsRunning)
+        {
+            var msg = $"実行中（{this.Runner.Root?.Name}：{this.Runner.Root?.Status}）に読み込みが解除されました。"
+                      + "こちらが頼んだ処理（GBR の自動採集・NPC 購入、Questionable、Artisan の製作、RSR の Henched、移動）は止めていません。"
+                      + "動き続けていれば、それぞれのプラグインで止めてください。次からは先に「停止」を押してから解除してください";
+            this.Debug.Line("実行", "⚠ " + msg);
+            try
+            {
+                Svc.Chat.PrintError($"[AutoJobQuest] {msg}");
+            }
+            catch (Exception ex)
+            {
+                Svc.Log.Warning(ex, "[AutoJobQuest] 解除時の案内を出せませんでした");
+            }
+        }
+
         this.addonRecorder.Dispose();
 
         // 自分が取った TextAdvance の外部制御だけは手放す（残すと TextAdvance が利用者の設定を無視し続け、

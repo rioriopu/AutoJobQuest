@@ -24,6 +24,8 @@ public sealed unsafe class AddonOwnership : IDisposable
     [
         "InclusionShop", "ShopExchangeItemDialog", "ShopExchangeCurrency", "ShopExchangeCurrencyDialog", "CollectablesShop",
         "SelectYesno", "SelectString", "SelectIconString", "Talk",
+        "PurifyResult", // 精選の結果（自分の精選で出たものだけ閉じる）
+        "Request",      // クエストの納品窓（自分が始めたクエストの間に開いたものだけ入れる）
     ];
 
     private static readonly TimeSpan Lifetime = TimeSpan.FromSeconds(60);
@@ -101,14 +103,20 @@ public sealed unsafe class AddonOwnership : IDisposable
     /// 押してよいのは「いま撃った操作の結果として出たもの」だけ、というときに使う（記録は延長しない）。
     /// </summary>
     public bool TryGetOwnedSince(string name, DateTime sinceUtc, out AtkUnitBase* addon)
+        => this.TryGetOwnedSince(name, sinceUtc, out addon, out _);
+
+    /// <summary>上と同じ。開いた時刻（PostSetup の時刻）も返す（同じアドレスで開き直した窓を別の窓として扱うため）。</summary>
+    public bool TryGetOwnedSince(string name, DateTime sinceUtc, out AtkUnitBase* addon, out DateTime openedAt)
     {
         addon = null;
+        openedAt = DateTime.MinValue;
         if (!GameUi.IsReady(name, out var candidate))
             return false;
         if (!this.owned.TryGetValue((nint)candidate, out var at) || at < sinceUtc)
             return false;
 
         addon = candidate;
+        openedAt = at;
         return true;
     }
 

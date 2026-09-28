@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 
 namespace AutoJobQuest.Core;
 
@@ -93,11 +94,30 @@ public sealed class Runner
     /// <summary>最後に終わったときの結果（画面表示用）。</summary>
     public string LastResult { get; private set; } = string.Empty;
 
+    /// <summary>
+    /// 新しく始めてはいけない理由（無ければ null）。前回止めたときの後始末（例：Artisan が遅れて製作を始めないかの見張り）が
+    /// 残っている間は始めない（見張りは止まっている間しか動かないので、すぐ始めると見張りが休み、
+    /// 前回の製作が遅れて始まりうる。逆に古い見張りが新しい実行の製作を止めることもありうる）。
+    /// </summary>
+    public string? StartBlocker()
+    {
+        if (this.ctx.AfterStop.Count == 0)
+            return null;
+        return $"前回止めたときの後始末が終わっていません（{string.Join("、", this.ctx.AfterStop.Select(a => a.Name))}）。終わるまで待ってください";
+    }
+
     public void Start(AutoTask task)
     {
         if (this.root != null)
         {
             this.ctx.Log.Warn("実行", "すでに動いています");
+            return;
+        }
+
+        if (this.StartBlocker() is { } blocked)
+        {
+            this.ctx.Log.Warn("実行", blocked);
+            Svc.Chat.Print($"[AutoJobQuest] 開始できません：{blocked}");
             return;
         }
 

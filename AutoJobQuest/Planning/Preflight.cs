@@ -171,7 +171,30 @@ public static class Preflight
                 if (MateriaCatalog.ResolveAny(ctx.Config.AnyMateriaItemId, m.TargetItemId, out var problem) == null)
                     list.Add(new PreflightItem(Severity.Error, $"{m.Quest}：{problem}"));
             }
+
+            // マテリアを付ける品がアーマリーチェストにだけある（装着はカバンの品しか探さない。持っているので作り直しもしない）。
+            // 装着の段まで進んでから止まらないよう、ここで知らせる
+            foreach (var m in plan.Materia.Where(m => !m.AlreadyMelded))
+            {
+                var owned = m.TargetHq ? Inventory.CountNow(m.TargetItemId, hqOnly: true) : Inventory.CountNow(m.TargetItemId);
+                if (owned > 0 && !Automation.MeldTask.InBags(m.TargetItemId, m.TargetHq))
+                    list.Add(new PreflightItem(Severity.Error,
+                        $"{m.Quest}：マテリアを付ける {CraftPlanner.ItemName(m.TargetItemId)}{(m.TargetHq ? "（HQ）" : string.Empty)} がアーマリーチェストにあります。カバンに移してから始めてください"));
+            }
+
+            // 前提のクエストが自動で進められない（メインクエスト等が未完了）ものは、素材を集める前に止める
+            foreach (var q in plan.RemainingQuests)
+            {
+                Unlocks.ChainToRun(q.RowId, out var blocked);
+                if (blocked != null)
+                    list.Add(new PreflightItem(Severity.Error, $"{Jobs.Name(q.ClassJobId)} {q}：{blocked}"));
+            }
         }
+
+        // RSR がこちらを使う前から動いている（利用者が使っている）。戦闘で使うと、終わったとき Off に戻る
+        // （IPC ではモードを読めないので元に戻せない）。確認窓で本人に決めてもらう
+        if (plan != null && (plan.Shortfalls.Any(x => x.Route == Route.Combat || x.Fallbacks.Contains(Route.Combat))) && ctx.Rotation.IsActive() == true)
+            list.Add(new PreflightItem(Severity.Warn, "RotationSolverReborn が動いています。戦闘で素材を集めるときに Henched に切り替え、終わったら Off にします（元のモードは読めないので戻せません）"));
 
         // 6) Artisan の簡易製作（設定ファイルを読むだけ）
         var quick = ReadArtisanBool("QuickSynthMode");

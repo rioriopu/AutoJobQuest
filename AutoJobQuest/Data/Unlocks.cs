@@ -99,11 +99,14 @@ public static class Unlocks
         var seen = new HashSet<uint>();
         string? reason = null;
 
+        // 深さの上限は、壊れたデータで延々とたどらないための歯止め（循環は seen で防いでいる）。
+        // ジョブクエは Lv1〜60 で十数本つながるので、Lv1 から始めるキャラでも届く深さにする
+        // （以前の 6 だと、未完了の前提が7本以上続くと「たどりきれません」になった）
         bool Visit(uint id, int depth)
         {
             if (!seen.Add(id) || QuestManager.IsQuestComplete(id))
                 return true;
-            if (depth > 6 || !quests.TryGetRow(id, out var q))
+            if (depth > 64 || !quests.TryGetRow(id, out var q))
             {
                 reason = $"前提のクエスト「{QuestName(id)}」をたどりきれません";
                 return false;

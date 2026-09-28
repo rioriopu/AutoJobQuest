@@ -277,6 +277,13 @@ public sealed unsafe class MarketBoardTask : AutoTask
     private int boughtForCurrent;
     private int attempts;
 
+    // 出品を選んだときの不足数（送る直前に変わっていたら選び直す）
+    private int needAtDecide;
+
+    // 購入額の確認で「はい」をもらった出品と金額（取り直した一覧で同じ出品・同額以下なら、確認をやり直さない）
+    private ulong approvedListingId;
+    private long approvedTotal;
+
     // 検索の失敗（混雑など）のあと、次に検索してよい時刻。失敗が続くほど間をあける
     // （SimpleTweaks RefreshMarketPrices と同じ考え方：2秒＋0.5秒×(回数−1)。進む条件ではなく、要求を出しすぎない抑え）
     private DateTime searchNotBefore = DateTime.MinValue;
@@ -473,6 +480,8 @@ public sealed unsafe class MarketBoardTask : AutoTask
         this.bestByCandidate.Clear();
         this.boughtForCurrent = 0;
         this.buyingItem = 0;
+        this.approvedListingId = 0;
+        this.approvedTotal = 0;
         this.candidatesOwnedAtStart = this.current.Candidates.Sum(c => Inventory.CountNow(c));
 
         // 買う直前にカバンを数え直し、不足分だけにする
@@ -683,6 +692,7 @@ public sealed unsafe class MarketBoardTask : AutoTask
         this.buyingListingId = pick.ListingId;
         this.buyingTotal = pick.Total;
         this.buyingQuantity = pick.Quantity;
+        this.needAtDecide = need;
         ctx.Log.Debug("マーケット", $"選んだ出品：{CraftPlanner.ItemName(this.buyingItem)} {pick.Quantity}個×{pick.UnitPrice:N0}＝合計{pick.Total:N0}（出品{pick.ListingId}）");
 
         var limit = ctx.Config.ConfirmPurchaseAboveGil;
@@ -690,8 +700,10 @@ public sealed unsafe class MarketBoardTask : AutoTask
         if (pick.Total > gil)
             return this.GiveUpCurrent(ctx, $"ギルが足りません（必要 {pick.Total:N0} / 所持 {gil:N0}）");
 
-        // 1回の購入額が基準（既定 500,000 ギル）を超えるときだけ確認する
-        if (limit > 0 && pick.Total > limit)
+        // 1回の購入額が基準（既定 500,000 ギル）を超えるときだけ確認する。
+        // 確認をもらった後に取り直した一覧で、同じ出品が同じ額以下のままなら、確認はやり直さない
+        var approved = pick.ListingId == this.approvedListingId && pick.Total <= this.approvedTotal;
+        if (limit > 0 && pick.Total > limit && !approved)
         {
             this.confirmTicket = ctx.Confirm.Ask(
                 "マーケットでの購入額の確認",
@@ -714,12 +726,37 @@ public sealed unsafe class MarketBoardTask : AutoTask
         if (ans == false)
             return this.Fail("購入の確認で「いいえ」が選ばれました");
 
-        this.Go(Phase.Buy, string.Empty);
+        // 確認を待つ間に出品が売れた・値が変わった可能性があるので、一覧を取り直してから選び直す
+        // （手元の一覧は確認を出した時点のもの。取り直した一覧で同じ出品が同じ額以下なら、そのまま買う）
+        this.approvedListingId = this.buyingListingId;
+        this.approvedTotal = this.buyingTotal;
+        ctx.Log.Write("マーケット", "購入の確認がとれました。出品一覧を取り直してから買います");
+        this.StartSearch(this.buyingItem);
         return TaskResult.Running;
     }
 
     private TaskResult Buy(TaskContext ctx)
     {
+        // 送る直前に、不足数とギルを数え直す（以前は出品の中身だけを照合していたので、
+        // 確認を待つ間に別の手段で足りても、古い不足数のまま買っていた）
+        var need = this.RemainingNeed();
+        if (need <= 0)
+        {
+            ctx.Log.Write("マーケット", $"{this.current!.Label} は買う前に足りたので、買いません");
+            this.Go(Phase.Next, string.Empty);
+            return TaskResult.Running;
+        }
+
+        if (need != this.needAtDecide)
+        {
+            ctx.Log.Warn("マーケット", $"不足数が変わった（{this.needAtDecide}→{need}）ので、出品を選び直します");
+            this.Go(Phase.Decide, string.Empty);
+            return TaskResult.Running;
+        }
+
+        if (this.buyingTotal > Inventory.Gil())
+            return this.GiveUpCurrent(ctx, $"ギルが足りません（必要 {this.buyingTotal:N0} / 所持 {Inventory.Gil():N0}）");
+
         var proxy = InfoProxyItemSearch.Instance();
         if (proxy == null || proxy->SearchItemId != this.buyingItem)
             return this.Retry(ctx, "出品一覧が別の品に変わっていました");

@@ -587,11 +587,13 @@ public sealed unsafe class TalkToNpcTask : AutoTask
 ///  ・一覧：AtkValues[20]＝表示行数（見出しを含む。走査の上限にだけ使う）、[33+i×11]＝行番号、[34+i×11]＝ItemId+500000。
 ///    行番号が 0 からの連番でない・収集品の形でない値がある・同じ行番号が2回出る、のどれかなら配置ずれとみなして撃たない。
 ///  ・選ぶ：Fire(12, (uint)行番号)。選べたかは右の一覧（node 31）の行数＝その品の所持数で確かめる
-///    （左の一覧の選択位置は動かないので見ない）。確かめられなければ納品ボタン（node 51）が押せる状態かで代える。2秒で諦める。
+///    （左の一覧の選択位置は動かないので見ない）。行数は品目を区別しないので、同じ所持数の別の収集品が一覧にあるときは
+///    「選ぶ前の行数から変わった」のを見るまで撃たない。納品ボタン（node 51）が押せるだけでは撃たない。2秒で諦める。
+///  ・やめる：交換に要る紫貨（呼び出し側が渡す）に届いたら、収集品が残っていてもやめる。
 ///  ・渡す：Fire(15, 0u)。確認ダイアログは出ず、1回で1個。
 ///  ・成功は「その収集品が減った AND 紫貨が増えた」（2.5秒まで待つ）。狙っていない収集品が減ったら即停止。
 ///    変わらなければ1度だけ撃ち直す。
-///  ・終わったら（成功でも失敗でも）自分が開いた画面だけを閉じる（1手目 Close、2手目以降 Fire(-1)。0.8秒おき）。
+///  ・終わったら（成功でも失敗でも）自分が開いた画面だけを閉じる（1手目 Close、2手目以降 Fire(-1)。0.8秒おき。10秒で失敗）。
 /// </summary>
 public sealed unsafe class DeliverCollectablesTask : AutoTask
 {
@@ -610,6 +612,7 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
 
     private readonly BookData data;
     private readonly NpcSpot npc;
+    private readonly Func<int> targetScrips;
     private DeliverStep step = DeliverStep.Equip;
     private AutoTask? sub;
 
@@ -625,15 +628,27 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
     private string lastButton = "未読";
     private string lastSelection = "未確認";
 
+    // 選択の確かめ。右の一覧の行数だけでは品目を区別できないので、
+    //  ・選ぶ前の行数（selectRowsBefore）から目的の品の所持数へ「変わった」のを見るか、
+    //  ・同じ所持数の別の収集品が一覧に無い（行数で区別できる）か、
+    //  ・この画面で前に確かめた選択が同じ行のまま（confirmedRow。自分の納品で数が減っただけ）か
+    // のどれかのときだけ撃つ
+    private int selectRowsBefore = -1;
+    private bool ambiguous;
+    private int confirmedRow = -1;
+    private nint confirmedAddon;
+
     private DateTime lastClose = DateTime.MinValue;
     private int closeAttempts;
 
     public int Delivered { get; private set; }
 
-    public DeliverCollectablesTask(BookData data, NpcSpot npc)
+    /// <param name="targetScrips">貯めたい紫貨（呼ぶたびに計算し直す）。所持がこれに届いたら納品をやめる。</param>
+    public DeliverCollectablesTask(BookData data, NpcSpot npc, Func<int> targetScrips)
     {
         this.data = data;
         this.npc = npc;
+        this.targetScrips = targetScrips;
     }
 
     public override string Name => "収集品の納品";
@@ -723,8 +738,17 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
             return TaskResult.Running;
         }
 
-        // 溢れた分は捨てられるので、一番多くもらえる場合で上限を見る
+        // 交換に要る紫貨に届いたら、収集品が残っていてもやめる（残りは次の機会に使える）
         var scrips = Inventory.CountSpecialCurrency(this.data.RewardSpecialCurrencyId, out _);
+        var target = this.targetScrips();
+        if (scrips >= target)
+        {
+            ctx.Log.Write("納品", $"交換に要る紫貨に届いたので納品をやめます（{scrips}/{target}、{this.Delivered} 個納品）");
+            this.Go(DeliverStep.Close, "納品画面を閉じます");
+            return TaskResult.Running;
+        }
+
+        // 溢れた分は捨てられるので、一番多くもらえる場合で上限を見る
         var cap = ScripCap(this.data.RewardSpecialCurrencyId);
         var gain = Math.Max(this.observedReward, this.data.RewardHigh);
         if (cap > 0 && scrips + gain > cap)
@@ -746,37 +770,73 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
         this.lastButton = "未読";
         this.lastSelection = "未確認";
 
+        // 選択を確かめる材料：選ぶ前の右の一覧の行数と、一覧に出ている別の収集品で同じ所持数のものがあるか
+        if ((nint)addon != this.confirmedAddon)
+            this.confirmedRow = -1; // 画面が開き直された（前の確認は使えない）
+        this.selectRowsBefore = HeldListRows(addon) ?? -1;
+        var sameCount = offers.Where(o => o.ItemId != this.Item && held.GetValueOrDefault(o.ItemId) == owned).Select(o => o.ItemId).ToList();
+        this.ambiguous = sameCount.Count > 0;
+        if (this.ambiguous)
+            ctx.Log.Debug("納品", $"所持数が同じ別の収集品があります（{string.Join("、", sameCount.Select(CraftPlanner.ItemName))}）。行数が変わるのを見てから撃ちます");
+
         ctx.Log.Write("納品", $"{CraftPlanner.ItemName(this.Item)} を選びます（行 {offer.Row}、所持 {owned}）");
         GameUi.Fire(addon, true, 12, (uint)offer.Row); // 実測は UInt（Int だと型が食い違う）
         this.Go(DeliverStep.WaitTrade, "選択が効くのを待っています");
         return TaskResult.Running;
     }
 
+    /// <summary>右の一覧（node 31＝選んだ品の手持ち）の行数。取れなければ null。</summary>
+    private static int? HeldListRows(AtkUnitBase* addon)
+    {
+        var comp = addon->GetComponentByNodeId(HeldListNodeId);
+        return comp != null && comp->GetComponentType() == ComponentType.List ? ((AtkComponentList*)comp)->ListLength : null;
+    }
+
     private TaskResult TickWaitTrade(TaskContext ctx, AtkUnitBase* addon)
     {
-        // 右の一覧（node 31）の行数＝その品の所持数なら、狙った品が選ばれている
-        var comp = addon->GetComponentByNodeId(HeldListNodeId);
-        if (comp != null && comp->GetComponentType() == ComponentType.List)
-        {
-            var rows = ((AtkComponentList*)comp)->ListLength;
-            this.lastSelection = $"手持ちの一覧 {rows} 行 / 所持 {this.ownedBefore}";
-            if (rows > 0 && rows == this.ownedBefore)
-                return this.FireDelivery(ctx, addon, this.lastSelection);
-        }
-        else
-        {
-            this.lastSelection = $"手持ちの一覧（node {HeldListNodeId}）を取れません";
-        }
-
-        // 確かめられない間は、納品ボタンが押せる状態かで代える
+        // 右の一覧（node 31）の行数＝その品の所持数なら、狙った品が選ばれている……とは限らない。
+        // 行数は品目を区別しないので、同じ所持数の別の収集品が選ばれたままでも一致してしまう。
+        // そこで、次のどれかが言えるときだけ撃つ：
+        //  ①同じ所持数の別の収集品が一覧に無い（行数で区別できる）
+        //  ②選ぶ前の行数から、目的の品の所持数へ変わったのを見た（選択が効いた）
+        //  ③この画面で前に確かめた選択が同じ行のまま（自分の納品で数が1つ減っただけ）
+        // 納品ボタンが押せるだけでは撃たない（以前の代わりの条件は、前の品の選択が残っていても通ってしまう）。
+        // 品目そのもの（選択中の ItemId）を画面から読む方法は、実機の記録で確かめるまで使わない
         var btn = addon->GetComponentByNodeId(TradeButtonNodeId);
+        var buttonReady = false;
         if (btn != null && btn->GetComponentType() == ComponentType.Button && btn->OwnerNode != null)
         {
             var visible = btn->OwnerNode->AtkResNode.IsVisible();
             var enabled = ((AtkComponentButton*)btn)->IsEnabled;
+            buttonReady = visible && enabled;
             this.lastButton = $"見える={visible} 押せる={enabled}";
-            if (visible && enabled)
-                return this.FireDelivery(ctx, addon, $"納品ボタンが押せる状態（{this.lastButton}）");
+        }
+
+        if (HeldListRows(addon) is { } rows)
+        {
+            this.lastSelection = $"手持ちの一覧 {rows} 行 / 所持 {this.ownedBefore}（選ぶ前 {this.selectRowsBefore} 行{(this.ambiguous ? "・同数の別の品あり" : string.Empty)}）";
+            if (rows > 0 && rows == this.ownedBefore)
+            {
+                var changed = this.selectRowsBefore >= 0 && this.selectRowsBefore != rows;
+                var sameAsConfirmed = this.confirmedRow == this.rowIndex && this.confirmedAddon == (nint)addon;
+                if (!this.ambiguous || changed || sameAsConfirmed)
+                {
+                    if (!buttonReady)
+                    {
+                        this.Status = "納品ボタンが押せるようになるのを待っています";
+                    }
+                    else
+                    {
+                        this.confirmedRow = this.rowIndex;
+                        this.confirmedAddon = (nint)addon;
+                        return this.FireDelivery(ctx, addon, this.lastSelection);
+                    }
+                }
+            }
+        }
+        else
+        {
+            this.lastSelection = $"手持ちの一覧（node {HeldListNodeId}）を取れません";
         }
 
         var waited = DateTime.UtcNow - this.selectedAt;
@@ -787,7 +847,12 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
         }
 
         if (waited >= TradeReadyLimit)
-            return this.Fail($"{CraftPlanner.ItemName(this.Item)} を選びましたが納品できる状態になりませんでした（ボタン: {this.lastButton} / 選択: {this.lastSelection}）");
+        {
+            return this.Fail(this.ambiguous
+                ? $"{CraftPlanner.ItemName(this.Item)} を選びましたが、所持数が同じ別の収集品があり、選択が効いたことを確かめられませんでした（取り違えを避けるため撃ちません。ボタン: {this.lastButton} / 選択: {this.lastSelection}）"
+                : $"{CraftPlanner.ItemName(this.Item)} を選びましたが納品できる状態になりませんでした（ボタン: {this.lastButton} / 選択: {this.lastSelection}）");
+        }
+
         return TaskResult.Running;
     }
 
@@ -861,11 +926,10 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
             return TaskResult.Done;
         }
 
+        // 閉じられないまま完了にすると、次の段（テレポ等）が「画面が開いている」で待って別の理由で止まり、
+        // 原因が分かりにくくなる。ここで理由をはっきりさせて止める
         if (this.TimedOut(TimeSpan.FromSeconds(10)))
-        {
-            ctx.Log.Warn("納品", "納品画面を閉じられませんでした。手で閉じてください");
-            return TaskResult.Done;
-        }
+            return this.Fail("納品画面を10秒たっても閉じられませんでした。手で閉じてからやり直してください");
 
         if (DateTime.UtcNow - this.lastClose < TimeSpan.FromMilliseconds(800))
             return TaskResult.Running;
@@ -1006,8 +1070,11 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
 ///  ・撃つ前：確認窓などが残っていない／index に重複が無い／目的の品がちょうど1件／値段がゲームデータと同じ／
 ///    払う通貨が紫貨／画面の通貨の所持数がカバンの紫貨と同じ（ずれていれば少し待つ）／紫貨が足りる／カバンに空きがある。
 ///  ・撃つ：Fire(14, (uint)index, 1u)。続いて ShopExchangeItemDialog の「交換する」（node 18）→ 品によって SelectYesno。
-///    SelectYesno は「本文に通貨名と値段がある」か「撃った後に自分の操作で開いたもので、危ない語を含まない」ときだけ「はい」。
-///  ・成功は「秘伝書が増えた AND 紫貨が減った」（15秒まで）。何も動かなければ（習得済みなど）その巻を飛ばす。片方だけなら止める。
+///    押す・閉じるのは、どの窓も「撃った後に自分の操作で開いたもの」だけ。
+///    SelectYesno はそのうえで、危ない語を含まず、「本文に通貨名と値段がある」か「撃ってから10秒以内」のときだけ「はい」。
+///  ・紫貨が足りなければ、その先は次の回にする（流れの側で収集品を作り足して、秘伝書の段をやり直す）。
+///  ・成功は「秘伝書が増えた AND 紫貨が減った」（15秒まで）。何も動かず、習得済みになっていればその巻を飛ばす。
+///    未習得のままなら失敗。片方だけなら止める。
 /// </summary>
 public sealed unsafe class ExchangeBooksTask : AutoTask
 {
@@ -1317,8 +1384,13 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
                 : TaskResult.Running;
         }
 
+        // 紫貨が足りなければ、この回はここまで（流れの側で収集品を作り足して、秘伝書の段をやり直す。やり直しは3回まで）
         if (scrips < offer.Price)
-            return this.Fail($"紫貨が足りません（{scrips}/{offer.Price}）");
+        {
+            ctx.Log.Warn("交換", $"紫貨が足りないので、{CraftPlanner.ItemName(offer.BookItemId)} から先の交換は次の回にします（{scrips}/{offer.Price}）");
+            this.Go(ExStep.Close, "交換画面を閉じます");
+            return TaskResult.Running;
+        }
         // 2枠は残す（空きが足りないキャラは AutoRetainer が処理から外すため）
         if (Inventory.FreeBagSlots() < 3)
             return this.Fail("カバンの空きが足りません（交換のあとも2枠残るよう、3枠以上空けてください）");
@@ -1348,16 +1420,32 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
             return TaskResult.Running;
         }
 
-        // 個数を選ぶ画面は想定外（1個ずつしか撃たない）。閉じて止める
-        if (GameUi.IsReady("ShopExchangeCurrencyDialog", out var qty))
+        // 画面を押す・閉じるのは、撃った後に自分の操作で開いたものだけ（以前は名前だけで
+        // 個数の画面を閉じ、交換の確認を押していた。撃つ前から開いていた窓や、別の操作の同名の窓まで触りえた）
+
+        // 個数を選ぶ画面は想定外（1個ずつしか撃たない）。自分のものなら閉じて止める。自分のものでなければ触らずに止める
+        if (GameUi.IsReady("ShopExchangeCurrencyDialog", out _))
         {
-            GameUi.Fire(qty, true, -1);
-            return this.Fail("個数を選ぶ画面が出ました（想定外）。閉じて止めました");
+            if (ctx.Ownership.TryGetOwnedSince("ShopExchangeCurrencyDialog", this.firedAt, out var qty))
+            {
+                GameUi.Fire(qty, true, -1);
+                return this.Fail("個数を選ぶ画面が出ました（想定外）。閉じて止めました");
+            }
+
+            return this.Fail("個数を選ぶ画面が開いています（交換で自分が開いたものではないので触りません）。閉じてからやり直してください");
         }
 
         // 交換の確認（撃った直後に出る）。押しても消えないまま時間が来たら、閉じて止める
-        if (GameUi.IsReady("ShopExchangeItemDialog", out var dialog))
+        if (GameUi.IsReady("ShopExchangeItemDialog", out _))
         {
+            if (!ctx.Ownership.TryGetOwnedSince("ShopExchangeItemDialog", this.firedAt, out var dialog))
+            {
+                this.Status = "交換の確認が出ていますが、撃った後に自分の操作で開いたものではないので押しません";
+                return DateTime.UtcNow - this.firedAt >= OutcomeLimit
+                    ? this.Fail("交換の確認が開いていますが、自分の操作で開いたものと確かめられないので押しませんでした")
+                    : TaskResult.Running;
+            }
+
             if (DateTime.UtcNow - this.firedAt >= OutcomeLimit)
             {
                 DebugLog.Current?.Block("交換", "消えない交換の確認", AddonRecorder.Describe(dialog));
@@ -1400,20 +1488,30 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
 
         if (books == this.beforeBooks && scrips == this.beforeScrips)
         {
-            // 何も動いていない＝ゲームが受け付けなかった（習得済みの秘伝書は、確認まで通って何も起きない：実測）
-            ctx.Log.Warn("交換", $"{CraftPlanner.ItemName(offer.BookItemId)} は交換されませんでした（所持数が動いていません。習得済みの可能性）。この巻は飛ばします");
-            this.current = null;
-            this.Go(ExStep.Select, string.Empty);
-            return TaskResult.Running;
+            // 何も動いていない＝ゲームが受け付けなかった（習得済みの秘伝書は、確認まで通って何も起きない：実測）。
+            // 飛ばしてよいのは、いま習得済みと読めたときだけ（以前は「習得済みの可能性」として
+            // 未習得のまま飛ばし、後の製作の段で「秘伝書が未読」と別の理由で止まっていた）。
+            // 撃つ前に習得済みなら PickNext で飛ばしているので、ここで未習得なら交換の失敗
+            if (IsLearned(offer.TomeId))
+            {
+                ctx.Log.Warn("交換", $"{CraftPlanner.ItemName(offer.BookItemId)} は交換されませんでしたが、習得済みになっていたので飛ばします");
+                this.current = null;
+                this.Go(ExStep.Select, string.Empty);
+                return TaskResult.Running;
+            }
+
+            return this.Fail($"{CraftPlanner.ItemName(offer.BookItemId)} の交換が受け付けられませんでした（{OutcomeLimit.TotalSeconds:0}秒たっても秘伝書も紫貨も動かず、未習得のまま。記録の画面の写しで、撃った後の画面を確かめてください）");
         }
 
         return this.Fail($"交換の結果が片方しか反映されていません（{CraftPlanner.ItemName(offer.BookItemId)} {this.beforeBooks}→{books}、紫貨 {this.beforeScrips}→{scrips}）");
     }
 
     /// <summary>
-    /// 押してよい SelectYesno を2段で探す。
-    ///  1) 本文に通貨名と値段の両方がある。
-    ///  2) 撃った後に自分の操作で開いたもので、撃ってから 10 秒以内、かつ危ない語を含まない（本文は記録に残す）。
+    /// 押してよい SelectYesno を2段で探す（所有の確認も行う）。
+    /// どちらも「撃った後に自分の操作で開いた」確認であることが前提（以前は 1) に所有の確認が無く、
+    /// 同じ通貨・同じ値段を含む別の確認まで押しえた）。危ない語（捨てる・売る等）を含むものは押さない。
+    ///  1) 本文に通貨名と値段の両方がある（値段は前後が数字でないこと。「100」が「1000」の一部に当たらないように）。
+    ///  2) 撃ってから 10 秒以内（本文が想定と違っても答える。本文は記録に残す）。
     /// </summary>
     private bool TryFindConfirm(TaskContext ctx, BookOffer offer, out AtkUnitBase* addon, out string body)
     {
@@ -1422,38 +1520,75 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
         if (yesno == null)
             return false;
 
-        var currencyName = CraftPlanner.ItemName(this.scripItemId);
-        var shown = body;
-        var priceTexts = new[] { offer.Price.ToString(), offer.Price.ToString("N0") };
-        if (currencyName.Length > 0 && shown.Contains(currencyName, StringComparison.Ordinal)
-            && priceTexts.Any(p => shown.Contains(p, StringComparison.Ordinal)))
+        if (!ctx.Ownership.TryGetOwnedSince("SelectYesno", this.firedAt, out var own) || (nint)own != (nint)yesno)
         {
-            addon = yesno;
-            return true;
-        }
-
-        if (DateTime.UtcNow - this.firedAt <= OwnedDialogWindow && ctx.Ownership.TryGetOwnedSince("SelectYesno", this.firedAt, out var own))
-        {
-            var bad = DangerousWord(body);
-            if (bad != null)
+            if (DateTime.UtcNow - this.lastUnmatchedLog >= TimeSpan.FromSeconds(5))
             {
-                ctx.Log.Warn("交換", $"確認に「{bad}」が含まれるので押しません：{body}");
-                return false;
+                this.lastUnmatchedLog = DateTime.UtcNow;
+                ctx.Log.Warn("交換", $"確認が出ていますが、撃った後に自分の操作で開いたものではないので押しません：{body}");
             }
 
-            ctx.Log.Warn("交換", $"確認の本文が想定と違いますが、撃った直後に自分の操作で開いたものなので答えます：{body}（探した語：{currencyName}・{offer.Price}）");
+            return false;
+        }
+
+        // 記録は5秒に1回まで（毎フレーム呼ばれるため）
+        var logNow = DateTime.UtcNow - this.lastUnmatchedLog >= TimeSpan.FromSeconds(5);
+        if (logNow)
+            this.lastUnmatchedLog = DateTime.UtcNow;
+
+        var bad = DangerousWord(body);
+        if (bad != null)
+        {
+            if (logNow)
+                ctx.Log.Warn("交換", $"確認に「{bad}」が含まれるので押しません：{body}");
+            return false;
+        }
+
+        var currencyName = CraftPlanner.ItemName(this.scripItemId);
+        if (currencyName.Length > 0 && body.Contains(currencyName, StringComparison.Ordinal) && ContainsNumber(body, offer.Price))
+        {
             addon = own;
             return true;
         }
 
-        if (DateTime.UtcNow - this.lastUnmatchedLog >= TimeSpan.FromSeconds(5))
+        if (DateTime.UtcNow - this.firedAt <= OwnedDialogWindow)
         {
-            this.lastUnmatchedLog = DateTime.UtcNow;
+            if (logNow)
+                ctx.Log.Warn("交換", $"確認の本文が想定と違いますが、撃った直後に自分の操作で開いたものなので答えます：{body}（探した語：{currencyName}・{offer.Price}）");
+            addon = own;
+            return true;
+        }
+
+        if (logNow)
             ctx.Log.Warn("交換", $"確認が出ていますが、交換のものと判断できないので押しません：{body}");
+
+        return false;
+    }
+
+    /// <summary>
+    /// 本文に、その数（3桁区切りでも可）が「前後が数字でない」形で含まれるか。
+    /// 「100」が「1000」「2,100」の一部に当たらないようにする。
+    /// </summary>
+    private static bool ContainsNumber(string body, uint value)
+    {
+        foreach (var text in new[] { value.ToString(), value.ToString("N0") }.Distinct())
+        {
+            var at = 0;
+            while ((at = body.IndexOf(text, at, StringComparison.Ordinal)) >= 0)
+            {
+                var beforeOk = at == 0 || !IsNumberChar(body[at - 1]);
+                var end = at + text.Length;
+                var afterOk = end >= body.Length || !IsNumberChar(body[end]);
+                if (beforeOk && afterOk)
+                    return true;
+                at = end;
+            }
         }
 
         return false;
     }
+
+    private static bool IsNumberChar(char c) => char.IsDigit(c) || c == ',' || c == '，';
 
     // ---- 閉じる ----
 
@@ -1468,11 +1603,9 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
             return TaskResult.Done;
         }
 
+        // 閉じられないまま完了にすると、次の段が別の理由で止まって原因が分かりにくくなる
         if (this.TimedOut(TimeSpan.FromSeconds(10)))
-        {
-            ctx.Log.Warn("交換", "アイテム交換の画面を閉じられませんでした。手で閉じてください");
-            return TaskResult.Done;
-        }
+            return this.Fail("アイテム交換の画面を10秒たっても閉じられませんでした。手で閉じてからやり直してください");
 
         if (DateTime.UtcNow - this.lastClose < TimeSpan.FromMilliseconds(800))
             return TaskResult.Running;
@@ -1574,7 +1707,8 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
 }
 
 /// <summary>
-/// 秘伝書を使って習得する。確認（SelectYesno）が出たら、本の名前を含むときだけ「はい」（押せる状態のボタンだけを押す）。
+/// 秘伝書を使って習得する。確認（SelectYesno）が出たら、本を使った後に自分の操作で開いたもので、
+/// 本の名前を含むか使ってから10秒以内のときだけ「はい」（押せる状態のボタンだけを押す）。
 /// 成功は「習得済みになった AND 本が減った」。
 /// </summary>
 public sealed unsafe class UseBooksTask : AutoTask
@@ -1648,18 +1782,18 @@ public sealed unsafe class UseBooksTask : AutoTask
             return TaskResult.Running;
         }
 
-        // 確認（SelectYesno）に答えるのは、交換と同じ2段の判定を通ったものだけ（本の名前だけでは、
-        // 利用者が出した「〇〇秘伝書を捨てますか？」にも「はい」を押しうる）。
-        //  1) 本文に本の名前がある、または 2) 本を使った後に自分の操作で開いた確認で、使ってから10秒以内。
-        //  どちらでも、危ない語を含むものは押さない。
+        // 確認（SelectYesno）に答えるのは、本を使った後に自分の操作で開いた確認だけ（以前は
+        // 本の名前が本文にあれば所有を確かめずに押していた）。そのうえで、危ない語を含まず、
+        //  1) 本文に本の名前がある、または 2) 使ってから10秒以内 のときだけ「はい」
+        // （本の名前だけでは、利用者が出した「〇〇秘伝書を捨てますか？」にも「はい」を押しうる）。
         var text = GameUi.YesnoText(out var yesno);
         if (text != null && DateTime.UtcNow - this.lastClick > TimeSpan.FromMilliseconds(400))
         {
             var bad = ExchangeBooksTask.DangerousWord(text);
+            var owned2 = ctx.Ownership.TryGetOwnedSince("SelectYesno", this.usedAt, out var own) && (nint)own == (nint)yesno;
             var byName = text.Contains(name, StringComparison.Ordinal);
-            var ownFresh = DateTime.UtcNow - this.usedAt <= TimeSpan.FromSeconds(10)
-                           && ctx.Ownership.TryGetOwnedSince("SelectYesno", this.usedAt, out _);
-            if (bad == null && (byName || ownFresh))
+            var fresh = DateTime.UtcNow - this.usedAt <= TimeSpan.FromSeconds(10);
+            if (bad == null && owned2 && (byName || fresh))
             {
                 this.lastClick = DateTime.UtcNow;
                 ctx.Log.Write("秘伝書", $"確認に「はい」と答えます（{(byName ? "本の名前が本文にある" : "使った直後に自分の操作で開いた確認")}）：{text}");
@@ -1673,7 +1807,9 @@ public sealed unsafe class UseBooksTask : AutoTask
                 this.lastUnmatchedLog = DateTime.UtcNow;
                 ctx.Log.Warn("秘伝書", bad != null
                     ? $"確認に「{bad}」が含まれるので押しません：{text}"
-                    : $"確認が出ていますが、秘伝書のものと判断できないので押しません：{text}");
+                    : !owned2
+                        ? $"確認が出ていますが、本を使った後に自分の操作で開いたものではないので押しません：{text}"
+                        : $"確認が出ていますが、秘伝書のものと判断できないので押しません：{text}");
             }
         }
 

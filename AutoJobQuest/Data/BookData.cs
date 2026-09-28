@@ -266,6 +266,51 @@ public sealed class BookData
     }
 
     /// <summary>
+    /// 秘伝書の流れに欠かせないデータがそろっているかを確かめ、足りないものを返す（空なら問題なし）。
+    /// フレームワークのスレッドから呼ぶ（特殊通貨の引き当てと、解放済みエーテライトを読むため）。
+    ///
+    /// 以前は Notes を警告として記録するだけで先へ進み、素材を集め終わった後で
+    /// 「秘伝書が未読」という別の段の理由で止まっていた（原因の段と止まる段が離れて調べにくい）。
+    /// </summary>
+    /// <param name="requiredBookItems">交換が要る秘伝書（アイテム ID）。</param>
+    public List<string> Validate(IEnumerable<uint> requiredBookItems)
+    {
+        var problems = new List<string>();
+        foreach (var b in requiredBookItems)
+            if (!this.Offers.ContainsKey(b))
+                problems.Add($"秘伝書「{CraftPlanner.ItemName(b)}」を交換できる店がゲームデータから見つかりません");
+
+        if (this.RewardLow <= 0)
+            problems.Add($"収集品「{CraftPlanner.ItemName(this.CollectableItemId)}」の納品の報酬（紫貨の量）がゲームデータから読めません");
+        if (this.CollectableRecipeId == 0)
+            problems.Add($"収集品「{CraftPlanner.ItemName(this.CollectableItemId)}」のレシピがゲームデータから見つかりません");
+        if (this.CollectableTabClassJob == 0)
+            problems.Add($"収集品「{CraftPlanner.ItemName(this.CollectableItemId)}」を受け付ける納品窓口がゲームデータから見つかりません");
+
+        // 納品でもらう通貨と、秘伝書の値段の通貨が同じ品か（違えば、いくら納品しても交換できない）
+        var rewardItem = SpecialCurrency.ItemId(this.RewardSpecialCurrencyId);
+        if (rewardItem == 0)
+            problems.Add($"納品の報酬の特殊通貨（番号 {this.RewardSpecialCurrencyId}）をアイテムに直せません");
+        foreach (var o in this.Offers.Values)
+        {
+            var costItem = SpecialCurrency.ItemId(o.SpecialCurrencyId);
+            if (costItem == 0)
+                problems.Add($"「{CraftPlanner.ItemName(o.BookItemId)}」の値段の特殊通貨（番号 {o.SpecialCurrencyId}）をアイテムに直せません");
+            else if (rewardItem != 0 && costItem != rewardItem)
+                problems.Add($"「{CraftPlanner.ItemName(o.BookItemId)}」の値段の通貨（{CraftPlanner.ItemName(costItem)}）が、納品でもらう通貨（{CraftPlanner.ItemName(rewardItem)}）と違います");
+            if (o.Price == 0)
+                problems.Add($"「{CraftPlanner.ItemName(o.BookItemId)}」の値段がゲームデータから読めません");
+        }
+
+        if (this.CollectableNpcs.Count == 0 || this.ScripNpcs.Count == 0)
+            problems.Add("収集品納品窓口かスクリップ取引窓口の場所がゲームデータから引けません");
+        else if (this.ChooseTown() == null)
+            problems.Add("収集品納品窓口とスクリップ取引窓口のある街に、解放済みのエーテライトがありません");
+
+        return problems;
+    }
+
+    /// <summary>
     /// 収集品納品窓口とスクリップ取引窓口が同じエリアにあり、そのエリアに解放済みのエーテライトがある組を選ぶ
     /// （イディルシャイア・モードゥナはどちらも Level シートだけで座標が引ける）。
     /// </summary>

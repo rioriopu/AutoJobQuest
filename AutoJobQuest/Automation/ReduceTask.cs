@@ -24,11 +24,13 @@ public sealed record ReduceNeed(uint ItemId, int TargetOwned, List<uint> Sources
 ///  ・GBR の精選の設定（DoReduce）は既定で OFF（AutoGather.Config.cs:27）。
 ///  ・ON でも、精選するのは「空き枠が 20 未満」か「空き枠 0」のときだけ（AutoGather.cs:680-714, 890）。
 ///    空きの多いキャラでは、採集の途中で精選されない。
-///  ・GBR は精選できる収集品を全部精選する（利用者が別の目的で持っている収集品まで）。
+///  ・GBR は精選できる収集品を全部精選する（利用者が別の目的で持っている収集品まで。AutoGather.Purify.cs:13-48）。
 ///
 /// こちらのやり方（AutoHook の Tasks/AetherialReduction.cs と同じ）:
 ///  ・AgentPurify.ReduceItem(カバンの枠) で、元の収集品の枠だけを1個ずつ精選する（選択の窓を通さない）。
 ///  ・結果の窓（PurifyResult）は「閉じる」（node 20。ECommons・GBR の AddonMaster と同じ）で閉じる。
+///    閉じるのは自分の精選の後に開いたものだけ。
+///  ・採らせている間は、GBR 自身の自動精選（DoReduce）を切る（GatherTask）。
 ///  ・1個ごとに「元の収集品が減った AND 欲しい品が増えた」を確かめる。欲しい数に届いたらそこでやめる
 ///    （1個から出る数は1〜4で幅があるので、精選しすぎない）。
 ///  ・元の収集品が無ければ、GBR に少しずつ採らせる（足りない数の半分ずつ）。採っている途中でも、
@@ -110,6 +112,10 @@ public sealed unsafe class ReduceTask : AutoTask
         }
 
         ctx.Log.Write("精選", $"{CraftPlanner.ItemName(this.need.ItemId)} を {this.need.TargetOwned} 個まで集めます（今 {this.Owned} 個）。元にする収集品：{string.Join("、", this.sources.Select(CraftPlanner.ItemName))}");
+
+        // 精選の結果の窓は、自分の精選で開いたものだけ閉じる（記録を始める）
+        ctx.Ownership.Clear();
+        ctx.Ownership.IsClaiming = true;
         return TaskResult.Running;
     }
 
@@ -163,7 +169,7 @@ public sealed unsafe class ReduceTask : AutoTask
         var target = this.need.TargetOwned;
         var wanted = this.need.ItemId;
         this.gather = new GatherTask(
-            [new GatherNeed(this.gatheringSource, count)], null,
+            [new GatherNeed(this.gatheringSource, 0, ExtraFromNow: count)], null,
             $"精選用の {CraftPlanner.ItemName(this.gatheringSource)}", TimeSpan.FromMinutes(60), Route.Reduce)
         {
             StopWhen = () => Inventory.CountNow(wanted) >= target,
@@ -201,11 +207,20 @@ public sealed unsafe class ReduceTask : AutoTask
 
     private TaskResult TickReduce(TaskContext ctx)
     {
-        // 前の結果の窓が残っていれば先に閉じる
-        if (GameUi.IsReady("PurifyResult", out var result))
+        // 前の結果の窓が残っていれば先に閉じる。自分の精選で開いたものでなければ触らず、閉じられるのを待つ
+        // （以前は名前だけで閉じていたので、始める前から開いていた窓まで閉じえた）
+        if (GameUi.IsReady("PurifyResult", out _))
         {
-            this.CloseResult(result);
-            return TaskResult.Running;
+            if (this.TryGetOwnResult(ctx, out var own))
+            {
+                this.CloseResult(own);
+                return TaskResult.Running;
+            }
+
+            this.Status = "精選の結果の窓が開いています（自分の精選のものではないので閉じません）";
+            return this.TimedOut(TimeSpan.FromSeconds(60))
+                ? this.Fail("自分の精選のものではない精選の結果の窓が開いたままです。閉じてからやり直してください")
+                : TaskResult.Running;
         }
 
         // 騎乗中は精選できない（GBR も騎乗中は精選しない：AutoGather.Purify.cs:15）
@@ -250,7 +265,7 @@ public sealed unsafe class ReduceTask : AutoTask
 
     private TaskResult TickWaitResult(TaskContext ctx)
     {
-        if (GameUi.IsReady("PurifyResult", out var result))
+        if (this.TryGetOwnResult(ctx, out var result))
         {
             this.CloseResult(result);
             return TaskResult.Running;
@@ -264,6 +279,7 @@ public sealed unsafe class ReduceTask : AutoTask
         if (!busy && sourceNow < this.sourceBefore && wantedNow > this.wantedBefore)
         {
             this.reducedCount++;
+            this.oddResults = 0;
             ctx.Log.Write("精選", $"{CraftPlanner.ItemName(this.reducingItem)} を精選しました → {CraftPlanner.ItemName(this.need.ItemId)} +{wantedNow - this.wantedBefore}（{wantedNow}/{this.need.TargetOwned}）");
             this.Go(ReduceStep.Decide, string.Empty);
             return TaskResult.Running;
@@ -274,15 +290,23 @@ public sealed unsafe class ReduceTask : AutoTask
 
         if (sourceNow < this.sourceBefore)
         {
-            // 精選はされたが、欲しい品が増えなかった（別の品だけが出た等）。続けるが、続くようなら止める
+            // 精選はされたが、欲しい品が増えなかった（別の品だけが出た等。精選の結果は品が決まっていない）。
+            // 続けるが、続けて4回（成功で数え直す。以前は累計だった）出なければ止める
             if (++this.oddResults > 3)
-                return this.Fail($"精選しても {CraftPlanner.ItemName(this.need.ItemId)} が出ないことが続きました（精選の対応表が違う可能性）");
+                return this.Fail($"精選しても {CraftPlanner.ItemName(this.need.ItemId)} が出ないことが {this.oddResults} 回続きました（精選の対応表が違う可能性）");
             ctx.Log.Warn("精選", $"{CraftPlanner.ItemName(this.reducingItem)} を精選しましたが、{CraftPlanner.ItemName(this.need.ItemId)} は増えませんでした");
             this.Go(ReduceStep.Decide, string.Empty);
             return TaskResult.Running;
         }
 
         return this.Fail($"精選が受け付けられませんでした（{CraftPlanner.ItemName(this.reducingItem)} {this.sourceBefore}→{sourceNow}、{CraftPlanner.ItemName(this.need.ItemId)} {this.wantedBefore}→{wantedNow}）");
+    }
+
+    /// <summary>自分の精選（最後に精選した時刻より後）で開いた結果の窓。</summary>
+    private bool TryGetOwnResult(TaskContext ctx, out FFXIVClientStructs.FFXIV.Component.GUI.AtkUnitBase* result)
+    {
+        result = null;
+        return this.reducedAt != DateTime.MinValue && ctx.Ownership.TryGetOwnedSince("PurifyResult", this.reducedAt, out result);
     }
 
     private void CloseResult(FFXIVClientStructs.FFXIV.Component.GUI.AtkUnitBase* result)
@@ -328,11 +352,13 @@ public sealed unsafe class ReduceTask : AutoTask
         this.gather = null;
 
         // 自分の精選で出た結果の窓が残っていれば閉じる
-        if (this.reducedAt != DateTime.MinValue && GameUi.IsReady("PurifyResult", out var result))
+        if (this.TryGetOwnResult(ctx, out var result))
         {
             DebugLog.Current?.Line("操作", "止めたので精選の結果の窓を閉じます");
             if (!GameUi.ClickButton(result, PurifyResultCloseNode))
                 GameUi.Fire(result, true, -1);
         }
+
+        ctx.Ownership.Clear();
     }
 }

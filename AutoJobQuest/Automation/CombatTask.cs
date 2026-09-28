@@ -42,16 +42,34 @@ public sealed class CombatTask : AutoTask
 
     private int spotIndex;
     private MoveToTask? moving;
-    private IBattleNpc? target;
-    private uint targetNameId;
     private DateTime spotArrivedAt = DateTime.MinValue;
     private DateTime lastApproach = DateTime.MinValue;
     private DateTime dismountAt = DateTime.MinValue;
 
-    // 同じ敵に長くダメージが入らない（届かない場所・他人の獲物など）ときは諦める
+    // 狙っている敵。オブジェクトの参照はフレームをまたいで持たず、GameObjectId で毎回引き直して
+    // 名前 ID・BaseId が同じかを確かめる（Dalamud の ObjectTable は枠ごとの入れ物を使い回し、
+    // アドレスを書き換える＝ObjectTable.cs:189-225。持ち続けた参照は、敵が消えた後に同じ枠へ入った別の敵を指しうる）
+    private ulong targetId;
+    private uint targetMobNameId;
+    private uint targetBaseId;
+
+    // RSR の優先リストに入れた名前 ID（次のモンスターに移るとき消す）
+    private uint targetNameId;
+
+    // 同じ敵に長くダメージが入らない（届かない場所・他人の獲物など）ときは諦める。
+    // 「最後に HP が減った時刻」から数える（以前は狙い始めた時の HP と比べていたので、
+    // 1回でも減った後に届かなくなると、制限時間の 25 分まで気づけなかった）
     private readonly HashSet<ulong> giveUp = [];
-    private DateTime targetSince = DateTime.MinValue;
-    private uint targetHpAtStart;
+    private DateTime lastProgressAt = DateTime.MinValue;
+    private uint lastHp;
+
+    // 自分が頼んだ近づく移動（画面が開いたときに止めてよいのはこれと出現点への移動だけ）
+    private bool approachIssued;
+    private bool pausedByUi;
+    private DateTime uiOpenSince = DateTime.MinValue;
+
+    // 諦めた敵にしか狙われていないのに戦闘状態が続いている時刻（続けば止める）
+    private DateTime stuckSince = DateTime.MinValue;
 
     public List<uint> Unfinished { get; } = [];
 
@@ -115,6 +133,22 @@ public sealed class CombatTask : AutoTask
             ctx.Log.Warn("戦闘", $"{this.limit.TotalMinutes:0}分たっても集めきれませんでした（戦闘中なら片づけてから次へ進みます）");
         }
 
+        // ショップ等の画面が出ていたら、自分の移動を止めて待つ（片づけの戦闘中も同じ。
+        // 以前は新しい移動を頼まないだけで、走っている移動は止めず、片づけの分岐はこの確認より前にあった）
+        if (GameUi.IsShopOrMarketOpen())
+        {
+            this.PauseOwnMovement(ctx);
+            if (this.uiOpenSince == DateTime.MinValue)
+                this.uiOpenSince = DateTime.UtcNow;
+            if (DateTime.UtcNow - this.uiOpenSince > TimeSpan.FromMinutes(5))
+                return this.Fail("ショップ等の画面が5分たっても閉じないので、戦闘を続けられません（閉じてからやり直してください）");
+            this.Status = "ショップ等の画面が開いているので待っています";
+            return TaskResult.Running;
+        }
+
+        this.pausedByUi = false;
+        this.uiOpenSince = DateTime.MinValue;
+
         var wanted = this.timedOut ? [] : this.WantedMobs();
         if (wanted.Count == 0)
         {
@@ -122,9 +156,9 @@ public sealed class CombatTask : AutoTask
             // （戦闘中のまま次の作業（テレポ・採集）に移ると、そこで失敗する）
             if (GameUi.InCombat && DateTime.UtcNow - this.CollectedAt() < TimeSpan.FromMinutes(2))
             {
-                if (this.target != null && IsAlive(this.target))
-                    return this.Engage(ctx);
-                var remaining = FindHater();
+                if (this.CurrentTarget() is { } current)
+                    return this.Engage(ctx, current);
+                var remaining = FindHater(this.giveUp, out _);
                 if (remaining != null)
                 {
                     this.SetTarget(ctx, remaining);
@@ -148,25 +182,34 @@ public sealed class CombatTask : AutoTask
         if (Me.Territory != this.territory)
             return this.Fail("エリアが変わりました");
 
-        // ショップ等の画面が出ていたら何もしない
-        if (GameUi.IsShopOrMarketOpen())
+        // 1) いまの相手がまだ生きていれば、近づいて RSR に任せる
+        if (this.CurrentTarget() is { } t)
+            return this.Engage(ctx, t);
+
+        this.targetId = 0;
+
+        // 2) こちらを狙っている敵がいれば先に片づける（Henched はハードターゲットしか殴らないため）。
+        //    諦めた敵は選び直さない（以前は敵視リスト経由で同じ敵をすぐ選び直していた）
+        var hater = FindHater(this.giveUp, out var onlyGivenUp);
+        if (hater != null)
         {
-            this.Status = "ショップ等の画面が開いているので待っています";
+            this.stuckSince = DateTime.MinValue;
+            this.SetTarget(ctx, hater);
             return TaskResult.Running;
         }
 
-        // 1) いまの相手がまだ生きていれば、近づいて RSR に任せる
-        if (this.target != null && IsAlive(this.target))
-            return this.Engage(ctx);
-
-        this.target = null;
-
-        // 2) こちらを狙っている敵がいれば先に片づける（Henched はハードターゲットしか殴らないため）
-        var hater = FindHater();
-        if (hater != null)
+        // 諦めた敵にしか狙われていないまま戦闘状態が続く＝攻撃の入らない敵に追われている。
+        // マウントにもテレポにも移れないので、上限（2分）を過ぎたら理由を出して止める
+        if (onlyGivenUp && GameUi.InCombat)
         {
-            this.SetTarget(ctx, hater);
-            return TaskResult.Running;
+            if (this.stuckSince == DateTime.MinValue)
+                this.stuckSince = DateTime.UtcNow;
+            if (DateTime.UtcNow - this.stuckSince > TimeSpan.FromMinutes(2))
+                return this.Fail("攻撃の入らない敵に狙われ続けていて、2分たっても戦闘状態が解けません");
+        }
+        else
+        {
+            this.stuckSince = DateTime.MinValue;
         }
 
         // 3) 指定のモンスターを探す
@@ -182,20 +225,29 @@ public sealed class CombatTask : AutoTask
         return this.Patrol(ctx);
     }
 
-    private TaskResult Engage(TaskContext ctx)
+    private TaskResult Engage(TaskContext ctx, IBattleNpc t)
     {
-        var t = this.target!;
         var dist = Vector3.Distance(Me.Position, t.Position);
         this.Status = $"{t.Name} と戦闘中（{dist:0.0}m）";
 
-        // 45秒たっても HP が1も減らなければ、その敵は諦める（届かない・他人が先に攻撃した等）
-        if (DateTime.UtcNow - this.targetSince > TimeSpan.FromSeconds(45) && t.CurrentHp >= this.targetHpAtStart)
+        // HP が減ったら進展として時刻を更新する（回復・無敵で増えたときは進展にしない）
+        var hp = t.CurrentHp;
+        if (hp < this.lastHp)
+            this.lastProgressAt = DateTime.UtcNow;
+        this.lastHp = hp;
+
+        // 最後に HP が減ってから 45 秒たったら、その敵は諦める（届かない・他人が先に攻撃した等）。
+        // ハードターゲットも外す（諦めた敵を RSR が殴り続けないように）
+        if (DateTime.UtcNow - this.lastProgressAt > TimeSpan.FromSeconds(45))
         {
-            ctx.Log.Warn("戦闘", $"{t.Name} に攻撃が入らないので、別の個体を探します");
+            ctx.Log.Warn("戦闘", $"{t.Name} の HP が 45 秒減っていないので、この個体は諦めて別の個体を探します（HP {hp}）");
             this.giveUp.Add(t.GameObjectId);
-            this.target = null;
-            if (ctx.Navmesh.IsMoving())
+            this.targetId = 0;
+            if (Svc.Targets.Target?.GameObjectId == t.GameObjectId)
+                Svc.Targets.Target = null;
+            if (this.approachIssued && ctx.Navmesh.IsMoving())
                 ctx.Navmesh.Stop();
+            this.approachIssued = false;
             return TaskResult.Running;
         }
 
@@ -211,7 +263,7 @@ public sealed class CombatTask : AutoTask
         if (!ctx.Rotation.EnsureHenched())
             return this.Fail("RSR を Henched モードにできませんでした");
         if (ctx.Rotation.HenchedUnresponsive)
-            return this.Fail("RSR に Henched への切り替えを送っても動作中になりません（IPC が効いていない可能性。記録の IPC 欄を見てください）");
+            return this.Fail($"{ctx.Rotation.HenchedProblem}。記録の IPC 欄を見てください");
 
         // ハードターゲットが外れていたら付け直す
         if (Svc.Targets.Target?.GameObjectId != t.GameObjectId)
@@ -223,12 +275,13 @@ public sealed class CombatTask : AutoTask
             if (!ctx.Navmesh.IsMoving() && DateTime.UtcNow - this.lastApproach > TimeSpan.FromSeconds(1))
             {
                 this.lastApproach = DateTime.UtcNow;
-                ctx.Navmesh.MoveCloseTo(t.Position, false, 2.5f);
+                this.approachIssued = ctx.Navmesh.MoveCloseTo(t.Position, false, 2.5f) || this.approachIssued;
             }
         }
-        else if (ctx.Navmesh.IsMoving())
+        else if (this.approachIssued && ctx.Navmesh.IsMoving())
         {
             ctx.Navmesh.Stop();
+            this.approachIssued = false;
         }
 
         return TaskResult.Running;
@@ -244,11 +297,42 @@ public sealed class CombatTask : AutoTask
             this.targetNameId = mob.NameId;
         }
 
-        this.target = mob;
-        this.targetSince = DateTime.UtcNow;
-        this.targetHpAtStart = mob.CurrentHp;
+        this.targetId = mob.GameObjectId;
+        this.targetMobNameId = mob.NameId;
+        this.targetBaseId = mob.BaseId;
+        this.lastProgressAt = DateTime.UtcNow;
+        this.lastHp = mob.CurrentHp;
         Svc.Targets.Target = mob;
         this.Status = $"{mob.Name} を狙います";
+    }
+
+    /// <summary>
+    /// 狙っている敵を GameObjectId で引き直す。消えた・別の敵に入れ替わった（名前 ID か BaseId が違う）・倒れた・
+    /// ターゲットできないなら null。
+    /// </summary>
+    private IBattleNpc? CurrentTarget()
+    {
+        if (this.targetId == 0)
+            return null;
+        return Svc.Objects.SearchById(this.targetId) is IBattleNpc npc
+               && npc.NameId == this.targetMobNameId && npc.BaseId == this.targetBaseId && IsAlive(npc)
+            ? npc
+            : null;
+    }
+
+    /// <summary>
+    /// ショップ等の画面が開いたとき、自分が頼んだ移動（出現点への移動・敵へ近づく移動）だけを止める。
+    /// 経路の計算中に止めても計算後に遅れて動き出すので、開いている間は毎回見て止める。
+    /// </summary>
+    private void PauseOwnMovement(TaskContext ctx)
+    {
+        if (this.moving != null || this.approachIssued)
+            this.pausedByUi = true;
+
+        this.CancelMove(ctx);
+        this.approachIssued = false;
+        if (this.pausedByUi && ctx.Navmesh.IsFollowingPath())
+            ctx.Navmesh.Stop();
     }
 
     private TaskResult Patrol(TaskContext ctx)
@@ -316,16 +400,18 @@ public sealed class CombatTask : AutoTask
     public override void Cleanup(TaskContext ctx)
     {
         this.CancelMove(ctx);
-        if (ctx.Navmesh.IsMoving())
+        if ((this.approachIssued || this.pausedByUi) && ctx.Navmesh.IsMoving())
             ctx.Navmesh.Stop();
+        this.approachIssued = false;
+        this.pausedByUi = false;
 
         // 止めたら優先指定を消し、RSR を止める（動作停止後は設定を消す）
         ctx.Rotation.ClearOwnPriorities();
         ctx.Rotation.ReleaseHenched();
 
-        if (this.target != null && Svc.Targets.Target?.GameObjectId == this.target.GameObjectId)
+        if (this.targetId != 0 && Svc.Targets.Target?.GameObjectId == this.targetId)
             Svc.Targets.Target = null;
-        this.target = null;
+        this.targetId = 0;
 
         if (this.Unfinished.Count == 0)
             this.CollectUnfinished();
@@ -358,9 +444,11 @@ public sealed class CombatTask : AutoTask
     /// ゲームの敵視リスト（UIState.Hater。画面の敵リストと同じ。BossMod の AggroPlayer の実体）で拾う。
     /// 自分を狙っていない敵（チョコボを狙っている等）も、敵視リストに載っていれば戦闘状態の原因なので含める。
     /// 敵視リストが読めないときは、自分を狙っている敵で代える。
+    /// 諦めた敵（<paramref name="giveUp"/>）は選ばない。諦めた敵しか残っていなければ <paramref name="onlyGivenUp"/> が true。
     /// </summary>
-    private static unsafe IBattleNpc? FindHater()
+    private static unsafe IBattleNpc? FindHater(HashSet<ulong> giveUp, out bool onlyGivenUp)
     {
+        onlyGivenUp = false;
         var meId = Svc.Objects.LocalPlayer?.GameObjectId ?? 0;
         if (meId == 0 || !GameUi.InCombat)
             return null;
@@ -375,12 +463,16 @@ public sealed class CombatTask : AutoTask
                     haters.Add(hater.Haters[i].EntityId);
         }
 
-        return Svc.Objects
+        var all = Svc.Objects
             .OfType<IBattleNpc>()
             .Where(o => o.BattleNpcKind == BattleNpcSubKind.Combatant && IsAlive(o)
                         && (haters.Contains(o.EntityId) || o.TargetObjectId == meId))
+            .ToList();
+        var pick = all.Where(o => !giveUp.Contains(o.GameObjectId))
             .OrderBy(o => Vector3.Distance(o.Position, Me.Position))
             .FirstOrDefault();
+        onlyGivenUp = pick == null && all.Count > 0;
+        return pick;
     }
 }
 

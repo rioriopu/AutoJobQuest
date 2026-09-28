@@ -98,8 +98,9 @@ public sealed class MainWindow : Window
     {
         var runner = this.services.Runner;
         var anySelected = this.config.SelectedCrafters.Any(x => x);
+        var blocker = runner.IsRunning ? null : runner.StartBlocker();
 
-        using (ImRaii.Disabled(runner.IsRunning || !anySelected))
+        using (ImRaii.Disabled(runner.IsRunning || !anySelected || blocker != null))
         {
             if (ImGui.Button("ジョブクエ開始", new Vector2(160, 32)))
                 this.StartFlow();
@@ -132,7 +133,25 @@ public sealed class MainWindow : Window
             ImGui.TextColored(Grey, "ジョブを1つ以上選んでください");
 
         ImGui.PushTextWrapPos(0);
+        if (blocker != null)
+            ImGui.TextColored(Yellow, blocker);
         ImGui.TextColored(Yellow, Preflight.Premise);
+
+        // 戻せなかった GBR のリスト（見つからない・同じ名前が複数）。利用者が GBR で確かめるまで出し続ける
+        var unresolved = this.config.GbrUnresolvedListRefs;
+        if (unresolved.Count > 0)
+        {
+            ImGui.TextColored(Yellow,
+                "⚠ 一時的に無効にした GBR の自動採集リストのうち、自動で有効に戻せなかったものがあります（見つからない、または同じ名前が複数あるため）。"
+                + "GBR の画面で有効にし直してください："
+                + string.Join("、", unresolved.Select(u => u.FolderPath.Length > 0 ? $"「{u.FolderPath}/{u.Name}」" : $"「{u.Name}」")));
+            if (ImGui.Button("GBR で確かめた（この表示を消す）"))
+            {
+                unresolved.Clear();
+                this.config.Save();
+            }
+        }
+
         ImGui.PopTextWrapPos();
     }
 

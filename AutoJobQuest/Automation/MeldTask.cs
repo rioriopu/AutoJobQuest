@@ -50,6 +50,7 @@ public sealed unsafe class MeldTask : AutoTask
     private byte materiaCountBefore;
     private long materiaStockBefore;
     private uint targetItemIdBefore;
+    private DateTime lastHide = DateTime.MinValue;
 
     public MeldTask(MateriaNeed need)
     {
@@ -81,12 +82,10 @@ public sealed unsafe class MeldTask : AutoTask
                 if (this.materiaStockBefore <= 0)
                     return this.Fail($"カバンに {CraftPlanner.ItemName(this.materiaItemId)} がありません");
 
-                // 装着の画面がもう開いていればそれを使う（開いている間は PlayerFree が false になるため、先に見る）
+                // 装着の画面が、こちらが開く前から開いている＝利用者か他のプラグインが使っている。横取りしない
+                // （以前はそのまま使っていたが、「利用者や他プラグインが開いた画面は押さない」に反する）
                 if (Agent->IsAgentActive())
-                {
-                    this.Next(MeldStep.SelectCategory);
-                    return TaskResult.Running;
-                }
+                    return this.Fail("マテリア装着の画面が開いています（こちらが開いたものではないので使いません）。閉じてからやり直してください");
 
                 if (!GameUi.PlayerFree())
                 {
@@ -246,8 +245,21 @@ public sealed unsafe class MeldTask : AutoTask
             }
 
             case MeldStep.Close:
+                // 閉じたことを確かめてから終える（続けて次の品に付けるとき、閉じきる前の画面を
+                // 「こちらが開いたものではない画面」と取り違えて止まらないように）
                 if (this.openedByUs && Agent->IsAgentActive())
-                    Agent->Hide();
+                {
+                    if (DateTime.UtcNow - this.lastHide >= TimeSpan.FromSeconds(1))
+                    {
+                        this.lastHide = DateTime.UtcNow;
+                        Agent->Hide();
+                    }
+
+                    return this.TimedOut(TimeSpan.FromSeconds(10))
+                        ? this.Fail("マテリア装着の画面が閉じません")
+                        : TaskResult.Running;
+                }
+
                 this.openedByUs = false;
                 return TaskResult.Done;
         }
@@ -295,25 +307,48 @@ public sealed unsafe class MeldTask : AutoTask
 
     private bool FindTargetSlot(byte slotCount)
     {
-        var im = InventoryManager.Instance();
-        foreach (var type in Inventory.Bags)
+        if (FindInBags(this.need.TargetItemId, this.need.TargetHq, slotCount, out var type, out var slot))
         {
-            var c = im->GetInventoryContainer(type);
+            this.targetType = type;
+            this.targetSlot = slot;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>付ける対象の品がカバンにあるか（HQ 指定なら HQ）。穴の数は問わない（事前点検用）。</summary>
+    public static bool InBags(uint itemId, bool hq)
+        => FindInBags(itemId, hq, null, out _, out _);
+
+    /// <summary>
+    /// カバンの中で対象の品を探す。<paramref name="slotCount"/> を渡したら、穴がまだ空いているものだけ
+    /// （穴が無い品には付けられない。禁断は扱わない）。
+    /// </summary>
+    private static bool FindInBags(uint itemId, bool hq, byte? slotCount, out InventoryType type, out int slot)
+    {
+        type = default;
+        slot = -1;
+        var im = InventoryManager.Instance();
+        if (im == null)
+            return false;
+        foreach (var t in Inventory.Bags)
+        {
+            var c = im->GetInventoryContainer(t);
             if (c == null || !c->IsLoaded)
                 continue;
             for (var i = 0; i < c->Size; i++)
             {
                 var s = c->GetInventorySlot(i);
-                if (s == null || s->ItemId != this.need.TargetItemId)
+                if (s == null || s->ItemId != itemId)
                     continue;
-                if (this.need.TargetHq && (s->Flags & InventoryItem.ItemFlags.HighQuality) == 0)
+                if (hq && (s->Flags & InventoryItem.ItemFlags.HighQuality) == 0)
                     continue;
-                // 穴が無い品には付けられない（禁断は扱わない）。穴が残っているものだけ
-                if (slotCount == 0 || s->GetMateriaCount() >= slotCount)
+                if (slotCount is { } n && (n == 0 || s->GetMateriaCount() >= n))
                     continue;
 
-                this.targetType = type;
-                this.targetSlot = i;
+                type = t;
+                slot = i;
                 return true;
             }
         }

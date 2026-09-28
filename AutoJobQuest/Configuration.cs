@@ -90,6 +90,12 @@ public sealed class Configuration : IPluginConfiguration
     /// <summary>こちらの GBR リスト「AutoJobQuest」を有効にしたままか。</summary>
     public bool GbrOwnListActive { get; set; }
 
+    /// <summary>
+    /// 一時的に無効にしたが、戻すときに1つに決まらなかった（見つからない・同じ名前が複数ある）GBR のリスト。
+    /// 自動ではやり直さない（時間がたっても変わらないため）。画面に出し、利用者が GBR で確かめて「確認した」を押すまで残す。
+    /// </summary>
+    public List<GbrListRef> GbrUnresolvedListRefs { get; set; } = [];
+
     [NonSerialized]
     private Dalamud.Plugin.IDalamudPluginInterface? pluginInterface;
 

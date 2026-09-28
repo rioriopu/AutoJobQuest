@@ -30,6 +30,9 @@ public sealed class MoveToTask : AutoTask
     private bool reloadRequested;
     private DateTime mountTriedAt = DateTime.MinValue;
 
+    // ショップ等の画面が開いたので、自分の移動を止めて待っている（閉じたら経路を引き直す）
+    private bool pausedByUi;
+
     public MoveToTask(Vector3 destination, float range, string label, TimeSpan? limit = null)
     {
         this.destination = destination;
@@ -56,9 +59,23 @@ public sealed class MoveToTask : AutoTask
 
         if (GameUi.IsShopOrMarketOpen())
         {
+            // 移動を始めた後に画面が開いたら、自分の移動を止める（以前は新しい移動を頼まないだけで、
+            // 走っている移動はそのまま続いていた＝画面が開いている間は移動しない、という決まりを満たしていなかった）。
+            // 経路の計算中に止めても、計算が終わると遅れて動き出すので、開いている間は毎回見て止める
+            if (this.started || this.pausedByUi)
+            {
+                this.pausedByUi = true;
+                this.started = false;
+                if (ctx.Navmesh.IsFollowingPath())
+                    ctx.Navmesh.Stop();
+            }
+
             this.Status = "ショップ等の画面が開いているので待っています";
             return TaskResult.Running;
         }
+
+        // 画面が閉じた。止めていた移動は経路を引き直して続ける（retries は数えない）
+        this.pausedByUi = false;
 
         if (GameUi.BetweenAreas)
         {
@@ -126,7 +143,7 @@ public sealed class MoveToTask : AutoTask
 
     public override void Cleanup(TaskContext ctx)
     {
-        if (this.started && ctx.Navmesh.IsMoving())
+        if ((this.started || this.pausedByUi) && ctx.Navmesh.IsMoving())
             ctx.Navmesh.Stop();
     }
 
