@@ -1,0 +1,647 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Numerics;
+using System.Threading.Tasks;
+using AutoJobQuest.Core;
+using AutoJobQuest.Data;
+using AutoJobQuest.Planning;
+
+namespace AutoJobQuest.Automation;
+
+/// <summary>
+/// 全体の流れ。
+///
+///   ① ゲームデータの読み込みを待つ
+///   ② 事前点検（レベル・装備・プラグイン等）。動作保証外の項目があれば確認窓を出す
+///   ③ 秘伝書が要るか調べる（要るなら、紫貨のための収集品の個数を逆算して素材の計画に足す）
+///   ④ 素材集め（周回）：マーケット → NPC購入 → マップごとに戦闘→採集 → 残りの採集 → 釣り
+///      周回ごとに計画を立て直し、失敗した入手手段は次の周回で別の手段にする
+///   ⑤ 秘伝書：クエスト「職人の新たなお仕事」→ 収集品を作る → 納品 → 交換 → 読む
+///   ⑥ グリダニアの宿屋で製作（HQ が足りなければ ④ に戻る）
+///   ⑦ マテリア装着
+///   ⑧ ジョブクエを Questionable で1本ずつ
+/// </summary>
+public sealed class JobQuestFlow : AutoTask
+{
+    private enum Stage
+    {
+        WaitData,
+        Preflight,
+        WaitPreflightAnswer,
+        BookPrep,
+        WaitBookData,
+        Acquire,
+        Books,
+        Craft,
+        Meld,
+        Quests,
+        Done,
+    }
+
+    private readonly bool[] selected;
+    private Stage stage = Stage.WaitData;
+    private AutoTask? child;
+    private int confirmTicket = -1;
+    private int round;
+
+    // 入手に失敗した手段（品目 → 手段）
+    private readonly Dictionary<uint, HashSet<Route>> excluded = [];
+
+    // 今の周回で作った作業（終わったあとに失敗した品目を集めるため）
+    private readonly List<AutoTask> roundTasks = [];
+
+    // 秘伝書
+    private Task<BookData>? bookBuild;
+    private BookData? books;
+    private List<BookOffer> booksToBuy = [];
+    private int collectablesToMake;
+    private bool booksDone;
+
+    public JobQuestFlow(bool[] selected)
+    {
+        this.selected = selected;
+    }
+
+    public override string Name => "ジョブクエ自動化";
+
+    protected override TaskResult OnStart(TaskContext ctx)
+    {
+        MarketBoardTask.SpentThisRun = 0;
+        ctx.Data.EnsureBuilding();
+        return TaskResult.Running;
+    }
+
+    protected override TaskResult Tick(TaskContext ctx)
+    {
+        // 子の作業が動いていればそれを進める
+        if (this.child != null)
+        {
+            var r = this.child.Step(ctx);
+            this.Status = $"{this.child.Name}: {this.child.Status}";
+            if (r == TaskResult.Running)
+                return TaskResult.Running;
+
+            this.child.Cleanup(ctx);
+            var failed = r == TaskResult.Failed ? this.child.FailReason : null;
+            this.child = null;
+            if (failed != null)
+                return this.Fail(failed);
+
+            return this.AfterChild(ctx);
+        }
+
+        switch (this.stage)
+        {
+            case Stage.WaitData:
+                if (ctx.Data.BuildError != null)
+                    return this.Fail($"ゲームデータを読めませんでした: {ctx.Data.BuildError}");
+                if (!ctx.Data.IsReady)
+                {
+                    this.Status = "ゲームデータを読み込んでいます";
+                    return this.Elapsed > TimeSpan.FromMinutes(3) ? this.Fail("ゲームデータの読み込みが終わりません") : TaskResult.Running;
+                }
+
+                this.stage = Stage.Preflight;
+                return TaskResult.Running;
+
+            case Stage.Preflight:
+                return this.RunPreflight(ctx);
+
+            case Stage.WaitPreflightAnswer:
+            {
+                var ans = ctx.Confirm.Poll(this.confirmTicket);
+                if (ans == null)
+                    return TaskResult.Running;
+                if (ans == false)
+                    return this.Fail("事前点検の確認で「いいえ」が選ばれました");
+                this.stage = Stage.BookPrep;
+                return TaskResult.Running;
+            }
+
+            case Stage.BookPrep:
+                return this.PrepareBooks(ctx);
+
+            case Stage.WaitBookData:
+                return this.WaitBookData(ctx);
+
+            case Stage.Acquire:
+                return this.StartAcquire(ctx);
+
+            case Stage.Books:
+                return this.StartBooks(ctx);
+
+            case Stage.Craft:
+                return this.StartCraft(ctx);
+
+            case Stage.Meld:
+                return this.StartMeld(ctx);
+
+            case Stage.Quests:
+                return this.StartQuests(ctx);
+
+            case Stage.Done:
+                return TaskResult.Done;
+        }
+
+        return TaskResult.Running;
+    }
+
+    private JobQuestPlan Plan(TaskContext ctx) => PlanBuilder.Build(ctx.Data, this.selected, this.excluded);
+
+    // ------------------------------------------------------------------
+    // ② 事前点検
+
+    private TaskResult RunPreflight(TaskContext ctx)
+    {
+        var plan = this.Plan(ctx);
+        if (plan.NothingToDo)
+        {
+            ctx.Log.Write("計画", "選んだジョブのジョブクエは、すべて完了しています");
+            this.stage = Stage.Done;
+            return TaskResult.Running;
+        }
+
+        ctx.Log.Write("計画", $"残りのジョブクエ {plan.RemainingQuests.Count} 本／製作 {plan.Craft.Crafts.Sum(c => c.Crafts)} 回／足りない素材 {plan.Shortfalls.Count()} 品目");
+        foreach (var w in plan.Warnings)
+            ctx.Log.Warn("計画", w);
+
+        var items = Preflight.Run(ctx, plan);
+        var errors = items.Where(i => i.Severity == Severity.Error).ToList();
+        if (errors.Count > 0)
+        {
+            foreach (var e in errors)
+                ctx.Log.Warn("点検", e.Text);
+            return this.Fail($"事前点検で止めました：{string.Join(" / ", errors.Select(e => e.Text))}");
+        }
+
+        var warns = items.Where(i => i.Severity == Severity.Warn).ToList();
+        foreach (var w in warns)
+            ctx.Log.Warn("点検", w.Text);
+
+        if (warns.Count > 0)
+        {
+            this.confirmTicket = ctx.Confirm.Ask(
+                "動作保証外の項目があります",
+                Preflight.Premise + "\n\n" + string.Join("\n", warns.Select(w => "・" + w.Text)) + "\n\nこのまま続けますか？「いいえ」で止めます。");
+            this.stage = Stage.WaitPreflightAnswer;
+            return TaskResult.Running;
+        }
+
+        this.stage = Stage.BookPrep;
+        return TaskResult.Running;
+    }
+
+    // ------------------------------------------------------------------
+    // ③ 秘伝書の下準備
+
+    private TaskResult PrepareBooks(TaskContext ctx)
+    {
+        var plan = this.Plan(ctx);
+        var tomes = plan.Craft.LockedBySecretBook.Select(c => c.SecretRecipeBookId).Distinct().ToList();
+        if (tomes.Count == 0)
+        {
+            this.booksDone = true;
+            this.stage = Stage.Acquire;
+            return TaskResult.Running;
+        }
+
+        var sheet = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.SecretRecipeBook>();
+        var bookItems = tomes.Select(t => sheet.TryGetRow(t, out var r) ? r.Item.RowId : 0).Where(x => x != 0).ToList();
+        var collectable = ctx.Config.ScripCollectableItemId;
+        ctx.Log.Write("秘伝書", $"未読の秘伝書：{string.Join("、", bookItems.Select(CraftPlanner.ItemName))}");
+        this.bookBuild = Task.Run(() => BookData.Build(bookItems, collectable));
+        this.stage = Stage.WaitBookData;
+        return TaskResult.Running;
+    }
+
+    private TaskResult WaitBookData(TaskContext ctx)
+    {
+        if (this.bookBuild == null || !this.bookBuild.IsCompleted)
+        {
+            this.Status = "秘伝書・収集品のデータを調べています";
+            return TaskResult.Running;
+        }
+
+        if (this.bookBuild.IsFaulted)
+            return this.Fail($"秘伝書のデータを読めませんでした: {this.bookBuild.Exception?.GetBaseException().Message}");
+
+        this.books = this.bookBuild.Result;
+        foreach (var n in this.books.Notes)
+            ctx.Log.Warn("秘伝書", n);
+
+        var offers = this.books.Offers.Values.Where(o => !ExchangeBooksTask.IsLearned(o.TomeId)).ToList();
+        this.booksToBuy = offers.Where(o => Inventory.CountNow(o.BookItemId) == 0).ToList();
+
+        var price = this.booksToBuy.Sum(o => (int)o.Price);
+        var scrips = this.booksToBuy.Count > 0 ? Inventory.CountSpecialCurrency(this.booksToBuy[0].SpecialCurrencyId, out _) : 0;
+        var scripNeed = Math.Max(0, price - scrips);
+        var held = Inventory.CountCollectables(this.books.CollectableItemId, this.books.MinCollectability);
+
+        // 1個あたりの報酬は、確実に足りるよう「低」で見積もる（シーダーロングボウは 45。最高評価なら 54）
+        this.collectablesToMake = this.books.RewardLow > 0
+            ? Math.Max(0, (int)Math.Ceiling(scripNeed / (double)this.books.RewardLow) - held)
+            : 0;
+
+        ctx.Log.Write("秘伝書",
+            $"交換 {this.booksToBuy.Count} 冊（紫貨 {price}）、所持 {scrips}、不足 {scripNeed}。"
+            + $"{CraftPlanner.ItemName(this.books.CollectableItemId)} を {this.collectablesToMake} 個作ります"
+            + $"（1個 {this.books.RewardLow}〜{this.books.RewardHigh}、手持ちの収集品 {held} 個）");
+
+        this.stage = Stage.Acquire;
+        return TaskResult.Running;
+    }
+
+    /// <summary>素材計画に足す、紫貨のための収集品。</summary>
+    private IEnumerable<QuestItemReq> ExtraTargets()
+    {
+        if (this.booksDone || this.books == null || this.collectablesToMake <= 0)
+            yield break;
+
+        yield return new QuestItemReq(this.books.CollectableItemId, this.collectablesToMake, false, "紫貨のための収集品");
+    }
+
+    // ------------------------------------------------------------------
+    // ④ 素材集め
+
+    private TaskResult StartAcquire(TaskContext ctx)
+    {
+        var plan = this.Plan(ctx);
+        var extra = this.ExtraTargets().ToList();
+        var craftAll = plan.Craft;
+        if (extra.Count > 0)
+            craftAll = ctx.Data.Planner!.Build(plan.RemainingQuests.SelectMany(q => q.Items).Concat(extra), Inventory.Snapshot(), PlanBuilder.IsBookUnlocked);
+
+        var raw = craftAll.RawShortfall
+            .Select(kv => (Item: kv.Key, Need: kv.Value, Routes: this.RoutesFor(ctx, kv.Key)))
+            .ToList();
+
+        var marketMateria = MateriaMarketNeeds(plan);
+
+        if (raw.Count == 0 && marketMateria.Count == 0)
+        {
+            this.stage = this.booksDone ? Stage.Craft : Stage.Books;
+            return TaskResult.Running;
+        }
+
+        if (this.round++ >= ctx.Config.MaxRetryRounds + 2)
+        {
+            var left = string.Join("、", raw.Select(r => $"{CraftPlanner.ItemName(r.Item)}×{r.Need}").Concat(marketMateria.Select(m => m.Label)));
+            return this.Fail($"何度集めても足りない素材があります：{left}");
+        }
+
+        ctx.Log.Write("素材", $"{this.round}周目：{raw.Count} 品目{(marketMateria.Count > 0 ? $"＋マテリア {marketMateria.Count} 件" : string.Empty)}を集めます");
+
+        var unknown = raw.Where(r => r.Routes.Count == 0).ToList();
+        if (unknown.Count > 0)
+            return this.Fail($"入手手段が残っていない素材があります：{string.Join("、", unknown.Select(r => $"{CraftPlanner.ItemName(r.Item)}×{r.Need}"))}");
+
+        this.roundTasks.Clear();
+        var steps = new List<Func<TaskContext, AutoTask?>>();
+
+        // 1) マーケット（クリスタル・クラスター・霊砂・デミマテリラ・マテリアなど）
+        var inv = Inventory.Snapshot();
+        var market = raw.Where(r => r.Routes[0] == Route.MarketBoard)
+            .Select(r => new MarketNeed([r.Item], r.Need, CraftPlanner.ItemName(r.Item), inv.CountAll(r.Item) + r.Need))
+            .Concat(marketMateria)
+            .ToList();
+        if (market.Count > 0)
+            steps.Add(c => this.Track(new MarketBoardTask(market, c.MarketWatcher)));
+
+        // 2) NPC 購入
+        var vendor = raw.Where(r => r.Routes[0] == Route.Vendor).Select(r => new VendorNeed(r.Item, r.Need)).ToList();
+        if (vendor.Count > 0)
+            steps.Add(_ => this.Track(new VendorTask(vendor)));
+
+        // 3) マップごとに：戦闘 → 同じマップで採れる素材の採集
+        var combat = raw.Where(r => r.Routes[0] == Route.Combat).ToDictionary(r => r.Item, r => r.Need);
+        var gather = raw.Where(r => r.Routes[0] == Route.Gather).ToList();
+        var gatheredInMap = new HashSet<uint>();
+        if (combat.Count > 0)
+        {
+            var combatJob = CombatJobPicker.Pick();
+            if (combatJob == null)
+                return this.Fail("戦闘に使えるジョブ（ギアセットのある戦闘ジョブ）がありません");
+
+            foreach (var (terr, needs, spots) in CombatPlanner.Plan(ctx.Data.Sources!, combat))
+            {
+                Vector3? firstSpot = spots.Count > 0 ? MapCoords.ToWorld(terr, spots[0].X, spots[0].Y) : null;
+                steps.Add(_ => new EquipJobTask(combatJob.Value.ClassJob));
+                steps.Add(_ => new TeleportTask(terr, firstSpot));
+                steps.Add(_ => this.Track(new CombatTask(terr, needs, spots, TimeSpan.FromMinutes(25))));
+
+                var here = gather.Where(g => ctx.Gbr.GatherableTerritories(g.Item)?.Contains(terr) == true).ToList();
+                foreach (var g in here)
+                    gatheredInMap.Add(g.Item);
+                if (here.Count > 0)
+                {
+                    steps.Add(_ => this.Track(new GatherTask(
+                        here.Select(g => new GatherNeed(g.Item, g.Need)), terr,
+                        $"{TeleportTask.TerritoryName(terr)} で採集", TimeSpan.FromMinutes(40))));
+                }
+            }
+        }
+
+        // 4) 残りの採集（シャード含む）。GBR が場所とジョブを選ぶ
+        var rest = gather.Where(g => !gatheredInMap.Contains(g.Item)).ToList();
+        if (rest.Count > 0)
+        {
+            steps.Add(_ => this.Track(new GatherTask(
+                rest.Select(g => new GatherNeed(g.Item, g.Need)), null, "採掘・園芸", TimeSpan.FromMinutes(90))));
+        }
+
+        // 5) 釣り（GBR の釣果送信の同意が ON のときだけ。OFF なら手を出さずに記録する）
+        var fish = raw.Where(r => r.Routes[0] == Route.Fish).ToList();
+        if (fish.Count > 0)
+        {
+            if (ctx.Gbr.ReadAutoGatherBool("FishDataCollection") == true)
+            {
+                steps.Add(_ => this.Track(new GatherTask(
+                    fish.Select(f => new GatherNeed(f.Item, f.Need)), null, "釣り", TimeSpan.FromMinutes(90))));
+            }
+            else
+            {
+                foreach (var f in fish)
+                {
+                    ctx.Log.Warn("釣り", $"{CraftPlanner.ItemName(f.Item)}×{f.Need}：GBR の釣果送信の同意が OFF のため釣れません（GBR の設定で ON にするかは利用者の判断です）");
+                    this.Exclude(f.Item, Route.Fish);
+                }
+            }
+        }
+
+        this.child = new SequenceTask($"素材集め {this.round}周目", steps);
+        return TaskResult.Running;
+    }
+
+    private List<Route> RoutesFor(TaskContext ctx, uint item)
+    {
+        var routes = PlanBuilder.ChooseRoutes(ctx.Data.Sources!, item);
+        if (this.excluded.TryGetValue(item, out var bad))
+            routes = routes.Where(r => !bad.Contains(r)).ToList();
+        return routes;
+    }
+
+    /// <summary>マテリア装着に要るマテリアのうち、カバンに無いもの（マーケットで買う）。</summary>
+    private static List<MarketNeed> MateriaMarketNeeds(JobQuestPlan plan)
+    {
+        var list = new List<MarketNeed>();
+        var specific = new Dictionary<uint, int>();
+        foreach (var m in plan.Materia.Where(m => !m.AlreadyMelded))
+        {
+            if (m.MateriaItemId is { } mid)
+            {
+                specific[mid] = specific.GetValueOrDefault(mid) + 1;
+                continue;
+            }
+
+            var candidates = MateriaCatalog.CandidatesFor(m.TargetItemId);
+            if (candidates.Any(c => Inventory.CountNow(c) > 0))
+                continue;
+            list.Add(new MarketNeed(candidates, 1, $"{CraftPlanner.ItemName(m.TargetItemId)} に付けるマテリア（種類不問）"));
+        }
+
+        foreach (var (mid, count) in specific)
+        {
+            var owned = Inventory.CountNow(mid);
+            if (owned < count)
+                list.Add(new MarketNeed([mid], count - owned, CraftPlanner.ItemName(mid), count));
+        }
+
+        return list;
+    }
+
+    private AutoTask Track(AutoTask t)
+    {
+        this.roundTasks.Add(t);
+        return t;
+    }
+
+    private void Exclude(uint item, Route route)
+    {
+        if (!this.excluded.TryGetValue(item, out var set))
+            this.excluded[item] = set = [];
+        set.Add(route);
+    }
+
+    /// <summary>周回の作業から、失敗した品目と手段を集める（次の周回で別の手段にする）。</summary>
+    private void CollectFailures(TaskContext ctx)
+    {
+        foreach (var t in this.roundTasks)
+        {
+            switch (t)
+            {
+                case MarketBoardTask m:
+                    foreach (var id in m.UnfinishedItems)
+                        this.Exclude(id, Route.MarketBoard);
+                    break;
+                case VendorTask v:
+                    foreach (var id in v.Unfinished)
+                        this.Exclude(id, Route.Vendor);
+                    break;
+                case CombatTask c:
+                    foreach (var id in c.Unfinished)
+                        this.Exclude(id, Route.Combat);
+                    break;
+                case GatherTask g:
+                    foreach (var id in g.Unfinished)
+                    {
+                        // 採集と釣りのどちらで失敗したかは品目の入手元で決める
+                        var s = ctx.Data.Sources!.Get(id);
+                        this.Exclude(id, s.CanGather ? Route.Gather : Route.Fish);
+                    }
+
+                    break;
+            }
+        }
+
+        this.roundTasks.Clear();
+    }
+
+    // ------------------------------------------------------------------
+    // ⑤ 秘伝書
+
+    private TaskResult StartBooks(TaskContext ctx)
+    {
+        if (this.books == null || this.booksDone)
+        {
+            this.stage = Stage.Craft;
+            return TaskResult.Running;
+        }
+
+        var town = this.books.ChooseTown();
+        if (town == null)
+            return this.Fail("収集品納品窓口とスクリップ取引窓口のある街に、解放済みのエーテライトがありません");
+
+        var steps = new List<Func<TaskContext, AutoTask?>>();
+        var b = this.books;
+
+        if (b.RequiredQuest != 0 && !FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(b.RequiredQuest))
+        {
+            var qname = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Quest>().TryGetRow(b.RequiredQuest, out var q) ? q.Name.ExtractText() : b.RequiredQuest.ToString();
+            steps.Add(_ => new RunQuestTask(b.RequiredQuest, qname));
+        }
+
+        if (this.collectablesToMake > 0)
+        {
+            steps.Add(_ => new GoToInnTask());
+            steps.Add(c =>
+            {
+                // 収集品の製作（中間素材から）。この時点の所持数で計画し直す
+                var held = Inventory.CountCollectables(b.CollectableItemId, b.MinCollectability);
+                var make = Math.Max(0, this.collectablesToMake - held);
+                if (make == 0)
+                    return null;
+
+                var plan = c.Data.Planner!.Build([new QuestItemReq(b.CollectableItemId, make, false, string.Empty)], Inventory.Snapshot(), PlanBuilder.IsBookUnlocked);
+                if (plan.RawShortfall.Count > 0)
+                {
+                    c.Log.Warn("秘伝書", $"収集品の素材が足りません：{string.Join("、", plan.RawShortfall.Select(x => $"{CraftPlanner.ItemName(x.Key)}×{x.Value}"))}");
+                    return null;
+                }
+
+                return new SequenceTask("収集品の製作", plan.Crafts.Select(pc => (Func<TaskContext, AutoTask?>)(_ => new CraftOneTask(pc))));
+            });
+        }
+
+        steps.Add(_ => new DeliverCollectablesTask(b, town.Value.Collect));
+        steps.Add(_ =>
+        {
+            var left = this.booksToBuy.Where(o => !ExchangeBooksTask.IsLearned(o.TomeId) && Inventory.CountNow(o.BookItemId) == 0).ToList();
+            return left.Count == 0 ? null : new ExchangeBooksTask(b, town.Value.Scrip, left);
+        });
+        steps.Add(_ =>
+        {
+            var toUse = b.Offers.Values.Where(o => !ExchangeBooksTask.IsLearned(o.TomeId) && Inventory.CountNow(o.BookItemId) > 0).ToList();
+            return toUse.Count == 0 ? null : new UseBooksTask(toUse);
+        });
+
+        this.child = new SequenceTask("秘伝書", steps);
+        return TaskResult.Running;
+    }
+
+    // ------------------------------------------------------------------
+    // ⑥ 製作
+
+    private TaskResult StartCraft(TaskContext ctx)
+    {
+        var plan = this.Plan(ctx);
+        if (plan.Craft.Crafts.Count == 0)
+        {
+            this.stage = Stage.Meld;
+            return TaskResult.Running;
+        }
+
+        if (plan.Craft.RawShortfall.Count > 0)
+        {
+            // 素材が足りない（製作で NQ ができて作り直しが要る等）→ 集め直す
+            this.stage = Stage.Acquire;
+            return TaskResult.Running;
+        }
+
+        if (plan.Craft.LockedBySecretBook.Count > 0)
+            return this.Fail($"秘伝書が未読のため作れない品があります：{string.Join("、", plan.Craft.LockedBySecretBook.Select(c => CraftPlanner.ItemName(c.ItemId)))}");
+
+        if (this.round++ > ctx.Config.MaxRetryRounds + 4)
+            return this.Fail("何度作っても納品物がそろいません（HQ ができない等）");
+
+        var steps = new List<Func<TaskContext, AutoTask?>> { _ => new GoToInnTask() };
+        foreach (var c in plan.Craft.Crafts)
+            steps.Add(_ => new CraftOneTask(c));
+
+        this.child = new SequenceTask("グリダニアの宿屋で製作", steps);
+        return TaskResult.Running;
+    }
+
+    // ------------------------------------------------------------------
+    // ⑦ マテリア装着
+
+    private TaskResult StartMeld(TaskContext ctx)
+    {
+        var plan = this.Plan(ctx);
+        var needs = plan.Materia.Where(m => !m.AlreadyMelded).ToList();
+        if (needs.Count == 0)
+        {
+            this.stage = Stage.Quests;
+            return TaskResult.Running;
+        }
+
+        // マテリアが無ければ集め直す
+        if (MateriaMarketNeeds(plan).Count > 0)
+        {
+            this.stage = Stage.Acquire;
+            return TaskResult.Running;
+        }
+
+        this.child = new SequenceTask("マテリア装着", needs.Select(m => (Func<TaskContext, AutoTask?>)(_ => new MeldTask(m))));
+        return TaskResult.Running;
+    }
+
+    // ------------------------------------------------------------------
+    // ⑧ クエスト
+
+    private TaskResult StartQuests(TaskContext ctx)
+    {
+        var plan = this.Plan(ctx);
+        if (plan.NothingToDo)
+        {
+            this.stage = Stage.Done;
+            return TaskResult.Running;
+        }
+
+        // 納品物がそろっていないクエストがあれば、製作からやり直す
+        if (plan.Craft.Crafts.Count > 0)
+        {
+            this.stage = Stage.Craft;
+            return TaskResult.Running;
+        }
+
+        if (plan.Materia.Any(m => !m.AlreadyMelded))
+        {
+            this.stage = Stage.Meld;
+            return TaskResult.Running;
+        }
+
+        this.child = new SequenceTask("ジョブクエ", plan.RemainingQuests.Select(q => (Func<TaskContext, AutoTask?>)(_ => new QuestTask(q))));
+        return TaskResult.Running;
+    }
+
+    // ------------------------------------------------------------------
+
+    private TaskResult AfterChild(TaskContext ctx)
+    {
+        switch (this.stage)
+        {
+            case Stage.Acquire:
+                // 失敗した手段を記録し、立て直す（足りていれば StartAcquire の中で次の段へ進む）
+                this.CollectFailures(ctx);
+                break;
+            case Stage.Books:
+                this.booksDone = true;
+                this.stage = Stage.Craft;
+                break;
+            case Stage.Meld:
+                this.stage = Stage.Quests;
+                break;
+
+            // Craft・Quests は同じ段で立て直す（足りない品があれば作り直し、残りが無ければ次へ）
+        }
+
+        return TaskResult.Running;
+    }
+
+    public override void Cleanup(TaskContext ctx)
+    {
+        if (this.child != null)
+        {
+            this.child.Cleanup(ctx);
+            this.child = null;
+        }
+
+        // 念のため、他プラグインへ頼んでいたことを全部戻す
+        ctx.Rotation.ClearOwnPriorities();
+        ctx.Gbr.RestoreGatherLists();
+        ctx.Gbr.RestoreConfig();
+        ctx.TextAdvance.ReleaseControl();
+        ctx.YesAlready.Release();
+    }
+}

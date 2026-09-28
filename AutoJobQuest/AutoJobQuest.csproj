@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+
+  <!--
+    TargetFramework / LangVersion / Platforms / Nullable / AllowUnsafeBlocks /
+    DalamudLibPath / DalamudPackager の参照は Dalamud.NET.Sdk の既定値を使う。
+  -->
+  <PropertyGroup>
+    <Version>0.1.0.0</Version>
+    <RootNamespace>AutoJobQuest</RootNamespace>
+    <AssemblyName>AutoJobQuest</AssemblyName>
+    <Description>製作系ジョブクエ（Lv1〜60）の素材集め・製作・マテリア装着・クエスト進行を自動で行う</Description>
+    <Authors>rioriopu</Authors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- manifest 本体。DalamudPackager が InternalName / AssemblyVersion / DalamudApiLevel を補完する -->
+    <Content Include="AutoJobQuest.json" />
+  </ItemGroup>
+
+  <!-- ビルド時刻をアセンブリへ埋め込む（古い DLL が動いていないかの切り分け用） -->
+  <ItemGroup>
+    <AssemblyMetadata Include="BuildTime" Value="$([System.DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))" />
+  </ItemGroup>
+
+  <!--
+    ECommons は使っていない（画面操作・コールバックは FFXIVClientStructs で直接書いた）。
+    初期化せずに同梱すると紛らわしいので参照しない。
+  -->
+  <ItemGroup>
+    <!-- モンスターのドロップ表と出現位置（ゲームデータに無いため）。Artisan 導入版と同じ版 -->
+    <PackageReference Include="LuminaSupplemental.Excel" Version="4.3.3" />
+  </ItemGroup>
+
+  <!--
+    ビルドしたら dev プラグインの置き場へコピーする。
+    DalamudPackager が manifest を作った後に走らせる（AfterTargets="Build" だと manifest が無い）。
+    依存 DLL（ECommons・LuminaSupplemental とその依存）も一緒に置く。
+  -->
+  <PropertyGroup>
+    <DeployDir Condition="'$(Configuration)' == 'Release'">C:\自作プラグイン\AutoJobQuest\</DeployDir>
+  </PropertyGroup>
+
+  <Target Name="DeployToPluginFolder"
+          AfterTargets="DefaultDalamudPackagerRelease;DefaultDalamudPackagerDebug"
+          Condition="'$(DeployDir)' != ''">
+    <ItemGroup>
+      <DeployFiles Include="$(OutputPath)*.dll;$(OutputPath)*.json" />
+    </ItemGroup>
+    <MakeDir Directories="$(DeployDir)" />
+    <Copy SourceFiles="@(DeployFiles)" DestinationFolder="$(DeployDir)" ContinueOnError="true">
+      <Output TaskParameter="CopiedFiles" ItemName="ActuallyCopied" />
+    </Copy>
+    <Warning Condition="'@(ActuallyCopied)' == ''"
+             Text="配置できませんでした。ゲームが DLL を掴んでいる可能性があります。もう一度ビルドしてください。" />
+    <Message Condition="'@(ActuallyCopied)' != ''" Importance="high" Text="配置しました: $(DeployDir)" />
+    <Warning Condition="!Exists('$(DeployDir)$(AssemblyName).json')"
+             Text="manifest（$(AssemblyName).json）が配置されていません。このままでは Dalamud の一覧に出ません。" />
+  </Target>
+
+</Project>

@@ -1,0 +1,8 @@
+{
+  "Author": "rioriopu",
+  "Name": "AutoJobQuest",
+  "Punchline": "製作系ジョブクエを素材集めから報告まで自動で進める",
+  "Description": "木工〜調理の8職のジョブクエ（Lv1〜60）について、必要な素材を採集・購入・討伐で集め、グリダニアの宿屋で製作し、マテリアを装着して、Questionable でクエストを進めます。\n\nArtisan・GatherBuddyReborn・vnavmesh・AutoHook・Lifestream・Questionable・RotationSolverReborn・TextAdvance が必要です。",
+  "Tags": [ "crafting", "quest", "automation" ],
+  "RepoUrl": ""
+}

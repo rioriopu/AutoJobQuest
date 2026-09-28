@@ -1,0 +1,71 @@
+namespace AutoJobQuest.Ipc;
+
+/// <summary>
+/// TextAdvance への窓口（導入版 3.3.0.1 を正とする）。
+///
+/// Questionable は動いている間、自分で TextAdvance の外部制御を取る（納品の自動入力も含む）。
+/// こちらが外部制御を取るのは、Questionable が止まる手順（木工 Lv20 のマテリア装着待ち）を
+/// 自前で報告するときだけ。使い終わったら必ず解除する（他者が制御中だと Questionable が取りに行けない）。
+///
+/// 【導入版の納品】アイテムを選ぶ小窓の先頭を常に選ぶ。品質（NQ/HQ）の指定項目は導入版に無い。
+/// </summary>
+public sealed class TextAdvanceIpc : IpcGate
+{
+    public override string InternalName => "TextAdvance";
+
+    /// <summary>TextAdvance の ExternalTerritoryConfig と同じ名前の項目（null は本体設定のまま）。</summary>
+    public sealed class ExternalTerritoryConfig
+    {
+        public bool? EnableQuestAccept;
+        public bool? EnableQuestComplete;
+        public bool? EnableRewardPick;
+        public bool? EnableRequestHandin;
+        public bool? EnableCutsceneEsc;
+        public bool? EnableCutsceneSkipConfirm;
+        public bool? EnableTalkSkip;
+        public bool? EnableRequestFill;
+        public bool? EnableAutoInteract;
+    }
+
+    private bool ownControl;
+
+    /// <summary>報告（会話送り・納品の入力・受け渡し）を任せる設定で外部制御を取る。</summary>
+    public bool TakeControlForTurnIn()
+    {
+        var cfg = new ExternalTerritoryConfig
+        {
+            EnableQuestAccept = true,
+            EnableQuestComplete = true,
+            EnableRewardPick = true,
+            EnableRequestHandin = true,
+            EnableCutsceneEsc = true,
+            EnableCutsceneSkipConfirm = true,
+            EnableTalkSkip = true,
+            EnableRequestFill = true,
+            EnableAutoInteract = false,
+        };
+
+        var ok = this.TryInvoke("EnableExternalControl",
+                     () => this.Func<string, ExternalTerritoryConfig, bool>("TextAdvance.EnableExternalControl")
+                         .InvokeFunc(Plugin.InternalNameConst, cfg), out var accepted)
+                 && accepted;
+        if (ok)
+            this.ownControl = true;
+        return ok;
+    }
+
+    /// <summary>こちらが取った外部制御を解除する。</summary>
+    public void ReleaseControl()
+    {
+        if (!this.ownControl)
+            return;
+
+        this.TryInvoke("DisableExternalControl",
+            () => this.Func<string, bool>("TextAdvance.DisableExternalControl").InvokeFunc(Plugin.InternalNameConst), out _);
+        this.ownControl = false;
+    }
+
+    public bool? IsInExternalControl()
+        => this.TryInvoke("IsInExternalControl",
+            () => this.Func<bool>("TextAdvance.IsInExternalControl").InvokeFunc(), out var v) ? v : null;
+}
