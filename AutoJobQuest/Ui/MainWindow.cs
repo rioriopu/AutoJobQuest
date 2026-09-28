@@ -168,31 +168,90 @@ public sealed class MainWindow : Window
                     sel[i] = all;
                 this.config.Save();
                 this.plan = null;
+                this.OnSelectionChanged();
             }
 
-            using var table = ImRaii.Table("##jobs", 4);
-            if (!table)
-                return;
-
-            for (var i = 0; i < Jobs.Crafters.Length; i++)
+            using (var table = ImRaii.Table("##jobs", 4))
             {
-                ImGui.TableNextColumn();
-                var v = sel[i];
-                var label = Jobs.CrafterShortNames[i];
-                if (this.plan != null)
+                if (table)
                 {
-                    var remaining = this.plan.RemainingQuests.Count(q => q.ClassJobId == Jobs.Crafters[i]);
-                    label += v ? $"（残り{remaining}本）" : string.Empty;
-                }
+                    for (var i = 0; i < Jobs.Crafters.Length; i++)
+                    {
+                        ImGui.TableNextColumn();
+                        var v = sel[i];
+                        var label = Jobs.CrafterShortNames[i];
+                        if (this.plan != null)
+                        {
+                            var remaining = this.plan.RemainingQuests.Count(q => q.ClassJobId == Jobs.Crafters[i]);
+                            label += v ? $"（残り{remaining}本）" : string.Empty;
+                        }
 
-                if (ImGui.Checkbox($"{label}##job{i}", ref v))
-                {
-                    sel[i] = v;
-                    this.config.Save();
-                    this.plan = null;
+                        if (ImGui.Checkbox($"{label}##job{i}", ref v))
+                        {
+                            sel[i] = v;
+                            this.config.Save();
+                            this.plan = null;
+                            this.OnSelectionChanged();
+                        }
+                    }
                 }
             }
         }
+
+        // 選んだジョブのうち、前提のクエスト（メインクエスト等）が未完了で進められないジョブクエ
+        // （チェックを入れた時点で、どのクエストが未達か分かるように）
+        var blocked = this.BlockedForSelection();
+        if (blocked == null)
+        {
+            if (sel.Any(x => x))
+                ImGui.TextColored(Grey, "（前提のクエストが未完了で進められないジョブクエは、ゲームデータの読み込み後にここへ出ます）");
+        }
+        else if (blocked.Count > 0)
+        {
+            ImGui.PushTextWrapPos(0);
+            ImGui.TextColored(Yellow, "⚠ 前提のクエストが未完了のため、次のジョブクエは進められません（開始すると確認が出ます。続けた場合は飛ばします）：");
+            foreach (var line in JobQuestPlan.SummarizeBlocked(blocked))
+                ImGui.TextColored(Yellow, $"　・{line}");
+            ImGui.PopTextWrapPos();
+        }
+    }
+
+    // 進められないジョブクエの控え（チェックを変えたとき・5秒ごとに調べ直す。毎フレームは調べない）
+    private List<BlockedQuest>? blockedCache;
+    private string blockedKey = string.Empty;
+    private DateTime blockedAt = DateTime.MinValue;
+
+    private void OnSelectionChanged()
+    {
+        // ゲームデータがまだなら読み始める（利用者がジョブを選んだとき＝使うと分かったときだけ。起動時には読まない）
+        this.Ctx.Data.EnsureBuilding();
+        this.blockedAt = DateTime.MinValue;
+    }
+
+    private List<BlockedQuest>? BlockedForSelection()
+    {
+        var data = this.Ctx.Data;
+        if (!data.IsReady || !Me.Available)
+            return null;
+
+        var key = string.Concat(this.config.SelectedCrafters.Select(x => x ? '1' : '0'));
+        if (this.blockedCache == null || key != this.blockedKey || DateTime.UtcNow - this.blockedAt > TimeSpan.FromSeconds(5))
+        {
+            try
+            {
+                this.blockedCache = PlanBuilder.FindBlocked(data, this.config.SelectedCrafters);
+            }
+            catch (Exception ex)
+            {
+                this.log.Warn("計画", $"進められないジョブクエを調べられませんでした: {ex.Message}");
+                this.blockedCache = [];
+            }
+
+            this.blockedKey = key;
+            this.blockedAt = DateTime.UtcNow;
+        }
+
+        return this.blockedCache;
     }
 
     private void StartFlow()
@@ -244,6 +303,16 @@ public sealed class MainWindow : Window
 
         foreach (var w in p.Warnings)
             ImGui.TextColored(Yellow, $"・{w}");
+
+        if (p.Blocked.Count > 0 && ImGui.CollapsingHeader($"前提が未完了で進められないジョブクエ（{p.Blocked.Count}）　※計画には入れていません", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            ImGui.PushTextWrapPos(0);
+            foreach (var line in p.BlockedSummary())
+                ImGui.TextColored(Yellow, $"  {line}");
+            foreach (var b in p.Blocked)
+                ImGui.TextUnformatted($"    {Jobs.Name(b.Quest.ClassJobId)} {b.Quest}：{b.Reason}");
+            ImGui.PopTextWrapPos();
+        }
 
         if (ImGui.CollapsingHeader($"残りのジョブクエ（{p.RemainingQuests.Count}）"))
         {

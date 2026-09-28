@@ -273,8 +273,12 @@ public sealed class BookData
     /// 「秘伝書が未読」という別の段の理由で止まっていた（原因の段と止まる段が離れて調べにくい）。
     /// </summary>
     /// <param name="requiredBookItems">交換が要る秘伝書（アイテム ID）。</param>
-    public List<string> Validate(IEnumerable<uint> requiredBookItems)
+    /// <param name="currencyItem">特殊通貨の番号 → アイテム（省略時はゲームから：SpecialCurrency.ItemId。試すときに差し替える）。</param>
+    /// <param name="townAvailable">両方の窓口のある街に行けるか（省略時はゲームから：ChooseTown。試すときに差し替える）。</param>
+    public List<string> Validate(IEnumerable<uint> requiredBookItems, Func<byte, uint>? currencyItem = null, Func<bool>? townAvailable = null)
     {
+        currencyItem ??= SpecialCurrency.ItemId;
+        townAvailable ??= () => this.ChooseTown() != null;
         var problems = new List<string>();
         foreach (var b in requiredBookItems)
             if (!this.Offers.ContainsKey(b))
@@ -288,12 +292,12 @@ public sealed class BookData
             problems.Add($"収集品「{CraftPlanner.ItemName(this.CollectableItemId)}」を受け付ける納品窓口がゲームデータから見つかりません");
 
         // 納品でもらう通貨と、秘伝書の値段の通貨が同じ品か（違えば、いくら納品しても交換できない）
-        var rewardItem = SpecialCurrency.ItemId(this.RewardSpecialCurrencyId);
+        var rewardItem = currencyItem(this.RewardSpecialCurrencyId);
         if (rewardItem == 0)
             problems.Add($"納品の報酬の特殊通貨（番号 {this.RewardSpecialCurrencyId}）をアイテムに直せません");
         foreach (var o in this.Offers.Values)
         {
-            var costItem = SpecialCurrency.ItemId(o.SpecialCurrencyId);
+            var costItem = currencyItem(o.SpecialCurrencyId);
             if (costItem == 0)
                 problems.Add($"「{CraftPlanner.ItemName(o.BookItemId)}」の値段の特殊通貨（番号 {o.SpecialCurrencyId}）をアイテムに直せません");
             else if (rewardItem != 0 && costItem != rewardItem)
@@ -304,7 +308,7 @@ public sealed class BookData
 
         if (this.CollectableNpcs.Count == 0 || this.ScripNpcs.Count == 0)
             problems.Add("収集品納品窓口かスクリップ取引窓口の場所がゲームデータから引けません");
-        else if (this.ChooseTown() == null)
+        else if (!townAvailable())
             problems.Add("収集品納品窓口とスクリップ取引窓口のある街に、解放済みのエーテライトがありません");
 
         return problems;

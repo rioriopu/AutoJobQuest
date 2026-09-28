@@ -51,8 +51,7 @@ public sealed class JobQuestFlow : AutoTask
     // どちらも「進まなかった周回」を数える：製作が進んだ（残りの製作回数が減った）ら両方 0 に戻す
     // （途中で打ち切って立て直す形にしたので、全体の回数で数えると正常な多レシピの計画でも上限に当たる）
     private int acquireRound;
-    private int craftRound;
-    private int lastCraftRemaining = int.MaxValue;
+    private readonly ProgressRounds craftRounds = new();
 
     // 製作の列の打ち切り（材料が予定より少ないレシピに来たら、古い計画のまま進めず、残りを捨てて立て直す）
     private string? craftCut;
@@ -197,6 +196,10 @@ public sealed class JobQuestFlow : AutoTask
         var plan = this.Plan(ctx);
         if (plan.NothingToDo)
         {
+            // 残りが全部「前提が未達で進められない」なら、完了ではないので理由を出して止める
+            if (plan.Blocked.Count > 0)
+                return this.Fail($"進められるジョブクエがありません（前提のクエストが未完了）：{string.Join(" / ", plan.BlockedSummary())}");
+
             ctx.Log.Write("計画", "選んだジョブのジョブクエは、すべて完了しています");
             this.stage = Stage.Done;
             return TaskResult.Running;
@@ -345,7 +348,7 @@ public sealed class JobQuestFlow : AutoTask
         var scrips = Inventory.CountSpecialCurrency(b.RewardSpecialCurrencyId, out _);
         var scripNeed = Math.Max(0, price - scrips);
         var held = Inventory.CountCollectables(b.CollectableItemId, b.MinCollectability);
-        this.collectablesNeeded = b.RewardLow > 0 ? (int)Math.Ceiling(scripNeed / (double)b.RewardLow) : 0;
+        this.collectablesNeeded = BookMath.CollectablesNeeded(price, scrips, b.RewardLow);
 
         ctx.Log.Write("秘伝書",
             $"交換 {this.booksToBuy.Count} 冊（紫貨 {price}）、所持 {scrips}、不足 {scripNeed}。"
@@ -366,14 +369,7 @@ public sealed class JobQuestFlow : AutoTask
 
     /// <summary>計画で使う職のうち、ギアセットの無いもの（「職（品）」の並び）。全部あれば null。</summary>
     private static string? MissingGearsets(CraftPlan plan)
-    {
-        var missing = plan.Crafts
-            .GroupBy(c => c.ClassJobId)
-            .Where(g => GearCheck.FindGearset(g.Key) < 0)
-            .Select(g => $"{Jobs.Name(g.Key)}（{string.Join("・", g.Select(c => CraftPlanner.ItemName(c.ItemId)).Distinct())}）")
-            .ToList();
-        return missing.Count == 0 ? null : string.Join("、", missing);
-    }
+        => CraftCut.MissingGearsets(plan, job => GearCheck.FindGearset(job) >= 0);
 
     /// <summary>
     /// 素材計画に足す、紫貨のための収集品。
@@ -741,18 +737,11 @@ public sealed class JobQuestFlow : AutoTask
         // 進まない周回（HQ ができない等）が MaxRetryRounds+4 回（既定 7 回）続いたら止める。
         // 素材集めの周回も、製作が進んだら数え直す（HQ の作り直しで材料を集め直すのは「集めきれない」ではないため）
         var remaining = plan.Craft.Crafts.Sum(c => c.Crafts);
-        if (remaining < this.lastCraftRemaining)
-        {
-            this.craftRound = 0;
+        if (this.craftRounds.Observe(remaining))
             this.acquireRound = 0;
-        }
-        else if (++this.craftRound >= ctx.Config.MaxRetryRounds + 4)
-        {
-            return this.Fail($"何度作っても納品物がそろいません（HQ ができない等。残りの製作 {remaining} 回のまま {this.craftRound} 周進みませんでした）"
+        else if (this.craftRounds.Exceeded(ctx.Config.MaxRetryRounds + 4))
+            return this.Fail($"何度作っても納品物がそろいません（HQ ができない等。残りの製作 {remaining} 回のまま {this.craftRounds.Stalled} 周進みませんでした）"
                              + (this.craftCut != null ? $"。直前の打ち切り：{this.craftCut}" : string.Empty));
-        }
-
-        this.lastCraftRemaining = remaining;
 
         if (MissingGearsets(plan.Craft) is { } missing)
             return this.Fail($"製作に使う職のギアセットがありません：{missing}");
@@ -778,15 +767,11 @@ public sealed class JobQuestFlow : AutoTask
         if (this.craftCut != null)
             return null;
 
-        var inv = Inventory.Snapshot();
         var recipe = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Recipe>().GetRow(c.RecipeId);
-        var lacking = CraftPlanner.Ingredients(recipe)
-            .Where(x => inv.CountAll(x.Item) < x.Amount * c.Crafts)
-            .Select(x => $"{CraftPlanner.ItemName(x.Item)} {inv.CountAll(x.Item)}/{x.Amount * c.Crafts}")
-            .ToList();
+        var lacking = CraftCut.Lacking(CraftPlanner.Ingredients(recipe), c.Crafts, Inventory.Snapshot());
         if (lacking.Count > 0)
         {
-            this.craftCut = $"{CraftPlanner.ItemName(c.ItemId)} の材料が計画より少ない（{string.Join("、", lacking)}）";
+            this.craftCut = $"{CraftPlanner.ItemName(c.ItemId)} の材料が計画より少ない（{string.Join("、", lacking.Select(x => $"{CraftPlanner.ItemName(x.Item)} {x.Have}/{x.Need}"))}）";
             ctx.Log.Warn("製作", $"{this.craftCut}ので、ここで製作の列を打ち切って計画を立て直します");
             return null;
         }
@@ -826,6 +811,13 @@ public sealed class JobQuestFlow : AutoTask
         var plan = this.Plan(ctx);
         if (plan.NothingToDo)
         {
+            // 前提が未達で飛ばしたクエストがあれば、終わりに改めて知らせる
+            foreach (var line in plan.BlockedSummary())
+            {
+                ctx.Log.Warn("クエスト", $"前提のクエストが未完了のため進めていません：{line}");
+                Svc.Chat.Print($"[AutoJobQuest] 前提のクエストが未完了のため進めていません：{line}");
+            }
+
             this.stage = Stage.Done;
             return TaskResult.Running;
         }

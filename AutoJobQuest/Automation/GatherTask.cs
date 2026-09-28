@@ -119,7 +119,7 @@ public sealed class GatherTask : AutoTask
         var inv = Inventory.Snapshot();
         foreach (var n in this.needs)
         {
-            var add = n.ExtraFromNow > 0 ? n.ExtraFromNow : n.TargetOwned - inv.CountAll(n.ItemId);
+            var add = n.ExtraFromNow > 0 ? n.ExtraFromNow : AcquireMath.Additional(n.TargetOwned, inv.CountAll(n.ItemId));
             if (add <= 0)
             {
                 ctx.Log.Write("採集", $"{CraftPlanner.ItemName(n.ItemId)} はもう足りています（{inv.CountAll(n.ItemId)}/{n.TargetOwned}）");
@@ -303,7 +303,7 @@ public sealed class VendorTask : AutoTask
         var inv = Inventory.Snapshot();
         foreach (var n in this.needs)
         {
-            var add = n.TargetOwned - inv.CountAll(n.ItemId);
+            var add = AcquireMath.Additional(n.TargetOwned, inv.CountAll(n.ItemId));
             if (add <= 0)
             {
                 ctx.Log.Write("購入", $"{CraftPlanner.ItemName(n.ItemId)} はもう足りています（{inv.CountAll(n.ItemId)}/{n.TargetOwned}）");

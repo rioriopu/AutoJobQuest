@@ -211,8 +211,13 @@ public static class CharacterReport
                 var qs = data.Quests.Quests.Where(q => q.ClassJobId == job).ToList();
                 var done = qs.Count(q => QuestManager.IsQuestComplete(q.RowId));
                 var next = qs.FirstOrDefault(q => !QuestManager.IsQuestComplete(q.RowId));
-                lines.Add(new ReportLine(next == null ? Severity.Ok : Severity.Ok,
+                lines.Add(new ReportLine(Severity.Ok,
                     $"{Jobs.Name(job)}：{done}/{qs.Count} 本完了{(next == null ? string.Empty : $"　次は {next}")}"));
+
+                // 前提のクエスト（メインクエスト等）が未完了で、自動では進められないもの
+                var blocked = PlanBuilder.FindBlocked(qs, QuestManager.IsQuestComplete);
+                foreach (var line in JobQuestPlan.SummarizeBlocked(blocked))
+                    lines.Add(new ReportLine(Severity.Warn, $"　前提が未完了で進められません：{line}"));
             }
         });
 

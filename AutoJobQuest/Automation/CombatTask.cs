@@ -60,8 +60,7 @@ public sealed class CombatTask : AutoTask
     // 「最後に HP が減った時刻」から数える（以前は狙い始めた時の HP と比べていたので、
     // 1回でも減った後に届かなくなると、制限時間の 25 分まで気づけなかった）
     private readonly HashSet<ulong> giveUp = [];
-    private DateTime lastProgressAt = DateTime.MinValue;
-    private uint lastHp;
+    private readonly StallWatch stall = new();
 
     // 自分が頼んだ近づく移動（画面が開いたときに止めてよいのはこれと出現点への移動だけ）
     private bool approachIssued;
@@ -230,15 +229,10 @@ public sealed class CombatTask : AutoTask
         var dist = Vector3.Distance(Me.Position, t.Position);
         this.Status = $"{t.Name} と戦闘中（{dist:0.0}m）";
 
-        // HP が減ったら進展として時刻を更新する（回復・無敵で増えたときは進展にしない）
+        // 最後に HP が減ってから 45 秒たったら、その敵は諦める（届かない・他人が先に攻撃した等。StallWatch）。
+        // 回復・無敵で HP が増えたときは進展にしない。ハードターゲットも外す（諦めた敵を RSR が殴り続けないように）
         var hp = t.CurrentHp;
-        if (hp < this.lastHp)
-            this.lastProgressAt = DateTime.UtcNow;
-        this.lastHp = hp;
-
-        // 最後に HP が減ってから 45 秒たったら、その敵は諦める（届かない・他人が先に攻撃した等）。
-        // ハードターゲットも外す（諦めた敵を RSR が殴り続けないように）
-        if (DateTime.UtcNow - this.lastProgressAt > TimeSpan.FromSeconds(45))
+        if (this.stall.Observe(hp, DateTime.UtcNow))
         {
             ctx.Log.Warn("戦闘", $"{t.Name} の HP が 45 秒減っていないので、この個体は諦めて別の個体を探します（HP {hp}）");
             this.giveUp.Add(t.GameObjectId);
@@ -300,8 +294,7 @@ public sealed class CombatTask : AutoTask
         this.targetId = mob.GameObjectId;
         this.targetMobNameId = mob.NameId;
         this.targetBaseId = mob.BaseId;
-        this.lastProgressAt = DateTime.UtcNow;
-        this.lastHp = mob.CurrentHp;
+        this.stall.Start(mob.CurrentHp, DateTime.UtcNow);
         Svc.Targets.Target = mob;
         this.Status = $"{mob.Name} を狙います";
     }

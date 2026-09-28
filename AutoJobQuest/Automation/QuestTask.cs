@@ -224,7 +224,7 @@ public sealed unsafe class QuestTask : AutoTask
             return null;
         }
 
-        var result = this.filler.Tick((nint)request, openedAt, this.questItems, out var detail);
+        var result = this.filler.Tick(GameRequestWindow.Instance, (nint)request, openedAt, this.questItems, out var detail);
         switch (result)
         {
             case RequestFiller.Outcome.Submitted:

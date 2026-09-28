@@ -182,19 +182,24 @@ public static class Preflight
                         $"{m.Quest}：マテリアを付ける {CraftPlanner.ItemName(m.TargetItemId)}{(m.TargetHq ? "（HQ）" : string.Empty)} がアーマリーチェストにあります。カバンに移してから始めてください"));
             }
 
-            // 前提のクエストが自動で進められない（メインクエスト等が未完了）ものは、素材を集める前に止める
-            foreach (var q in plan.RemainingQuests)
-            {
-                Unlocks.ChainToRun(q.RowId, out var blocked);
-                if (blocked != null)
-                    list.Add(new PreflightItem(Severity.Error, $"{Jobs.Name(q.ClassJobId)} {q}：{blocked}"));
-            }
+            // 前提のクエストが自動で進められない（メインクエスト等が未完了）ジョブクエ。
+            // 止めずに「どのクエストが未達なので動作保証しない」と注意を出す（確認窓で続けるか決める）。
+            // 続けた場合、そのクエストは計画に入れない（素材も集めない）。進められる分だけ進める
+            foreach (var line in plan.BlockedSummary())
+                list.Add(new PreflightItem(Severity.Warn,
+                    $"前提のクエストが未完了のため、次のジョブクエは進められません（動作保証外。続けた場合、これらは飛ばし、素材も集めません）：{line}"));
         }
 
-        // RSR がこちらを使う前から動いている（利用者が使っている）。戦闘で使うと、終わったとき Off に戻る
-        // （IPC ではモードを読めないので元に戻せない）。確認窓で本人に決めてもらう
+        // RSR がこちらを使う前から動いている（利用者が使っている）とき。
+        // 戦闘では Henched に切り替え、終わったら使う前のモードに戻す（モードは RSR の内部から読む：RsrStateReader）。
+        // モードを読めない場合だけ、終わったら Off になるので確認窓で本人に決めてもらう
         if (plan != null && (plan.Shortfalls.Any(x => x.Route == Route.Combat || x.Fallbacks.Contains(Route.Combat))) && ctx.Rotation.IsActive() == true)
-            list.Add(new PreflightItem(Severity.Warn, "RotationSolverReborn が動いています。戦闘で素材を集めるときに Henched に切り替え、終わったら Off にします（元のモードは読めないので戻せません）"));
+        {
+            var mode = ctx.Rotation.CurrentModeName();
+            list.Add(mode != null
+                ? new PreflightItem(Severity.Ok, $"RotationSolverReborn は今 {mode} で動いています。戦闘の間だけ Henched に切り替え、終わったら {mode} に戻します")
+                : new PreflightItem(Severity.Warn, $"RotationSolverReborn が動いていますが、今のモードを読めません（{Ipc.RsrStateReader.LastError}）。戦闘の後は Off になります"));
+        }
 
         // 6) Artisan の簡易製作（設定ファイルを読むだけ）
         var quick = ReadArtisanBool("QuickSynthMode");

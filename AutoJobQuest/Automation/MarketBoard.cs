@@ -702,7 +702,7 @@ public sealed unsafe class MarketBoardTask : AutoTask
 
         // 1回の購入額が基準（既定 500,000 ギル）を超えるときだけ確認する。
         // 確認をもらった後に取り直した一覧で、同じ出品が同じ額以下のままなら、確認はやり直さない
-        var approved = pick.ListingId == this.approvedListingId && pick.Total <= this.approvedTotal;
+        var approved = PurchaseGuard.IsApproved(pick.ListingId, pick.Total, this.approvedListingId, this.approvedTotal);
         if (limit > 0 && pick.Total > limit && !approved)
         {
             this.confirmTicket = ctx.Confirm.Ask(
@@ -740,22 +740,20 @@ public sealed unsafe class MarketBoardTask : AutoTask
         // 送る直前に、不足数とギルを数え直す（以前は出品の中身だけを照合していたので、
         // 確認を待つ間に別の手段で足りても、古い不足数のまま買っていた）
         var need = this.RemainingNeed();
-        if (need <= 0)
+        var gilNow = Inventory.Gil();
+        switch (PurchaseGuard.Check(need, this.needAtDecide, gilNow, this.buyingTotal))
         {
-            ctx.Log.Write("マーケット", $"{this.current!.Label} は買う前に足りたので、買いません");
-            this.Go(Phase.Next, string.Empty);
-            return TaskResult.Running;
+            case PurchaseGuard.Verdict.AlreadyEnough:
+                ctx.Log.Write("マーケット", $"{this.current!.Label} は買う前に足りたので、買いません");
+                this.Go(Phase.Next, string.Empty);
+                return TaskResult.Running;
+            case PurchaseGuard.Verdict.Reselect:
+                ctx.Log.Warn("マーケット", $"不足数が変わった（{this.needAtDecide}→{need}）ので、出品を選び直します");
+                this.Go(Phase.Decide, string.Empty);
+                return TaskResult.Running;
+            case PurchaseGuard.Verdict.NotEnoughGil:
+                return this.GiveUpCurrent(ctx, $"ギルが足りません（必要 {this.buyingTotal:N0} / 所持 {gilNow:N0}）");
         }
-
-        if (need != this.needAtDecide)
-        {
-            ctx.Log.Warn("マーケット", $"不足数が変わった（{this.needAtDecide}→{need}）ので、出品を選び直します");
-            this.Go(Phase.Decide, string.Empty);
-            return TaskResult.Running;
-        }
-
-        if (this.buyingTotal > Inventory.Gil())
-            return this.GiveUpCurrent(ctx, $"ギルが足りません（必要 {this.buyingTotal:N0} / 所持 {Inventory.Gil():N0}）");
 
         var proxy = InfoProxyItemSearch.Instance();
         if (proxy == null || proxy->SearchItemId != this.buyingItem)

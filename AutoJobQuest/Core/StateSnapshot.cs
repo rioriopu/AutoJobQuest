@@ -79,7 +79,7 @@ public static class StateSnapshot
             sb.AppendLine($"  Artisan: 処理中={ctx.Artisan.IsBusy()} Endurance={ctx.Artisan.IsEndurance()} リスト実行中={ctx.Artisan.IsListRunning()} 停止要求={ctx.Artisan.GetStopRequest()}");
             var step = ctx.Questionable.GetCurrentStepData();
             sb.AppendLine($"  Questionable: 実行中={ctx.Questionable.IsRunning()} クエスト={ctx.Questionable.GetCurrentQuestId()} 手順={(step == null ? "なし" : $"{step.Sequence}-{step.Step} {step.InteractionType} 位置={step.Position} エリア={step.TerritoryId}")}");
-            sb.AppendLine($"  RSR: 自動ローテ={ctx.Rotation.IsActive()} こちらの優先指定={ctx.Rotation.HasOwnPriorities}");
+            sb.AppendLine($"  RSR: 自動ローテ={ctx.Rotation.IsActive()} モード={ctx.Rotation.CurrentModeName() ?? "読めない"} こちらの優先指定={ctx.Rotation.HasOwnPriorities}");
             sb.AppendLine($"  Lifestream: 処理中={ctx.Lifestream.IsBusy()}");
             sb.AppendLine($"  vnavmesh: 使える={ctx.Navmesh.IsReady()} 移動中={ctx.Navmesh.IsMoving()} 構築={ctx.Navmesh.BuildProgress()}");
             sb.AppendLine($"  TextAdvance: 外部制御中={ctx.TextAdvance.IsInExternalControl()}");

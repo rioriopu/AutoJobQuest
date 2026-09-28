@@ -68,10 +68,24 @@ public sealed class MateriaNeed
     public bool AlreadyMelded { get; init; }
 }
 
+/// <summary>前提のクエストが未完了で、自動では進められないジョブクエ。</summary>
+/// <param name="Quest">進められないジョブクエ。</param>
+/// <param name="BlockingQuest">止めている前提のクエスト（メインクエスト等）。</param>
+/// <param name="Reason">理由（画面・記録用）。</param>
+public sealed record BlockedQuest(JobQuest Quest, uint BlockingQuest, string Reason);
+
 /// <summary>選んだジョブの、残りのジョブクエ全部についての計画。</summary>
 public sealed class JobQuestPlan
 {
+    /// <summary>残りのジョブクエのうち、進められるもの（前提が進められないものは <see cref="Blocked"/> へ分ける）。</summary>
     public List<JobQuest> RemainingQuests { get; } = [];
+
+    /// <summary>
+    /// 残りのジョブクエのうち、前提のクエスト（メインクエスト等）が未完了で進められないもの。
+    /// 計画（素材・製作・装着）には入れない（進められないクエストの素材を集めない）。
+    /// 開始時に「どのクエストが未達なので動作保証しない」と注意を出す。
+    /// </summary>
+    public List<BlockedQuest> Blocked { get; } = [];
 
     public CraftPlan Craft { get; set; } = new();
 
@@ -85,7 +99,40 @@ public sealed class JobQuestPlan
 
     public IEnumerable<RawNeed> Shortfalls => this.Raw.Where(x => x.Shortfall > 0);
 
+    /// <summary>進められるジョブクエが残っていない（前提が未達で進められないものは含めない）。</summary>
     public bool NothingToDo => this.RemainingQuests.Count == 0;
+
+    /// <summary>
+    /// 進められないジョブクエを、止めている前提ごとにまとめた文（無ければ空）。職ごとに Lv の範囲と本数を出す。
+    /// 例：「希望の灯火」（第七星暦ストーリー）が未完了 → 木工師 Lv53〜60（4本）・鍛冶師 Lv53〜60（4本）
+    /// </summary>
+    public List<string> BlockedSummary() => SummarizeBlocked(this.Blocked);
+
+    /// <summary><see cref="BlockedSummary"/> の本体（計画を立てずに、進められないクエストだけ調べたときにも使う）。</summary>
+    public static List<string> SummarizeBlocked(IEnumerable<BlockedQuest> blocked)
+        => blocked
+            .GroupBy(b => b.BlockingQuest)
+            .Select(g =>
+            {
+                var head = g.Key != 0
+                    ? $"「{Unlocks.QuestName(g.Key)}」{GenreOf(g.Key)}が未完了"
+                    : g.First().Reason;
+                var jobs = g.GroupBy(b => b.Quest.ClassJobId)
+                    .Select(j =>
+                    {
+                        var min = j.Min(b => b.Quest.Level);
+                        var max = j.Max(b => b.Quest.Level);
+                        return $"{Jobs.Name(j.Key)} Lv{min}{(max != min ? $"〜{max}" : string.Empty)}（{j.Count()}本）";
+                    });
+                return $"{head} → {string.Join("・", jobs)}";
+            })
+            .ToList();
+
+    private static string GenreOf(uint questId)
+        => Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Quest>().TryGetRow(questId, out var q)
+           && q.JournalGenre.ValueNullable is { } g
+            ? $"（{g.Name.ExtractText()}）"
+            : string.Empty;
 }
 
 /// <summary>
@@ -113,14 +160,15 @@ public static class PlanBuilder
             if (selected[i])
                 jobs.Add(Jobs.Crafters[i]);
 
-        foreach (var q in data.Quests!.Quests)
-        {
-            if (!jobs.Contains(q.ClassJobId))
-                continue;
-            if (QuestManager.IsQuestComplete(q.RowId))
-                continue;
-            plan.RemainingQuests.Add(q);
-        }
+        // 残りのジョブクエ。前提のクエスト（メインクエスト等）が未完了で自動では進められないものは分けて、計画に入れない
+        // （開始時に「未達なので動作保証しない」と注意を出し、進められる分だけ進める。
+        //   進められないクエストの素材まで集めると、ギルと時間が無駄になるため）
+        var candidates = data.Quests!.Quests
+            .Where(q => jobs.Contains(q.ClassJobId) && !QuestManager.IsQuestComplete(q.RowId))
+            .ToList();
+        plan.Blocked.AddRange(FindBlocked(candidates, QuestManager.IsQuestComplete));
+        var blockedIds = plan.Blocked.Select(b => b.Quest.RowId).ToHashSet();
+        plan.RemainingQuests.AddRange(candidates.Where(q => !blockedIds.Contains(q.RowId)));
 
         var inv = Inventory.Snapshot();
 
@@ -173,6 +221,40 @@ public static class PlanBuilder
         }
 
         return plan;
+    }
+
+    /// <summary>
+    /// 未完了のジョブクエのうち、前提のクエストが自動で進められない（区分の違う前提＝メインクエスト等が未完了）もの。
+    /// 「完了済みか」は外から渡す（ゲームを起動せずに試せるように）。
+    /// </summary>
+    public static List<BlockedQuest> FindBlocked(IEnumerable<JobQuest> quests, Func<uint, bool> isComplete)
+    {
+        var list = new List<BlockedQuest>();
+        foreach (var q in quests)
+        {
+            if (isComplete(q.RowId))
+                continue;
+            Unlocks.ChainCore(q.RowId, isComplete, out var blocked, out var blocker);
+            if (blocked != null)
+                list.Add(new BlockedQuest(q, blocker, blocked));
+        }
+
+        return list;
+    }
+
+    /// <summary>
+    /// 選んだジョブの、進められないジョブクエだけを調べる（計画を立てずに。ジョブのチェック欄の下に出す用）。
+    /// ゲームデータの読み込み前は空。フレームワークのスレッドから呼ぶ。
+    /// </summary>
+    public static List<BlockedQuest> FindBlocked(GameDataCache data, bool[] selected)
+    {
+        if (data.Quests == null)
+            return [];
+        var jobs = new HashSet<uint>();
+        for (var i = 0; i < selected.Length && i < Jobs.Crafters.Length; i++)
+            if (selected[i])
+                jobs.Add(Jobs.Crafters[i]);
+        return FindBlocked(data.Quests.Quests.Where(q => jobs.Contains(q.ClassJobId)), QuestManager.IsQuestComplete);
     }
 
     /// <summary>

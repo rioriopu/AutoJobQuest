@@ -85,8 +85,20 @@ public static class Unlocks
     /// 解放クエストがすでに完了なら空（blocked も null）。
     /// </summary>
     public static List<uint> ChainToRun(uint questId, out string? blocked)
+        => ChainToRun(questId, out blocked, out _);
+
+    /// <summary>上と同じ。止めている前提のクエスト（自動で進められない未完了のもの）も返す（無ければ 0）。</summary>
+    public static List<uint> ChainToRun(uint questId, out string? blocked, out uint blockingQuest)
+        => ChainCore(questId, QuestManager.IsQuestComplete, out blocked, out blockingQuest);
+
+    /// <summary>
+    /// 前提のたどり方の本体。「完了済みか」を外から渡す（ゲームを起動せずに、完了済みの組み合わせを仮定して試せるように）。
+    /// 前提（Quest.PreviousQuest）は全部そろえる側に倒す（結合条件 PreviousQuestJoin の意味はソースで確かめられなかったため）。
+    /// </summary>
+    public static List<uint> ChainCore(uint questId, Func<uint, bool> isComplete, out string? blocked, out uint blockingQuest)
     {
         blocked = null;
+        blockingQuest = 0;
         var quests = Svc.Data.GetExcelSheet<Quest>();
         if (!quests.TryGetRow(questId, out var target))
         {
@@ -98,23 +110,26 @@ public static class Unlocks
         var order = new List<uint>();
         var seen = new HashSet<uint>();
         string? reason = null;
+        uint blocker = 0;
 
         // 深さの上限は、壊れたデータで延々とたどらないための歯止め（循環は seen で防いでいる）。
         // ジョブクエは Lv1〜60 で十数本つながるので、Lv1 から始めるキャラでも届く深さにする
         // （以前の 6 だと、未完了の前提が7本以上続くと「たどりきれません」になった）
         bool Visit(uint id, int depth)
         {
-            if (!seen.Add(id) || QuestManager.IsQuestComplete(id))
+            if (!seen.Add(id) || isComplete(id))
                 return true;
             if (depth > 64 || !quests.TryGetRow(id, out var q))
             {
                 reason = $"前提のクエスト「{QuestName(id)}」をたどりきれません";
+                blocker = id;
                 return false;
             }
 
             if (SectionOf(q) != section)
             {
                 reason = $"前提のクエスト「{q.Name.ExtractText()}」（{q.JournalGenre.ValueNullable?.Name.ExtractText()}）が未完了です。メインクエスト等は自動では進めません";
+                blocker = id;
                 return false;
             }
 
@@ -130,6 +145,7 @@ public static class Unlocks
 
         var ok = Visit(questId, 0);
         blocked = reason;
+        blockingQuest = blocker;
         return ok ? order : [];
     }
 

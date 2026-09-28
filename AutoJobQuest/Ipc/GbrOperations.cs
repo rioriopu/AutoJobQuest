@@ -187,7 +187,7 @@ public sealed class GbrOperations
         if (!this.HasLeftovers)
             return true;
 
-        if (gbrEnabled != false || vendorBusy != false)
+        if (!CanRestore(gbrEnabled, vendorBusy))
         {
             Note($"GBR が動いている（または状態が読めない）ので、リストと設定はまだ戻しません（自動採集={gbrEnabled?.ToString() ?? "不明"}、購入中={vendorBusy?.ToString() ?? "不明"}）");
             return false;
@@ -196,6 +196,91 @@ public sealed class GbrOperations
         var lists = this.RestoreGatherLists();
         var cfg = this.RestoreConfig();
         return lists && cfg;
+    }
+
+    /// <summary>戻してよいか：自動採集も NPC 購入も「止まっている（false）」と読めたときだけ（読めない null は戻さない）。</summary>
+    public static bool CanRestore(bool? gbrEnabled, bool? vendorBusy) => gbrEnabled == false && vendorBusy == false;
+
+    /// <summary>
+    /// 設定を戻す本体（GBR への読み書きは外から渡す。ゲームを起動せずに試せるように分けた）。
+    /// 今の値が「こちらが入れた値」（元の値の反対）なら元に戻し、そうでなければ利用者が変えたとみなして触らない。
+    /// 最後に保存し、**保存が通ってから**控えから消す。例外なら控えは全部残す。
+    /// </summary>
+    public static bool RestoreConfigCore(
+        Dictionary<string, bool> originals, Func<string, bool> get, Action<string, bool> set, Action save, Action<string> note, out string? error)
+    {
+        error = null;
+        var done = new List<string>();
+        try
+        {
+            foreach (var (name, original) in originals.ToList())
+            {
+                if (get(name) == !original)
+                {
+                    set(name, original);
+                    note($"設定 {name} を元の {original} に戻します");
+                }
+                else
+                {
+                    note($"設定 {name} は途中で変わっていたので戻しません（今の値を尊重）");
+                }
+
+                done.Add(name);
+            }
+
+            save();
+        }
+        catch (Exception ex)
+        {
+            error = Unwrap(ex);
+            return false;
+        }
+
+        foreach (var name in done)
+            originals.Remove(name);
+        note($"GBR の設定を保存しました（戻した・確かめた設定：{string.Join("、", done)}）");
+        return true;
+    }
+
+    /// <summary>
+    /// 無効にしたリストの戻し先を決める本体（リストの中身には触らない。ゲームを起動せずに試せるように分けた）。
+    /// 控え1件ずつ、この実行で無効にしたリストそのもの（生きている参照）があればそれ、無ければ名前＋フォルダで探して
+    /// ちょうど1つのときだけ。決まらない控えは Unresolved に入れる。
+    /// </summary>
+    public static (List<T> Enable, List<GbrListRef> Restored, List<GbrListRef> Unresolved) PlanListRestore<T>(
+        IEnumerable<GbrListRef> refs, IEnumerable<(T List, GbrListRef Ref)> mine, IReadOnlyList<T> alive, Func<T, GbrListRef> refOf)
+        where T : class
+    {
+        var enable = new List<T>();
+        var restored = new List<GbrListRef>();
+        var unresolved = new List<GbrListRef>();
+        var mineList = mine.ToList();
+        foreach (var reference in refs)
+        {
+            // この実行で無効にしたリストそのもの（同じ控えに当たるものは全部。同じ名前のリストを複数無効にした場合）
+            var targets = mineList
+                .Where(d => d.Ref == reference && alive.Any(x => ReferenceEquals(x, d.List)))
+                .Select(d => d.List)
+                .ToList();
+
+            if (targets.Count == 0)
+            {
+                // 参照が無い：名前＋フォルダで探す。1つに決まるときだけ戻す
+                var matches = alive.Where(x => refOf(x) == reference).ToList();
+                if (matches.Count != 1)
+                {
+                    unresolved.Add(reference);
+                    continue;
+                }
+
+                targets = matches;
+            }
+
+            enable.AddRange(targets);
+            restored.Add(reference);
+        }
+
+        return (enable, restored, unresolved);
     }
 
     /// <summary>
@@ -213,36 +298,13 @@ public sealed class GbrOperations
 
         // 控えは GBR の保存が通ってから消す（以前は1件ずつ控えを消してから最後に保存していたので、
         // 保存で例外が出ると、控えだけ消えてやり直しの対象から外れていた）
-        var done = new List<string>();
-        try
+        if (!RestoreConfigCore(this.config.GbrConfigOriginals, h.GetAutoGatherBool, h.SetAutoGatherBool, h.SaveConfig, Note, out var error))
         {
-            foreach (var (name, original) in this.config.GbrConfigOriginals.ToList())
-            {
-                if (h.GetAutoGatherBool(name) == !original)
-                {
-                    h.SetAutoGatherBool(name, original);
-                    Note($"設定 {name} を元の {original} に戻します");
-                }
-                else
-                {
-                    Note($"設定 {name} は途中で変わっていたので戻しません（今の値を尊重）");
-                }
-
-                done.Add(name);
-            }
-
-            h.SaveConfig();
-        }
-        catch (Exception ex)
-        {
-            this.SetError($"GBR の設定を戻せませんでした（控えは残し、止まっている間にやり直します）: {Unwrap(ex)}");
+            this.SetError($"GBR の設定を戻せませんでした（控えは残し、止まっている間にやり直します）: {error}");
             return false;
         }
 
-        foreach (var name in done)
-            this.config.GbrConfigOriginals.Remove(name);
         this.config.Save();
-        Note($"GBR の設定を保存しました（戻した・確かめた設定：{string.Join("、", done)}）");
         return true;
     }
 
@@ -353,8 +415,8 @@ public sealed class GbrOperations
         if (h == null)
             return false; // 届くようになってから戻す
 
-        var restored = new List<string>();
-        var unresolved = new List<GbrListRef>();
+        List<GbrListRef> restored;
+        List<GbrListRef> unresolved;
         try
         {
             var r = new ListReflection(h);
@@ -367,38 +429,24 @@ public sealed class GbrOperations
                 r.PEnabled.SetValue(own, false);
             }
 
+            // 戻し先を決める（PlanListRestore。同じ控えに当たるリストは全部・参照が無ければ名前＋フォルダで1つに決まるときだけ）
             var alive = r.AllLists().ToList();
-            foreach (var reference in this.config.GbrDisabledListRefs)
+            var plan = PlanListRestore(
+                this.config.GbrDisabledListRefs, this.disabledByMe, alive,
+                x => new GbrListRef((string?)r.PName.GetValue(x) ?? string.Empty, (string?)r.PFolderPath.GetValue(x) ?? string.Empty));
+            restored = plan.Restored;
+            unresolved = plan.Unresolved;
+
+            foreach (var t in plan.Enable)
             {
-                // この実行で無効にしたリストそのもの（同じ控えに当たるものは全部。同じ名前のリストを複数無効にした場合）
-                var targets = this.disabledByMe
-                    .Where(d => d.Ref == reference && alive.Any(x => ReferenceEquals(x, d.List)))
-                    .Select(d => d.List)
-                    .ToList();
+                if (!(bool)r.PEnabled.GetValue(t)!)
+                    r.PEnabled.SetValue(t, true);
+            }
 
-                if (targets.Count == 0)
-                {
-                    // 参照が無い：名前＋フォルダで探す。1つに決まるときだけ戻す
-                    var matches = alive
-                        .Where(x => (string?)r.PName.GetValue(x) == reference.Name && ((string?)r.PFolderPath.GetValue(x) ?? string.Empty) == reference.FolderPath)
-                        .ToList();
-                    if (matches.Count != 1)
-                    {
-                        unresolved.Add(reference);
-                        Note($"⚠ リスト「{reference.Name}」（フォルダ「{reference.FolderPath}」）は{(matches.Count == 0 ? "見つからない" : $"同じ名前が {matches.Count} 個ある")}ので戻しません。GBR の画面で確かめてください（画面の「戻せなかった GBR のリスト」に残します）");
-                        continue;
-                    }
-
-                    targets = matches;
-                }
-
-                foreach (var t in targets)
-                {
-                    if (!(bool)r.PEnabled.GetValue(t)!)
-                        r.PEnabled.SetValue(t, true);
-                }
-
-                restored.Add(reference.Name);
+            foreach (var u in unresolved)
+            {
+                var count = alive.Count(x => (string?)r.PName.GetValue(x) == u.Name && ((string?)r.PFolderPath.GetValue(x) ?? string.Empty) == u.FolderPath);
+                Note($"⚠ リスト「{u.Name}」（フォルダ「{u.FolderPath}」）は{(count == 0 ? "見つからない" : $"同じ名前が {count} 個ある")}ので戻しません。GBR の画面で確かめてください（画面の「戻せなかった GBR のリスト」に残します）");
             }
 
             r.MSetActive.Invoke(r.Manager, [false]);
@@ -420,7 +468,7 @@ public sealed class GbrOperations
         this.config.GbrOwnListActive = false;
         this.config.Save();
 
-        Note($"自動採集リストを元に戻しました（戻したリスト：{(restored.Count == 0 ? "なし" : string.Join("、", restored))}"
+        Note($"自動採集リストを元に戻しました（戻したリスト：{(restored.Count == 0 ? "なし" : string.Join("、", restored.Select(x => x.Name)))}"
              + (unresolved.Count > 0 ? $"／戻せなかったリスト：{string.Join("、", unresolved.Select(u => u.Name))}" : string.Empty) + "）");
         return true;
     }

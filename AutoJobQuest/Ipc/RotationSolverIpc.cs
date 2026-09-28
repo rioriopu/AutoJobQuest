@@ -40,10 +40,11 @@ public sealed class RotationSolverIpc : IpcGate
         => this.TraceThen($"ChangeOperatingMode({mode})") && this.TryAction("ChangeOperatingMode",
             () => this.Func<byte, object>(Prefix + "ChangeOperatingMode").InvokeAction(mode));
 
-    private bool henchedByMe;
-    private DateTime lastHenchedSend = DateTime.MinValue;
-    private int unanswered;
-    private int unreadable;
+    // Henched の応答の数え方（IPC を呼ばない部分。HenchedTracker）
+    private readonly HenchedTracker tracker = new();
+
+    // こちらが Henched にする前の RSR のモード（RsrStateReader で読む。読めなければ null）。使い終わったらこれに戻す
+    private byte? originalMode;
 
     /// <summary>
     /// Henched を送っても RSR が動作中にならない（false）か、状態が読めない（null）ことが続いたか（それぞれ3回）。
@@ -57,16 +58,14 @@ public sealed class RotationSolverIpc : IpcGate
     /// なお AutorotationActive は「State か IsManual」なので、true でも Henched になったことまでは証明しない
     /// （IPC にモードを読む口が無いため。RSR の IPCProvider.cs:274・DataCenter.cs:246）。
     /// </summary>
-    public bool HenchedUnresponsive => this.unanswered >= 3 || this.unreadable >= 3;
+    public bool HenchedUnresponsive => this.tracker.Unresponsive;
 
     /// <summary><see cref="HenchedUnresponsive"/> のときの理由（記録と停止の文言用）。</summary>
-    public string HenchedProblem => this.unreadable >= 3
-        ? $"RSR の動作状態（AutorotationActive）を {this.unreadable} 回続けて読めませんでした（IPC が変わった可能性）"
-        : $"RSR に Henched への切り替えを {this.unanswered} 回送っても動作中になりません（IPC が効いていない可能性）";
+    public string HenchedProblem => this.tracker.Problem;
 
     /// <summary>
-    /// Henched にする（まだこちらが入れていなければ）。入れる前に RSR が動いていたら、利用者が使っていたとみなして記録する
-    /// （IPC ではモードの種類までは読めないので、戻すときは Off にしかできないため）。
+    /// Henched にする（まだこちらが入れていなければ）。入れる前の RSR のモードを RSR の内部から読んで覚える
+    /// （使い終わったら元のモードに戻す。読めなければ Off に戻す）。
     /// こちらが入れた後に RSR が自分で OFF になった（エリア移動・死亡・着替え）ときは入れ直す。
     /// 状態が読めないときも入れ直す（RSR の ChangeOperatingMode は切り替えではなく「そのモードにする」なので、
     /// 同じモードを送っても OFF にはならない：RSR の IPCProvider.cs:125 → RSCommands.UpdateState）。
@@ -75,45 +74,48 @@ public sealed class RotationSolverIpc : IpcGate
     public bool EnsureHenched()
     {
         var active = this.IsActive();
-        if (this.henchedByMe && active == true)
+        var firstTake = !this.tracker.HenchedByMe;
+        var action = this.tracker.Decide(active, DateTime.UtcNow);
+        if (action != HenchedTracker.Action.Send)
+            return true; // 応答あり、または送った直後の反映待ち
+
+        if (firstTake)
         {
-            this.unanswered = 0;
-            this.unreadable = 0;
-            return true;
+            this.originalMode = RsrStateReader.ReadMode();
+            Core.DebugLog.Current?.Line("IPC", this.originalMode is { } m
+                ? $"RSR の使う前のモードは {RsrStateReader.ModeName(m)}。使い終わったら {RsrStateReader.ModeName(m)} に戻します"
+                : $"⚠ RSR の使う前のモードを読めません（{RsrStateReader.LastError}）。使い終わったら Off に戻します");
         }
 
-        if (DateTime.UtcNow - this.lastHenchedSend < TimeSpan.FromSeconds(3))
-            return true; // 送った直後は反映待ち
-
-        if (!this.henchedByMe && active == true)
-            Core.DebugLog.Current?.Line("IPC", "⚠ RSR はこちらが使う前から動いていました。終わったときは Off に戻ります（元のモードは IPC で読めないため）");
-
-        if (this.henchedByMe && active == false && ++this.unanswered >= 3)
-            Core.DebugLog.Current?.Line("IPC", $"⚠ RSR に Henched を {this.unanswered} 回送っても動作中になりません");
-
-        if (this.henchedByMe && active == null && ++this.unreadable >= 3)
-            Core.DebugLog.Current?.Line("IPC", $"⚠ RSR の動作状態を {this.unreadable} 回続けて読めません");
+        if (this.tracker.Unanswered >= 3 || this.tracker.Unreadable >= 3)
+            Core.DebugLog.Current?.Line("IPC", $"⚠ {this.tracker.Problem}");
 
         if (!this.ChangeOperatingMode(ModeHenched))
             return false;
-        this.henchedByMe = true;
-        this.lastHenchedSend = DateTime.UtcNow;
+        this.tracker.Sent(DateTime.UtcNow);
         return true;
     }
 
-    /// <summary>こちらが Henched にしていたときだけ Off に戻す（利用者が使っていた RSR を勝手に止めないため）。</summary>
+    /// <summary>
+    /// こちらが Henched にしていたときだけ、使う前のモードに戻す（使う前が Off か、読めなかったなら Off）。
+    /// 利用者が使っていた RSR を勝手に止めない・勝手にモードを変えたままにしないため。
+    /// </summary>
     public void ReleaseHenched()
     {
-        if (!this.henchedByMe)
+        if (!this.tracker.HenchedByMe)
             return;
-        if (this.ChangeOperatingMode(ModeOff))
+
+        var back = this.originalMode ?? ModeOff;
+        if (this.ChangeOperatingMode(back))
         {
-            this.henchedByMe = false;
-            this.unanswered = 0;
-            this.unreadable = 0;
-            this.lastHenchedSend = DateTime.MinValue;
+            Core.DebugLog.Current?.Line("IPC", $"RSR を {RsrStateReader.ModeName(back)} に戻しました{(this.originalMode == null ? "（使う前のモードが読めなかったため Off）" : string.Empty)}");
+            this.tracker.Released();
+            this.originalMode = null;
         }
     }
+
+    /// <summary>今の RSR のモードの名前（事前点検・画面用）。読めなければ null。</summary>
+    public string? CurrentModeName() => RsrStateReader.ReadMode() is { } m ? RsrStateReader.ModeName(m) : null;
 
     /// <summary>自動ローテーションが動いているか。読めなければ null。</summary>
     public bool? IsActive()
@@ -145,4 +147,78 @@ public sealed class RotationSolverIpc : IpcGate
 
     /// <summary>こちらが足した優先指定が残っているか。</summary>
     public bool HasOwnPriorities => this.ownPriorities.Count > 0;
+}
+
+/// <summary>
+/// RSR に Henched を頼むときの応答の数え方（IPC を呼ばない部分だけ。ゲームを起動せずに試せるように分けた）。
+///  ・こちらが入れていて、動作中（true）と読めたら「応答あり」。数を 0 に戻す。
+///  ・送ってから3秒は反映待ち（送り直さない）。
+///  ・それ以外は送り直す。こちらが入れた後の false を Unanswered、読めない（null）を Unreadable として数える。どちらか3回で「応答なし」。
+/// </summary>
+public sealed class HenchedTracker
+{
+    public enum Action
+    {
+        /// <summary>応答あり（何もしない）。</summary>
+        Ok,
+
+        /// <summary>送った直後の反映待ち（何もしない）。</summary>
+        Wait,
+
+        /// <summary>Henched を送る。</summary>
+        Send,
+    }
+
+    public static readonly TimeSpan ResendInterval = TimeSpan.FromSeconds(3);
+
+    public bool HenchedByMe { get; private set; }
+
+    public int Unanswered { get; private set; }
+
+    public int Unreadable { get; private set; }
+
+    private DateTime lastSend = DateTime.MinValue;
+
+    public bool Unresponsive => this.Unanswered >= 3 || this.Unreadable >= 3;
+
+    public string Problem => this.Unreadable >= 3
+        ? $"RSR の動作状態（AutorotationActive）を {this.Unreadable} 回続けて読めませんでした（IPC が変わった可能性）"
+        : $"RSR に Henched への切り替えを {this.Unanswered} 回送っても動作中になりません（IPC が効いていない可能性）";
+
+    /// <param name="active">RSR の AutorotationActive（読めなければ null）。</param>
+    /// <param name="now">いまの時刻。</param>
+    public Action Decide(bool? active, DateTime now)
+    {
+        if (this.HenchedByMe && active == true)
+        {
+            this.Unanswered = 0;
+            this.Unreadable = 0;
+            return Action.Ok;
+        }
+
+        if (now - this.lastSend < ResendInterval)
+            return Action.Wait;
+
+        if (this.HenchedByMe && active == false)
+            this.Unanswered++;
+        if (this.HenchedByMe && active == null)
+            this.Unreadable++;
+        return Action.Send;
+    }
+
+    /// <summary>Henched を送った。</summary>
+    public void Sent(DateTime now)
+    {
+        this.HenchedByMe = true;
+        this.lastSend = now;
+    }
+
+    /// <summary>元のモードに戻した。</summary>
+    public void Released()
+    {
+        this.HenchedByMe = false;
+        this.Unanswered = 0;
+        this.Unreadable = 0;
+        this.lastSend = DateTime.MinValue;
+    }
 }

@@ -741,7 +741,7 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
         // 交換に要る紫貨に届いたら、収集品が残っていてもやめる（残りは次の機会に使える）
         var scrips = Inventory.CountSpecialCurrency(this.data.RewardSpecialCurrencyId, out _);
         var target = this.targetScrips();
-        if (scrips >= target)
+        if (!BookMath.ShouldDeliver(scrips, target))
         {
             ctx.Log.Write("納品", $"交換に要る紫貨に届いたので納品をやめます（{scrips}/{target}、{this.Delivered} 個納品）");
             this.Go(DeliverStep.Close, "納品画面を閉じます");
@@ -812,31 +812,20 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
             this.lastButton = $"見える={visible} 押せる={enabled}";
         }
 
-        if (HeldListRows(addon) is { } rows)
+        var rows = HeldListRows(addon);
+        this.lastSelection = rows is { } r
+            ? $"手持ちの一覧 {r} 行 / 所持 {this.ownedBefore}（選ぶ前 {this.selectRowsBefore} 行{(this.ambiguous ? "・同数の別の品あり" : string.Empty)}）"
+            : $"手持ちの一覧（node {HeldListNodeId}）を取れません";
+        var sameAsConfirmed = this.confirmedRow == this.rowIndex && this.confirmedAddon == (nint)addon;
+        switch (CollectableSelection.Decide(rows, this.ownedBefore, this.selectRowsBefore, this.ambiguous, sameAsConfirmed, buttonReady))
         {
-            this.lastSelection = $"手持ちの一覧 {rows} 行 / 所持 {this.ownedBefore}（選ぶ前 {this.selectRowsBefore} 行{(this.ambiguous ? "・同数の別の品あり" : string.Empty)}）";
-            if (rows > 0 && rows == this.ownedBefore)
-            {
-                var changed = this.selectRowsBefore >= 0 && this.selectRowsBefore != rows;
-                var sameAsConfirmed = this.confirmedRow == this.rowIndex && this.confirmedAddon == (nint)addon;
-                if (!this.ambiguous || changed || sameAsConfirmed)
-                {
-                    if (!buttonReady)
-                    {
-                        this.Status = "納品ボタンが押せるようになるのを待っています";
-                    }
-                    else
-                    {
-                        this.confirmedRow = this.rowIndex;
-                        this.confirmedAddon = (nint)addon;
-                        return this.FireDelivery(ctx, addon, this.lastSelection);
-                    }
-                }
-            }
-        }
-        else
-        {
-            this.lastSelection = $"手持ちの一覧（node {HeldListNodeId}）を取れません";
+            case CollectableSelection.Verdict.Fire:
+                this.confirmedRow = this.rowIndex;
+                this.confirmedAddon = (nint)addon;
+                return this.FireDelivery(ctx, addon, this.lastSelection);
+            case CollectableSelection.Verdict.WaitButton:
+                this.Status = "納品ボタンが押せるようになるのを待っています";
+                break;
         }
 
         var waited = DateTime.UtcNow - this.selectedAt;
@@ -1545,7 +1534,7 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
         }
 
         var currencyName = CraftPlanner.ItemName(this.scripItemId);
-        if (currencyName.Length > 0 && body.Contains(currencyName, StringComparison.Ordinal) && ContainsNumber(body, offer.Price))
+        if (currencyName.Length > 0 && body.Contains(currencyName, StringComparison.Ordinal) && TextMatch.ContainsNumber(body, offer.Price))
         {
             addon = own;
             return true;
@@ -1564,31 +1553,6 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
 
         return false;
     }
-
-    /// <summary>
-    /// 本文に、その数（3桁区切りでも可）が「前後が数字でない」形で含まれるか。
-    /// 「100」が「1000」「2,100」の一部に当たらないようにする。
-    /// </summary>
-    private static bool ContainsNumber(string body, uint value)
-    {
-        foreach (var text in new[] { value.ToString(), value.ToString("N0") }.Distinct())
-        {
-            var at = 0;
-            while ((at = body.IndexOf(text, at, StringComparison.Ordinal)) >= 0)
-            {
-                var beforeOk = at == 0 || !IsNumberChar(body[at - 1]);
-                var end = at + text.Length;
-                var afterOk = end >= body.Length || !IsNumberChar(body[end]);
-                if (beforeOk && afterOk)
-                    return true;
-                at = end;
-            }
-        }
-
-        return false;
-    }
-
-    private static bool IsNumberChar(char c) => char.IsDigit(c) || c == ',' || c == '，';
 
     // ---- 閉じる ----
 
