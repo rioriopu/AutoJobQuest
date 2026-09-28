@@ -374,15 +374,32 @@ public static class CombatPlanner
     /// <summary>
     /// 品目ごとに「どのエリアで、どのモンスターを倒すか」を決める。
     /// 同じエリアで複数の品目が取れるなら、そのエリアにまとめる（移動を減らす）。
-    /// 飛べないエリア・解放済みエーテライトの無いエリアは後回しにする。
+    ///
+    /// 行けるエリアだけを使う：野外（TerritoryIntendedUse=1。ゲームデータで確認：0=街・1=野外・2=宿屋・3=ダンジョン）で、
+    /// 解放済みのエーテライトがあること。行けないエリアを選ぶとテレポの段で全体が止まるため。
+    /// 行けるエリアが1つも無い品目は <paramref name="unreachable"/> に入れて返す（呼び出し側が戦闘をあきらめて次の手段へ回す）。
     /// </summary>
+    /// <summary>戦闘で行けるエリアか（野外で、解放済みのエーテライトがある）。</summary>
+    public static bool IsReachable(uint territory, HashSet<uint>? unlockedAetherytes = null)
+    {
+        var unlocked = unlockedAetherytes ?? Svc.Aetherytes.Select(a => a.AetheryteId).ToHashSet();
+        return Svc.Data.GetExcelSheet<TerritoryType>().TryGetRow(territory, out var t) && t.TerritoryIntendedUse.RowId == 1
+               && Svc.Data.GetExcelSheet<Aetheryte>().Any(a => a.IsAetheryte && a.Territory.RowId == territory && unlocked.Contains(a.RowId));
+    }
+
+    /// <summary>その品を落とすモンスターが、行けるエリアに1か所でも出るか。</summary>
+    public static bool HasReachableSpawn(SourceIndex sources, uint itemId)
+    {
+        var unlocked = Svc.Aetherytes.Select(a => a.AetheryteId).ToHashSet();
+        return sources.Get(itemId).DropMobs.Any(m => sources.SpawnsOf(m).Any(s => IsReachable(s.Territory, unlocked)));
+    }
+
     public static List<(uint Territory, List<CombatNeed> Needs, List<Vector2> Spots)> Plan(
-        SourceIndex sources, IReadOnlyDictionary<uint, int> shortfalls)
+        SourceIndex sources, IReadOnlyDictionary<uint, int> shortfalls, out List<uint> unreachable)
     {
         var inv = Inventory.Snapshot();
         var unlocked = Svc.Aetherytes.Select(a => a.AetheryteId).ToHashSet();
-        var aetherytes = Svc.Data.GetExcelSheet<Aetheryte>();
-        bool HasAetheryte(uint terr) => aetherytes.Any(a => a.IsAetheryte && a.Territory.RowId == terr && unlocked.Contains(a.RowId));
+        bool Reachable(uint terr) => IsReachable(terr, unlocked);
 
         // 品目 → エリア → モンスター
         var options = new Dictionary<uint, Dictionary<uint, List<uint>>>();
@@ -393,6 +410,8 @@ public static class CombatPlanner
             {
                 foreach (var spot in sources.SpawnsOf(mob))
                 {
+                    if (!Reachable(spot.Territory))
+                        continue;
                     if (!byTerr.TryGetValue(spot.Territory, out var l))
                         byTerr[spot.Territory] = l = [];
                     if (!l.Contains(mob))
@@ -403,7 +422,10 @@ public static class CombatPlanner
             options[item] = byTerr;
         }
 
-        // 貪欲法：多くの品目を賄えるエリアから決める（解放済みエーテライトのあるエリアを優先）
+        // 行けるエリアが1つも無い品目は戦闘では集められない
+        unreachable = shortfalls.Keys.Where(k => !options.TryGetValue(k, out var o) || o.Count == 0).ToList();
+
+        // 貪欲法：多くの品目を賄えるエリアから決める（行けるエリアだけが候補に残っている）
         var remaining = shortfalls.Keys.Where(k => options.TryGetValue(k, out var o) && o.Count > 0).ToHashSet();
         var result = new List<(uint, List<CombatNeed>, List<Vector2>)>();
         while (remaining.Count > 0)
@@ -411,9 +433,8 @@ public static class CombatPlanner
             var best = remaining
                 .SelectMany(i => options[i].Keys)
                 .Distinct()
-                .Select(t => (Terr: t, Count: remaining.Count(i => options[i].ContainsKey(t)), Reach: HasAetheryte(t)))
-                .OrderByDescending(x => x.Reach)
-                .ThenByDescending(x => x.Count)
+                .Select(t => (Terr: t, Count: remaining.Count(i => options[i].ContainsKey(t))))
+                .OrderByDescending(x => x.Count)
                 .First();
 
             var needs = new List<CombatNeed>();

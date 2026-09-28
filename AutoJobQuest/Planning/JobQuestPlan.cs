@@ -127,10 +127,7 @@ public static class PlanBuilder
         foreach (var (item, total) in plan.Craft.RawTotal.OrderBy(x => x.Key))
         {
             var shortfall = plan.Craft.RawShortfall.GetValueOrDefault(item);
-            var routes = ChooseRoutes(data.Sources!, item);
-            if (excludedRoutes != null && excludedRoutes.TryGetValue(item, out var bad))
-                routes = routes.Where(r => !bad.Contains(r)).ToList();
-
+            var routes = AvailableRoutes(data.Sources!, item, excludedRoutes);
             var first = routes.Count > 0 ? routes[0] : Route.Unknown;
             plan.Raw.Add(new RawNeed
             {
@@ -180,6 +177,25 @@ public static class PlanBuilder
     ///  ・マテリア・デミマテリラ・霊砂はマーケットボードで買う。
     /// それ以外は 採集 → 釣り → 戦闘 → マーケットボード の順に試す。
     /// </summary>
+    /// <summary>
+    /// 実際に使える入手手段（優先順）。計画の表示と実行の両方がこれを使う（表示と動きが食い違わないように）。
+    ///  ・前の周回で失敗した手段を外す
+    ///  ・NPC 購入：GBR の購入機能は Allagan Tools か Allagan Item Search が無いと使えないので外す
+    ///  ・戦闘：落とすモンスターが行けるエリア（野外・解放済みのエーテライトあり）に出なければ外す
+    ///  （使えない手段を試して失敗するまで周回を1回無駄にし、行けないエリアではテレポの段で全体が止まるため）
+    /// </summary>
+    public static List<Route> AvailableRoutes(SourceIndex sources, uint itemId, IReadOnlyDictionary<uint, HashSet<Route>>? excludedRoutes)
+    {
+        var routes = ChooseRoutes(sources, itemId);
+        if (excludedRoutes != null && excludedRoutes.TryGetValue(itemId, out var bad))
+            routes = routes.Where(r => !bad.Contains(r)).ToList();
+        if (routes.Contains(Route.Vendor) && !Svc.PluginInterface.InstalledPlugins.Any(x => x.IsLoaded && x.InternalName is "InventoryTools" or "AllaganItemSearch"))
+            routes.Remove(Route.Vendor);
+        if (routes.Contains(Route.Combat) && !Automation.CombatPlanner.HasReachableSpawn(sources, itemId))
+            routes.Remove(Route.Combat);
+        return routes;
+    }
+
     public static List<Route> ChooseRoutes(SourceIndex sources, uint itemId)
     {
         var s = sources.Get(itemId);

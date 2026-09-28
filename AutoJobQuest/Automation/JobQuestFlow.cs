@@ -44,7 +44,12 @@ public sealed class JobQuestFlow : AutoTask
     private Stage stage = Stage.WaitData;
     private AutoTask? child;
     private int confirmTicket = -1;
-    private int round;
+    // 周回の回数（素材集めと製作で別々に数える。共有すると製作の作り直しが素材集めの上限を食う）
+    private int acquireRound;
+    private int craftRound;
+
+    // マーケットで買えなかった回数（品目ごと。2回で手段から外す）
+    private readonly Dictionary<uint, int> marketFailures = [];
 
     // 入手に失敗した手段（品目 → 手段）
     private readonly Dictionary<uint, HashSet<Route>> excluded = [];
@@ -339,13 +344,13 @@ public sealed class JobQuestFlow : AutoTask
             return TaskResult.Running;
         }
 
-        if (this.round++ >= ctx.Config.MaxRetryRounds + 2)
+        if (this.acquireRound++ >= ctx.Config.MaxRetryRounds + 2)
         {
             var left = string.Join("、", raw.Select(r => $"{CraftPlanner.ItemName(r.Item)}×{r.Need}").Concat(marketMateria.Select(m => m.Label)));
             return this.Fail($"何度集めても足りない素材があります：{left}");
         }
 
-        ctx.Log.Write("素材", $"{this.round}周目：{raw.Count} 品目{(marketMateria.Count > 0 ? $"＋マテリア {marketMateria.Count} 件" : string.Empty)}を集めます");
+        ctx.Log.Write("素材", $"{this.acquireRound}周目：{raw.Count} 品目{(marketMateria.Count > 0 ? $"＋マテリア {marketMateria.Count} 件" : string.Empty)}を集めます");
 
         var unknown = raw.Where(r => r.Routes.Count == 0).ToList();
         if (unknown.Count > 0)
@@ -378,7 +383,15 @@ public sealed class JobQuestFlow : AutoTask
             if (combatJob == null)
                 return this.Fail("戦闘に使えるジョブ（ギアセットのある戦闘ジョブ）がありません");
 
-            foreach (var (terr, needs, spots) in CombatPlanner.Plan(ctx.Data.Sources!, combat))
+            var combatPlan = CombatPlanner.Plan(ctx.Data.Sources!, combat, out var unreachable);
+            foreach (var id in unreachable)
+            {
+                // RoutesFor で外しているので通常は来ない。来たら戦闘をあきらめて次の周回で別の手段にする
+                ctx.Log.Warn("戦闘", $"{CraftPlanner.ItemName(id)} を落とすモンスターは、行けるエリア（野外・解放済みのエーテライトあり）にいません");
+                this.Exclude(id, Route.Combat);
+            }
+
+            foreach (var (terr, needs, spots) in combatPlan)
             {
                 Vector3? firstSpot = spots.Count > 0 ? MapCoords.ToWorld(terr, spots[0].X, spots[0].Y) : null;
                 steps.Add(_ => new EquipJobTask(combatJob.Value.ClassJob));
@@ -422,20 +435,16 @@ public sealed class JobQuestFlow : AutoTask
             }
 
             steps.Add(_ => this.Track(new GatherTask(
-                fish.Select(f => new GatherNeed(f.Item, f.Need)), null, "釣り", TimeSpan.FromMinutes(90))));
+                fish.Select(f => new GatherNeed(f.Item, f.Need)), null, "釣り", TimeSpan.FromMinutes(90), Route.Fish)));
         }
 
-        this.child = new SequenceTask($"素材集め {this.round}周目", steps);
+        this.child = new SequenceTask($"素材集め {this.acquireRound}周目", steps);
         return TaskResult.Running;
     }
 
+    // 使える入手手段（計画の表示と同じ判定：PlanBuilder.AvailableRoutes）
     private List<Route> RoutesFor(TaskContext ctx, uint item)
-    {
-        var routes = PlanBuilder.ChooseRoutes(ctx.Data.Sources!, item);
-        if (this.excluded.TryGetValue(item, out var bad))
-            routes = routes.Where(r => !bad.Contains(r)).ToList();
-        return routes;
-    }
+        => PlanBuilder.AvailableRoutes(ctx.Data.Sources!, item, this.excluded);
 
     /// <summary>
     /// マテリア装着に要るマテリアのうち、カバンに無いもの（マーケットで買う）。
@@ -485,8 +494,16 @@ public sealed class JobQuestFlow : AutoTask
             switch (t)
             {
                 case MarketBoardTask m:
+                    // マーケットは一時的な理由（混雑・その時点で出品が無い）でも失敗するので、2回失敗するまでは外さない
                     foreach (var id in m.UnfinishedItems)
-                        this.Exclude(id, Route.MarketBoard);
+                    {
+                        var n = this.marketFailures[id] = this.marketFailures.GetValueOrDefault(id) + 1;
+                        if (n >= 2)
+                            this.Exclude(id, Route.MarketBoard);
+                        else
+                            ctx.Log.Warn("素材", $"{CraftPlanner.ItemName(id)} はマーケットで買えませんでした（1回目）。次の周回でもう一度マーケットを試します");
+                    }
+
                     break;
                 case VendorTask v:
                     foreach (var id in v.Unfinished)
@@ -497,13 +514,9 @@ public sealed class JobQuestFlow : AutoTask
                         this.Exclude(id, Route.Combat);
                     break;
                 case GatherTask g:
+                    // 採集と釣りのどちらで失敗したかは、作業の種類で決める（品目の性質で決めると、両方で取れる品で取り違える）
                     foreach (var id in g.Unfinished)
-                    {
-                        // 採集と釣りのどちらで失敗したかは品目の入手元で決める
-                        var s = ctx.Data.Sources!.Get(id);
-                        this.Exclude(id, s.CanGather ? Route.Gather : Route.Fish);
-                    }
-
+                        this.Exclude(id, g.Route);
                     break;
             }
         }
@@ -599,7 +612,7 @@ public sealed class JobQuestFlow : AutoTask
         if (plan.Craft.LockedBySecretBook.Count > 0)
             return this.Fail($"秘伝書が未読のため作れない品があります：{string.Join("、", plan.Craft.LockedBySecretBook.Select(c => CraftPlanner.ItemName(c.ItemId)))}");
 
-        if (this.round++ > ctx.Config.MaxRetryRounds + 4)
+        if (this.craftRound++ > ctx.Config.MaxRetryRounds + 4)
             return this.Fail("何度作っても納品物がそろいません（HQ ができない等）");
 
         var steps = new List<Func<TaskContext, AutoTask?>> { _ => new GoToInnTask() };

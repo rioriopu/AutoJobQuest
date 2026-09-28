@@ -56,11 +56,19 @@ public static class Preflight
 
         // 1) プラグイン
         var installed = Svc.PluginInterface.InstalledPlugins.ToList();
+        // 戦闘・釣りの素材が今の計画に無ければ、RSR・AutoHook が無くても止めない（使わない物で止めない）。
+        // ほかの手段が失敗して戦闘・釣りに回ったときは、その作業の開始時に理由を出して止まる
+        bool Uses(Route r) => plan == null || plan.Shortfalls.Any(x => x.Route == r || x.Fallbacks.Contains(r));
         foreach (var (internalName, display, why) in RequiredPlugins)
         {
             var p = installed.FirstOrDefault(x => x.InternalName == internalName);
-            if (p == null || !p.IsLoaded)
-                list.Add(new PreflightItem(Severity.Error, $"{display} が読み込まれていません（{why}に使います）"));
+            if (p != null && p.IsLoaded)
+                continue;
+
+            var optional = (internalName == "RotationSolver" && !Uses(Route.Combat)) || (internalName == "AutoHook" && !Uses(Route.Fish));
+            list.Add(optional
+                ? new PreflightItem(Severity.Warn, $"{display} が読み込まれていません（{why}に使います。今の計画では使いませんが、ほかの手段で集めきれず{why}に回ったときに止まります）")
+                : new PreflightItem(Severity.Error, $"{display} が読み込まれていません（{why}に使います）"));
         }
 
         // GBR の NPC 購入は Allagan Tools か Allagan Item Search が要る
@@ -85,7 +93,17 @@ public static class Preflight
         // 4) 装備（基準値はゲームデータから計算）・ギアセット
         if (ctx.Data.GearBaselines is { } baselines)
         {
-            foreach (var job in Jobs.Crafters)
+            // ギアセットが要るのは、今の計画で製作に使うクラフターだけ（選んだジョブ＋中間素材を作るジョブ＋紫貨の収集品を作るジョブ）。
+            // 使わないクラフターのギアセットが無いだけで止めない
+            var used = new HashSet<uint>(Jobs.Crafters);
+            if (plan != null)
+            {
+                used = plan.RemainingQuests.Select(q => q.ClassJobId).Concat(plan.Craft.Crafts.Select(c => c.ClassJobId)).ToHashSet();
+                if (plan.Craft.LockedBySecretBook.Count > 0 && ctx.Data.Planner?.Pick(ctx.Config.ScripCollectableItemId) is { } collectRecipe)
+                    used.Add(Jobs.CraftTypeToClassJob(collectRecipe.CraftType.RowId));
+            }
+
+            foreach (var job in Jobs.Crafters.Where(used.Contains))
             {
                 var gear = GearCheck.ReadGearset(job);
                 if (gear.GearsetIndex < 0)
@@ -95,6 +113,13 @@ public static class Preflight
                 }
 
                 var (bCr, bCo) = baselines.GetValueOrDefault(job);
+                if (bCr == 0 || bCo == 0)
+                {
+                    // 基準をゲームデータから計算できなかった（ショップの品が見つからない等）。比べても意味が無いので、そう記録する
+                    list.Add(new PreflightItem(Severity.Warn, $"{Jobs.Name(job)} の装備の基準をゲームデータから計算できませんでした（装備の確認を飛ばします）"));
+                    continue;
+                }
+
                 if (gear.Craftsmanship < bCr || gear.Control < bCo)
                 {
                     list.Add(new PreflightItem(Severity.Warn,

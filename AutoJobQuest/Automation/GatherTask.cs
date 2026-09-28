@@ -43,12 +43,19 @@ public sealed class GatherTask : AutoTask
     /// <summary>集めきれなかった品目（呼び出し側が次の手段を選ぶのに使う）。</summary>
     public List<uint> Unfinished { get; } = [];
 
-    public GatherTask(IEnumerable<GatherNeed> needs, uint? preferredTerritory, string label, TimeSpan limit)
+    /// <summary>
+    /// この作業がどの手段か（採集か釣りか）。集めきれなかったときに、どの手段を外すかをこれで決める
+    /// （品目の性質で決めると、採集でも釣りでも取れる品で、失敗した手段と違う手段を外してしまう）。
+    /// </summary>
+    public Planning.Route Route { get; }
+
+    public GatherTask(IEnumerable<GatherNeed> needs, uint? preferredTerritory, string label, TimeSpan limit, Planning.Route route = Planning.Route.Gather)
     {
         this.needs = needs.Where(x => x.Shortfall > 0).ToList();
         this.preferredTerritory = preferredTerritory;
         this.label = label;
         this.limit = limit;
+        this.Route = route;
     }
 
     public override string Name => $"採集: {this.label}";
@@ -183,6 +190,8 @@ public sealed class VendorTask : AutoTask
 {
     private readonly List<VendorNeed> needs;
     private readonly Dictionary<uint, int> targets = [];
+    private readonly Dictionary<uint, int> before = [];
+    private long gilBefore;
     private Guid? listId;
     private bool started;
     private int retries;
@@ -216,7 +225,12 @@ public sealed class VendorTask : AutoTask
             return this.Fail("GBR の自動採集が動いている（または状態が読めない）ので、NPC 購入を始めません");
 
         foreach (var n in this.needs)
-            this.targets[n.ItemId] = VendorCount(n.ItemId) + n.Shortfall;
+        {
+            this.before[n.ItemId] = VendorCount(n.ItemId);
+            this.targets[n.ItemId] = this.before[n.ItemId] + n.Shortfall;
+        }
+
+        this.gilBefore = Inventory.Gil();
 
         // 帰宅テレポの抑止（購入の後に採集へ続くことが多いので、ここでも切っておく）
         ctx.Gbr.OverrideBool("GoHomeWhenDone", false);
@@ -296,15 +310,25 @@ public sealed class VendorTask : AutoTask
 
     private TaskResult Finish(TaskContext ctx)
     {
+        var gained = new List<string>();
         foreach (var (id, target) in this.targets)
         {
             var now = VendorCount(id);
+            if (now > this.before.GetValueOrDefault(id))
+                gained.Add($"{CraftPlanner.ItemName(id)} {this.before.GetValueOrDefault(id)}→{now}");
             if (now < target)
             {
                 this.Unfinished.Add(id);
                 ctx.Log.Warn("購入", $"{CraftPlanner.ItemName(id)} を買いきれませんでした（{now}/{target}）");
             }
         }
+
+        // 減った AND 増えた：品が増えたのにギルが減っていなければ、購入ではない増え方（取り出し等）なので記録に残す
+        var gil = Inventory.Gil();
+        if (gained.Count > 0 && gil >= this.gilBefore)
+            ctx.Log.Warn("購入", $"品は増えましたがギルが減っていません（{this.gilBefore:N0}→{gil:N0}。購入ではない増え方の可能性）：{string.Join("、", gained)}");
+        else if (gained.Count > 0)
+            ctx.Log.Write("購入", $"NPC から買いました（ギル {this.gilBefore:N0}→{gil:N0}）：{string.Join("、", gained)}");
 
         return TaskResult.Done;
     }
