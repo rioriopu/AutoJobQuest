@@ -315,3 +315,20 @@ public sealed class WaitUntilTask : AutoTask
         return this.Elapsed > this.limit ? this.Fail($"{this.name}: {this.limit.TotalSeconds:0}秒待っても条件が満たされませんでした") : TaskResult.Running;
     }
 }
+
+/// <summary>理由を添えてその場で止める（順番に並べた作業の途中で、続けても意味が無いと分かったとき用）。</summary>
+public sealed class StopTask : AutoTask
+{
+    private readonly string reason;
+
+    public StopTask(string reason)
+    {
+        this.reason = reason;
+    }
+
+    public override string Name => "停止";
+
+    protected override TaskResult OnStart(TaskContext ctx) => this.Fail(this.reason);
+
+    protected override TaskResult Tick(TaskContext ctx) => this.Fail(this.reason);
+}

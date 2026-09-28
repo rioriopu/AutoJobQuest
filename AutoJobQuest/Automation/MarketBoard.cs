@@ -414,9 +414,9 @@ public sealed unsafe class MarketBoardTask : AutoTask
 
     private TaskResult OpenBoard(TaskContext ctx)
     {
+        // 「自分が開いた」の印は、こちらが話しかけたときだけ立てる（最初から開いていた画面は利用者のものなので、最後に閉じない）
         if (GameUi.IsReady("ItemSearch", out _))
         {
-            this.openedByMe = true;
             this.Go(Phase.Next, "マーケットボードを開きました");
             return TaskResult.Running;
         }

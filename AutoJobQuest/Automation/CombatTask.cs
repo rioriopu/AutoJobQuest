@@ -58,6 +58,9 @@ public sealed class CombatTask : AutoTask
     // そろった時刻（そろったあとに残った敵を片づける時間の上限に使う）
     private DateTime collectedSince = DateTime.MinValue;
 
+    // 制限時間を過ぎたか（過ぎたら新しい敵は狙わず、残った敵だけ片づけて終わる）
+    private bool timedOut;
+
     private DateTime CollectedAt()
     {
         if (this.collectedSince == DateTime.MinValue)
@@ -100,10 +103,22 @@ public sealed class CombatTask : AutoTask
 
     protected override TaskResult Tick(TaskContext ctx)
     {
-        var wanted = this.WantedMobs();
+        if (Svc.Objects.LocalPlayer is { } dead && dead.IsDead)
+            return this.Fail("倒されました。自動動作を止めます");
+
+        // 制限時間を過ぎたら、以後はもう狙わない。集めきれなかった品を記録し、戦闘中なら片づけてから終わる
+        // （時間切れの瞬間はたいてい戦闘中。そのまま終わると RSR が止まり、次のテレポ・採集が戦闘中で詰まる）
+        if (!this.timedOut && this.Elapsed > this.limit)
+        {
+            this.timedOut = true;
+            this.CollectUnfinished();
+            ctx.Log.Warn("戦闘", $"{this.limit.TotalMinutes:0}分たっても集めきれませんでした（戦闘中なら片づけてから次へ進みます）");
+        }
+
+        var wanted = this.timedOut ? [] : this.WantedMobs();
         if (wanted.Count == 0)
         {
-            // そろっても、こちらを狙っている敵が残っていれば片づけてから終わる
+            // そろっても（または時間切れでも）、こちらを狙っている敵が残っていれば片づけてから終わる
             // （戦闘中のまま次の作業（テレポ・採集）に移ると、そこで失敗する）
             if (GameUi.InCombat && DateTime.UtcNow - this.CollectedAt() < TimeSpan.FromMinutes(2))
             {
@@ -121,23 +136,14 @@ public sealed class CombatTask : AutoTask
             }
 
             if (GameUi.InCombat)
-                ctx.Log.Warn("戦闘", "そろったあと2分たっても戦闘状態が解けません。このまま次へ進みます");
+                ctx.Log.Warn("戦闘", "2分たっても戦闘状態が解けません。このまま次へ進みます");
 
-            ctx.Log.Write("戦闘", $"{TeleportTask.TerritoryName(this.territory)}: そろいました");
+            if (!this.timedOut)
+                ctx.Log.Write("戦闘", $"{TeleportTask.TerritoryName(this.territory)}: そろいました");
             return TaskResult.Done;
         }
 
         this.collectedSince = DateTime.MinValue;
-
-        if (this.Elapsed > this.limit)
-        {
-            this.CollectUnfinished();
-            ctx.Log.Warn("戦闘", $"{this.limit.TotalMinutes:0}分たっても集めきれませんでした");
-            return TaskResult.Done;
-        }
-
-        if (Svc.Objects.LocalPlayer is { } me && me.IsDead)
-            return this.Fail("倒されました。自動動作を止めます");
 
         if (Me.Territory != this.territory)
             return this.Fail("エリアが変わりました");
@@ -204,6 +210,8 @@ public sealed class CombatTask : AutoTask
         // Henched を入れる（こちらが入れていれば送り直さない。RSR が自分で OFF になったときだけ入れ直す）
         if (!ctx.Rotation.EnsureHenched())
             return this.Fail("RSR を Henched モードにできませんでした");
+        if (ctx.Rotation.HenchedUnresponsive)
+            return this.Fail("RSR に Henched への切り替えを送っても動作中になりません（IPC が効いていない可能性。記録の IPC 欄を見てください）");
 
         // ハードターゲットが外れていたら付け直す
         if (Svc.Targets.Target?.GameObjectId != t.GameObjectId)

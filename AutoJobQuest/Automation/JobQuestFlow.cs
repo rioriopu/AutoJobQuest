@@ -277,15 +277,22 @@ public sealed class JobQuestFlow : AutoTask
     }
 
     /// <summary>
-    /// 素材計画に足す、紫貨のための収集品。個数は「持っていたい総数」で渡す
-    /// （計画係が手持ちを引くので、ここで引くと二重になる）。
+    /// 素材計画に足す、紫貨のための収集品。
+    /// 計画係の所持数（Inventory.Snapshot）は収集品の枠を数えないので、手持ちの収集品はここで引く
+    /// （引かないと手持ちの分まで素材を集め、マーケットで要らないギルを使う）。
+    /// 作る数＝要る総数 − 納品の下限を満たす手持ち。計画係は同じ品の通常品の手持ちを引くので、その分を足して渡す（StartBooks と同じ式）。
     /// </summary>
     private IEnumerable<QuestItemReq> ExtraTargets()
     {
         if (this.booksDone || this.books == null || this.collectablesNeeded <= 0)
             yield break;
 
-        yield return new QuestItemReq(this.books.CollectableItemId, this.collectablesNeeded, false, "紫貨のための収集品");
+        var held = Inventory.CountCollectables(this.books.CollectableItemId, this.books.MinCollectability);
+        var make = Math.Max(0, this.collectablesNeeded - held);
+        if (make == 0)
+            yield break;
+
+        yield return new QuestItemReq(this.books.CollectableItemId, make + Inventory.CountNow(this.books.CollectableItemId), false, "紫貨のための収集品");
     }
 
     // ------------------------------------------------------------------
@@ -404,11 +411,14 @@ public sealed class JobQuestFlow : AutoTask
         var fish = raw.Where(r => r.Routes[0] == Route.Fish).ToList();
         if (fish.Count > 0)
         {
-            if (ctx.Gbr.ReadAutoGatherBool("FishDataCollection") != true)
+            var optIn = ctx.Gbr.ReadAutoGatherBool("FishDataCollection");
+            if (optIn != true)
             {
                 return this.Fail(
                     $"釣りで集める素材（{string.Join("、", fish.Select(f => $"{CraftPlanner.ItemName(f.Item)}×{f.Need}"))}）がありますが、"
-                    + "GBR の「Opt-in to fishing data collection」が OFF のため GBR は釣りをしません（こちらからは変えません）");
+                    + (optIn == false
+                        ? "GBR の「Opt-in to fishing data collection」が OFF のため GBR は釣りをしません（こちらからは変えません）"
+                        : "GBR の「Opt-in to fishing data collection」の設定を読めませんでした（GBR の版が変わった可能性。記録の IPC 欄を見てください）"));
             }
 
             steps.Add(_ => this.Track(new GatherTask(
@@ -531,7 +541,7 @@ public sealed class JobQuestFlow : AutoTask
             steps.Add(c =>
             {
                 // 収集品の製作（中間素材から）。この時点の所持数で計画し直す。
-                // 作る数＝要る総数 − 納品の下限を満たす手持ち。計画係は同じ品の手持ち（下限未満も含む）を引くので、その分を足して渡す
+                // 作る数＝要る総数 − 納品の下限を満たす手持ち。計画係は同じ品の通常品の手持ち（収集品の枠は数えない）を引くので、その分を足して渡す
                 var held = Inventory.CountCollectables(b.CollectableItemId, b.MinCollectability);
                 var make = Math.Max(0, this.collectablesNeeded - held);
                 if (make == 0)
@@ -542,8 +552,9 @@ public sealed class JobQuestFlow : AutoTask
                 var plan = c.Data.Planner!.Build([new QuestItemReq(b.CollectableItemId, make + inv.CountAll(b.CollectableItemId), false, string.Empty)], inv, PlanBuilder.IsBookUnlocked);
                 if (plan.RawShortfall.Count > 0)
                 {
-                    c.Log.Warn("秘伝書", $"収集品の素材が足りません：{string.Join("、", plan.RawShortfall.Select(x => $"{CraftPlanner.ItemName(x.Key)}×{x.Value}"))}");
-                    return null;
+                    // 黙って飛ばすと、後の交換で「紫貨が足りません」という別の理由で止まり、原因が分からなくなる
+                    return new StopTask($"紫貨のための収集品（{CraftPlanner.ItemName(b.CollectableItemId)}）の素材が足りません："
+                                        + string.Join("、", plan.RawShortfall.Select(x => $"{CraftPlanner.ItemName(x.Key)}×{x.Value}")));
                 }
 
                 return new SequenceTask("収集品の製作", plan.Crafts.Select(pc => (Func<TaskContext, AutoTask?>)(_ => new CraftOneTask(pc))));

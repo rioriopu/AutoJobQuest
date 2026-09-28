@@ -439,7 +439,24 @@ public sealed unsafe class TalkToNpcTask : AutoTask
             .OrderBy(o => Vector3.Distance(o.Position, Me.Position))
             .FirstOrDefault();
 
-    public override void Cleanup(TaskContext ctx) => this.StopSub(ctx);
+    public override void Cleanup(TaskContext ctx)
+    {
+        this.StopSub(ctx);
+
+        // 失敗して止まったとき、自分の操作で開いた選択肢が残っていれば閉じる（
+        // 残ると次の実行のテレポが「ショップ等の画面が開いている」で待ち続ける）
+        if (!this.opened())
+        {
+            foreach (var name in new[] { "SelectString", "SelectIconString" })
+            {
+                if (ctx.Ownership.TryGetOwned(name, out var own))
+                {
+                    DebugLog.Current?.Line("操作", $"止めたので {name} を閉じます");
+                    GameUi.Fire(own, true, -1);
+                }
+            }
+        }
+    }
 }
 
 /// <summary>
@@ -507,6 +524,10 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
 
     protected override TaskResult OnStart(TaskContext ctx)
     {
+        // 報酬の通貨をアイテムに直せないと、納品が成立しても紫貨の増加を読めない（片方だけ反映に見えて止まる）。先に理由をはっきりさせる
+        if (SpecialCurrency.ItemId(this.data.RewardSpecialCurrencyId) == 0)
+            return this.Fail($"納品の報酬の特殊通貨（番号 {this.data.RewardSpecialCurrencyId}）をアイテムに直せません（クライアントの表にも、設定の控えにもありません）");
+
         ctx.Ownership.Clear();
         ctx.Ownership.IsClaiming = true;
         return TaskResult.Running;
@@ -841,10 +862,8 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
     public static int ScripCap(byte specialId)
     {
         var cm = CurrencyManager.Instance();
-        if (cm == null)
-            return 0;
-        var id = cm->GetItemIdBySpecialId(specialId);
-        if (id == 0)
+        var id = SpecialCurrency.ItemId(specialId);
+        if (cm == null || id == 0)
             return 0;
         if (cm->IsItemLimited(id))
         {
@@ -884,7 +903,7 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
 
     /// <summary>撃つ前に開いていてはいけない画面。</summary>
     private static readonly string[] BlockingAddons =
-        ["ShopExchangeCurrencyDialog", "ShopExchangeItemDialog", "SelectYesno", "SelectString", "SelectIconString", "Talk"];
+        ["ShopExchangeCurrencyDialog", "ShopExchangeItemDialog", "SelectYesno", "SelectString", "SelectIconString", "Talk", "_TextInput"];
 
     /// <summary>本文にこれが出ていたら、交換の確認ではないとみなして押さない。</summary>
     private static readonly string[] DangerousWords = ["捨て", "破棄", "削除", "分解", "精製", "売却", "ログアウト", "タイトル", "トレード"];
@@ -918,6 +937,12 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
 
     protected override TaskResult OnStart(TaskContext ctx)
     {
+        foreach (var o in this.queue)
+        {
+            if (SpecialCurrency.ItemId(o.SpecialCurrencyId) == 0)
+                return this.Fail($"{CraftPlanner.ItemName(o.BookItemId)} の値段の特殊通貨（番号 {o.SpecialCurrencyId}）をアイテムに直せません（クライアントの表にも、設定の控えにもありません）");
+        }
+
         ctx.Ownership.Clear();
         ctx.Ownership.IsClaiming = true;
         return TaskResult.Running;
@@ -1051,8 +1076,14 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
             }
         }
 
+        // 画面の準備ができた直後は系統の一覧がまだ空のことがある（推測）ので、上限まで待ってから諦める（30 秒）
         if (targetPos < 0)
-            return this.Fail($"この窓口の交換画面に {CraftPlanner.ItemName(this.current.BookItemId)} の店（SpecialShop {shopId}）を含む系統がありません");
+        {
+            this.Status = "交換画面の系統が出そろうのを待っています";
+            return this.TimedOut(TimeSpan.FromSeconds(30))
+                ? this.Fail($"この窓口の交換画面に {CraftPlanner.ItemName(this.current.BookItemId)} の店（SpecialShop {shopId}）を含む系統がありません")
+                : TaskResult.Running;
+        }
 
         if (d->SelectedCategoryIndex != targetPos)
         {
@@ -1113,12 +1144,13 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
     {
         var offer = this.current!;
 
-        // 残っている確認窓などがあれば、自分のものは閉じてから。他人のものなら止める（押し合いにしない）
+        // 残っている確認窓などがあれば、前の巻を撃った後に自分の操作で開いたものだけ閉じる。それ以外は止める
+        // （移動・会話の間に利用者や他のプラグインが出した確認まで「自分のもの」に含まれうるため、撃った時刻で絞る）
         foreach (var name in BlockingAddons)
         {
             if (!GameUi.IsReady(name, out _))
                 continue;
-            if (ctx.Ownership.TryGetOwned(name, out var own))
+            if (this.firedAt != DateTime.MinValue && ctx.Ownership.TryGetOwnedSince(name, this.firedAt, out var own))
             {
                 if (DateTime.UtcNow - this.lastClose >= TimeSpan.FromMilliseconds(500))
                 {
@@ -1130,7 +1162,7 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
                 return this.TimedOut(TimeSpan.FromSeconds(10)) ? this.Fail($"{name} が閉じません") : TaskResult.Running;
             }
 
-            return this.Fail($"{name} が開いています（自分が開いたものではないので触りません）。閉じてから始めてください");
+            return this.Fail($"{name} が開いています（交換で自分が開いたものではないので触りません）。閉じてから始めてください");
         }
 
         if (!GameUi.IsReady("InclusionShop", out var addon))
@@ -1166,8 +1198,9 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
 
         if (scrips < offer.Price)
             return this.Fail($"紫貨が足りません（{scrips}/{offer.Price}）");
-        if (Inventory.FreeBagSlots() < 1)
-            return this.Fail("カバンに空きがありません");
+        // 2枠は残す（空きが足りないキャラは AutoRetainer が処理から外すため）
+        if (Inventory.FreeBagSlots() < 3)
+            return this.Fail("カバンの空きが足りません（交換のあとも2枠残るよう、3枠以上空けてください）");
 
         this.beforeBooks = Inventory.CountNow(offer.BookItemId);
         this.beforeScrips = scrips;
@@ -1280,8 +1313,7 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
 
         if (DateTime.UtcNow - this.firedAt <= OwnedDialogWindow && ctx.Ownership.TryGetOwnedSince("SelectYesno", this.firedAt, out var own))
         {
-            var text = body;
-            var bad = DangerousWords.FirstOrDefault(w => text.Contains(w, StringComparison.Ordinal));
+            var bad = DangerousWord(body);
             if (bad != null)
             {
                 ctx.Log.Warn("交換", $"確認に「{bad}」が含まれるので押しません：{body}");
@@ -1393,15 +1425,16 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
         return true;
     }
 
+    /// <summary>本文に押してはいけない語（捨てる・売る・ログアウト等）があればその語、無ければ null。</summary>
+    public static string? DangerousWord(string body)
+        => DangerousWords.FirstOrDefault(w => body.Contains(w, StringComparison.Ordinal));
+
     /// <summary>画面の「払う通貨」の値をアイテム ID に直す（8 以上ならそのまま、未満なら特殊通貨の番号）。</summary>
     private static uint? ResolveCurrency(uint value)
     {
         if (value >= 8)
             return value;
-        var cm = CurrencyManager.Instance();
-        if (cm == null)
-            return null;
-        var id = cm->GetItemIdBySpecialId((byte)value);
+        var id = SpecialCurrency.ItemId((byte)value);
         return id == 0 ? null : id;
     }
 
@@ -1430,6 +1463,7 @@ public sealed unsafe class UseBooksTask : AutoTask
     private int ownedBefore;
     private DateTime usedAt = DateTime.MinValue;
     private DateTime lastClick = DateTime.MinValue;
+    private DateTime lastUnmatchedLog = DateTime.MinValue;
 
     public UseBooksTask(IEnumerable<BookOffer> books)
     {
@@ -1493,15 +1527,33 @@ public sealed unsafe class UseBooksTask : AutoTask
             return TaskResult.Running;
         }
 
+        // 確認（SelectYesno）に答えるのは、交換と同じ2段の判定を通ったものだけ（本の名前だけでは、
+        // 利用者が出した「〇〇秘伝書を捨てますか？」にも「はい」を押しうる）。
+        //  1) 本文に本の名前がある、または 2) 本を使った後に自分の操作で開いた確認で、使ってから10秒以内。
+        //  どちらでも、危ない語を含むものは押さない。
         var text = GameUi.YesnoText(out var yesno);
-        if (text != null && text.Contains(name, StringComparison.Ordinal)
-            && DateTime.UtcNow - this.lastClick > TimeSpan.FromMilliseconds(400))
+        if (text != null && DateTime.UtcNow - this.lastClick > TimeSpan.FromMilliseconds(400))
         {
-            this.lastClick = DateTime.UtcNow;
-            ctx.Log.Write("秘伝書", $"確認に「はい」と答えます：{text}");
-            if (!GameUi.ClickYes(yesno))
-                return this.Fail($"確認の「はい」が押せる状態ではありません：{text}");
-            return TaskResult.Running;
+            var bad = ExchangeBooksTask.DangerousWord(text);
+            var byName = text.Contains(name, StringComparison.Ordinal);
+            var ownFresh = DateTime.UtcNow - this.usedAt <= TimeSpan.FromSeconds(10)
+                           && ctx.Ownership.TryGetOwnedSince("SelectYesno", this.usedAt, out _);
+            if (bad == null && (byName || ownFresh))
+            {
+                this.lastClick = DateTime.UtcNow;
+                ctx.Log.Write("秘伝書", $"確認に「はい」と答えます（{(byName ? "本の名前が本文にある" : "使った直後に自分の操作で開いた確認")}）：{text}");
+                if (!GameUi.ClickYes(yesno))
+                    return this.Fail($"確認の「はい」が押せる状態ではありません：{text}");
+                return TaskResult.Running;
+            }
+
+            if (DateTime.UtcNow - this.lastUnmatchedLog >= TimeSpan.FromSeconds(5))
+            {
+                this.lastUnmatchedLog = DateTime.UtcNow;
+                ctx.Log.Warn("秘伝書", bad != null
+                    ? $"確認に「{bad}」が含まれるので押しません：{text}"
+                    : $"確認が出ていますが、秘伝書のものと判断できないので押しません：{text}");
+            }
         }
 
         if (DateTime.UtcNow - this.usedAt > TimeSpan.FromSeconds(15))

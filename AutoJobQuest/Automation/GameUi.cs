@@ -278,7 +278,11 @@ public static unsafe class GameUi
     /// <summary>空白（半角・全角）を除いて比べるための正規化。</summary>
     public static string Normalize(string s) => s.Replace(" ", string.Empty).Replace("　", string.Empty).Trim();
 
-    /// <summary>SelectYesno の本文。開いていなければ null。</summary>
+    /// <summary>
+    /// SelectYesno の本文（表示される文字だけ）。開いていなければ null。
+    /// Utf8String.ToString は SeString の制御（色・品名の差し込み等）の生のバイトまで文字にしてしまい、
+    /// 品名との照合が外れるので、SeString として解析して TextValue を使う。
+    /// </summary>
     public static string? YesnoText(out AtkUnitBase* addon)
     {
         addon = null;
@@ -286,7 +290,16 @@ public static unsafe class GameUi
             return null;
         addon = a;
         var y = (AddonSelectYesno*)a;
-        return y->PromptText == null ? string.Empty : y->PromptText->NodeText.ToString();
+        if (y->PromptText == null)
+            return string.Empty;
+        try
+        {
+            return Dalamud.Game.Text.SeStringHandling.SeString.Parse(y->PromptText->NodeText.AsSpan().ToArray()).TextValue;
+        }
+        catch
+        {
+            return y->PromptText->NodeText.ToString();
+        }
     }
 
     /// <summary>一般アクション（GeneralAction）を使う。</summary>

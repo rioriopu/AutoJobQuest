@@ -232,17 +232,15 @@ public sealed unsafe class Inventory : IInventoryView
         return values;
     }
 
-    /// <summary>特殊通貨（スクリップなど）の番号からアイテム ID を引き、所持数を返す。</summary>
+    /// <summary>
+    /// 特殊通貨（スクリップなど）の番号からアイテム ID を引き、所持数を返す。
+    /// アイテムに直せなければ itemId=0 で 0 を返す（呼び出し側は「0 個」と区別して扱うこと）。
+    /// </summary>
     public static int CountSpecialCurrency(byte specialId, out uint itemId)
     {
-        itemId = 0;
-        var cm = CurrencyManager.Instance();
+        itemId = SpecialCurrency.ItemId(specialId);
         var im = InventoryManager.Instance();
-        if (cm == null || im == null)
-            return 0;
-
-        itemId = cm->GetItemIdBySpecialId(specialId);
-        if (itemId == 0)
+        if (itemId == 0 || im == null)
             return 0;
 
         return im->GetInventoryItemCount(itemId, false, false, false) + im->GetInventoryItemCount(itemId, true, false, false);

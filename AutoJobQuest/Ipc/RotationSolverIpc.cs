@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 
 namespace AutoJobQuest.Ipc;
@@ -40,23 +41,46 @@ public sealed class RotationSolverIpc : IpcGate
             () => this.Func<byte, object>(Prefix + "ChangeOperatingMode").InvokeAction(mode));
 
     private bool henchedByMe;
+    private DateTime lastHenchedSend = DateTime.MinValue;
+    private int unanswered;
+
+    /// <summary>
+    /// Henched を送っても RSR が動作中にならないことが続いたか（3回）。
+    /// RSR の AutorotationActive は Henched で true になる（State と IsManual が立つ：RSR の RSCommands_StateSpecialCommand.cs・
+    /// DataCenter.IsActivatedIPC）。これが続くのは IPC が効いていないということ
+    /// （BeastHelper の作者は「自前の enum で呼んだら黙って効かなかった」と記録している。Dalamud は型が違う引数を
+    /// JSON で変換するので byte は通るはずだが、実機では未確認のため、黙って送り続けずに気づけるようにする）。
+    /// </summary>
+    public bool HenchedUnresponsive => this.unanswered >= 3;
 
     /// <summary>
     /// Henched にする（まだこちらが入れていなければ）。入れる前に RSR が動いていたら、利用者が使っていたとみなして記録する
     /// （IPC ではモードの種類までは読めないので、戻すときは Off にしかできないため）。
     /// こちらが入れた後に RSR が自分で OFF になった（エリア移動・死亡・着替え）ときは入れ直す。
+    /// 送るのは3秒に1回まで（反映を待たずに毎フレーム送ると、RSR の切り替え表示がチャットにあふれる）。
     /// </summary>
     public bool EnsureHenched()
     {
-        if (this.henchedByMe && this.IsActive() != false)
+        var active = this.IsActive();
+        if (this.henchedByMe && active != false)
+        {
+            this.unanswered = 0;
             return true;
+        }
 
-        if (!this.henchedByMe && this.IsActive() == true)
+        if (DateTime.UtcNow - this.lastHenchedSend < TimeSpan.FromSeconds(3))
+            return true; // 送った直後は反映待ち
+
+        if (!this.henchedByMe && active == true)
             Core.DebugLog.Current?.Line("IPC", "⚠ RSR はこちらが使う前から動いていました。終わったときは Off に戻ります（元のモードは IPC で読めないため）");
+
+        if (this.henchedByMe && active == false && ++this.unanswered >= 3)
+            Core.DebugLog.Current?.Line("IPC", $"⚠ RSR に Henched を {this.unanswered} 回送っても動作中になりません");
 
         if (!this.ChangeOperatingMode(ModeHenched))
             return false;
         this.henchedByMe = true;
+        this.lastHenchedSend = DateTime.UtcNow;
         return true;
     }
 
@@ -66,7 +90,11 @@ public sealed class RotationSolverIpc : IpcGate
         if (!this.henchedByMe)
             return;
         if (this.ChangeOperatingMode(ModeOff))
+        {
             this.henchedByMe = false;
+            this.unanswered = 0;
+            this.lastHenchedSend = DateTime.MinValue;
+        }
     }
 
     /// <summary>自動ローテーションが動いているか。読めなければ null。</summary>

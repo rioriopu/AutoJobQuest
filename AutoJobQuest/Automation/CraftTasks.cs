@@ -192,8 +192,9 @@ public sealed class CraftOneTask : AutoTask
             return TaskResult.Running;
         }
 
-        // 頼んだ直後は Endurance がまだ OFF（レシピ選択の後で ON になる）。IsBusy が立つまで待つ
-        if (!this.sawBusy && this.PhaseElapsed < TimeSpan.FromSeconds(15))
+        // 頼んだ直後は Endurance がまだ OFF（レシピ選択の後で ON になる）。IsBusy が立つか、品が増えるまで待つ。
+        // 60 秒は「動き出さなかった」と判断する上限（15 秒では開始の遅い環境で別の理由の失敗になる）
+        if (!this.sawBusy && this.CountMade(Inventory.Snapshot()) <= this.beforeAll && this.PhaseElapsed < TimeSpan.FromSeconds(60))
             return TaskResult.Running;
 
         var inv = Inventory.Snapshot();

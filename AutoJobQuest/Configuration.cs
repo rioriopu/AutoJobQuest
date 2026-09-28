@@ -47,6 +47,21 @@ public sealed class Configuration : IPluginConfiguration
     public uint AnyMateriaItemId { get; set; } = 5679;
 
     /// <summary>
+    /// 特殊通貨の番号 → アイテムの控え。クライアントの表に無いとき（まだ触れていないスクリップ）だけ使う。
+    /// この対応はゲームのシートに無いので外部の控えとして持つしかない。中身は
+    /// Data\special_currency_map.json と同じ（1=詩学 28、2=クラフタースクリップ:紫貨 33913、4=ギャザラー紫貨 33914、
+    /// 6=クラフター橙貨 41784、7=ギャザラー橙貨 41785）。スクリップの階層が増えると番号が入れ替わるので、そのときは直す。
+    /// </summary>
+    public Dictionary<int, uint> SpecialCurrencyFallback { get; set; } = new()
+    {
+        [1] = 28,
+        [2] = 33913,
+        [4] = 33914,
+        [6] = 41784,
+        [7] = 41785,
+    };
+
+    /// <summary>
     /// 記録（ログ）を残すフォルダ。既定は開発用のフォルダの ログ（作れなければプラグインの設定フォルダの ログ）。
     /// </summary>
     public string LogDirectory { get; set; } = Core.DebugLog.DefaultDirectory;
@@ -87,6 +102,9 @@ public sealed class Configuration : IPluginConfiguration
             if (!this.GbrDisabledListRefs.Any(r => r.Name == name))
                 this.GbrDisabledListRefs.Add(new GbrListRef(name, string.Empty));
         this.GbrDisabledLists.Clear();
+
+        // 特殊通貨の控えを引き当て係へ渡す
+        Data.SpecialCurrency.Fallback = this.SpecialCurrencyFallback;
 
         // 古い設定ファイルで配列の長さが違うと、チェックボックスの描画で範囲外になる
         if (this.SelectedCrafters is not { Length: 8 })
