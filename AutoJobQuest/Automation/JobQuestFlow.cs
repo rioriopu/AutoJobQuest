@@ -386,7 +386,11 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
             ctx.Log.Warn("秘伝書", n);
 
         // 秘伝書の流れに欠かせないデータ（交換の店・報酬・通貨・窓口）がそろっているか。欠けていれば素材を集める前に止める
-        var problems = this.books.Validate(this.requiredBookItems);
+        // 町を選べるかは、StartBooks と同じく「収集品の納品に要るクエスト（この段で自動で進める）」を済んだものとして見る
+        // （以前は既定の見方のまま検証し、自動で進められるのに素材集めの前で止まった）
+        var townQuest = this.books.RequiredQuest;
+        bool QuestDone(uint q) => FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(q) || (q != 0 && q == townQuest);
+        var problems = this.books.Validate(this.requiredBookItems, townAvailable: () => this.books.ChooseTown(questDone: QuestDone) != null, questDone: QuestDone);
         if (problems.Count > 0)
             return this.Fail($"秘伝書のデータが足りないため始めません：{string.Join(" / ", problems)}");
 

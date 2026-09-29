@@ -458,7 +458,7 @@ public static class QuestItemNeeds
 
         // 相手ごとの品で決める。今の段の相手が見つからなければ（データが合わない）、今までの手持ちで進める判断に戻る
         var range = handovers.Where(h => h.Seq >= currentSeq && h.Seq <= lastItemSeq).ToList();
-        if (here.Count == 0 || range.Count == 0)
+        if (range.Count == 0)
             return new Result(stage, QuestItemStage.StillNeeded(items, stage, held), detail);
 
         var full = new HashSet<uint>();

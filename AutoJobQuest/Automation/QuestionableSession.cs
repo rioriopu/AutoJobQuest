@@ -108,7 +108,7 @@ public sealed class QuestionablePriorityGuard
         string msg;
         if (now == null)
             msg = "Questionable の優先リストを読めないので、元に戻せませんでした（Questionable の画面で確かめてください）";
-        else if (now != mine)
+        else if (now != mine && now != Empty && now.Length > 0)
             msg = "Questionable の優先リストが途中で変わっていたので、元に戻さずに今の中身を残しました";
         else
         {
@@ -271,7 +271,10 @@ public sealed class GoToTask : AutoTask
         if (Me.Territory == this.territory)
         {
             this.aethernetRequested = false;
-            if (Vector3.Distance(Me.Position, this.position) <= this.range)
+            // 着いたかは MoveToTask と同じ見方（水平の距離が範囲内で、高さの差が 8 未満）。以前は3次元の距離で見ていたので、
+            // 高さに差がある行き先では MoveToTask がすぐ「着いた」と返し、こちらは着いていないとみなして作り直し続けた
+            var flat = Vector2.Distance(new Vector2(Me.Position.X, Me.Position.Z), new Vector2(this.position.X, this.position.Z));
+            if (flat <= this.range && MathF.Abs(Me.Position.Y - this.position.Y) < 8f)
                 return TaskResult.Done;
             this.sub = new MoveToTask(this.position, this.range, this.label);
             return TaskResult.Running;

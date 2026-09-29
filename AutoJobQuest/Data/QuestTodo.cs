@@ -1,3 +1,4 @@
+using System;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Client.Game.Event;
 
@@ -21,6 +22,19 @@ public static unsafe class QuestTodo
     /// フレームワークのスレッドから呼ぶ。
     /// </summary>
     public static bool? IsChecked(uint questRowId, byte todo)
+    {
+        try
+        {
+            return IsCheckedCore(questRowId, todo);
+        }
+        catch (Exception)
+        {
+            // ゲームの関数の場所を解決できない（ゲームの更新の後など）。読めないとして今までの判断に戻す
+            return null;
+        }
+    }
+
+    private static bool? IsCheckedCore(uint questRowId, byte todo)
     {
         var ef = EventFramework.Instance();
         if (ef == null)
