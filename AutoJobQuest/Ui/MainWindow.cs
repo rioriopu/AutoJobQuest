@@ -368,7 +368,7 @@ public sealed class MainWindow : Window
                     var stageNote = p.ItemStages.GetValueOrDefault(q.RowId, Automation.QuestItemStage.Stage.All) switch
                     {
                         Automation.QuestItemStage.Stage.None => "（納品物は渡し終えています）",
-                        Automation.QuestItemStage.Stage.HeldOnly => "（途中まで渡しています。手持ちで続けます）",
+                        Automation.QuestItemStage.Stage.HeldOnly => "（途中まで渡しています。残りの分を用意します）",
                         _ => string.Empty,
                     };
                     ImGui.TextUnformatted($"  Lv{q.Level} {q.Name}：{items}{materia}{stageNote}");

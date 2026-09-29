@@ -36,10 +36,27 @@ public sealed unsafe class Inventory : IInventoryView
     private readonly Dictionary<uint, int> nq = [];
     private readonly Dictionary<uint, int> hq = [];
 
+    /// <summary>
+    /// 検証の仕組み用：設定すると、ゲームの持ち物の代わりにこれを読む（（品, HQ か）→ 数）。本番では null のまま
+    /// （本番の作業〔CraftOneTask 等〕を偽物の持ち物で通しで動かすため）。
+    /// </summary>
+    public static Func<IReadOnlyDictionary<(uint Item, bool Hq), int>>? TestSource { get; set; }
+
     /// <summary>いまの所持数を写し取る。</summary>
     public static Inventory Snapshot()
     {
         var inv = new Inventory();
+        if (TestSource is { } source)
+        {
+            foreach (var ((item, isHq), n) in source())
+            {
+                var d = isHq ? inv.hq : inv.nq;
+                d[item] = d.GetValueOrDefault(item) + n;
+            }
+
+            return inv;
+        }
+
         var im = InventoryManager.Instance();
         if (im == null)
             return inv;

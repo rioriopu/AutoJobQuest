@@ -16,6 +16,12 @@ namespace AutoJobQuest.Data;
 /// <param name="Evidence">個数の根拠にした本文（確認用）。</param>
 public sealed record QuestItemReq(uint ItemId, int Count, bool Hq, string Evidence);
 
+/// <summary>
+/// 品を受け取る相手1人。段＝QuestListenerParams の ActorSpawnSeq、手順の番号＝ActorDespawnSeq（日誌の TODO_NN の NN。
+/// 120本・342件すべてで「その番号の手順の段＝その相手の段」が一致）、相手＝Listener、品＝その相手が受け取る品。
+/// </summary>
+public sealed record QuestHandover(byte Seq, byte Todo, uint Npc, IReadOnlyList<uint> Items);
+
 /// <summary>マテリア装着の条件。</summary>
 /// <param name="TargetItemId">マテリアを付けるアイテム。</param>
 /// <param name="MateriaItemId">指定のマテリア。null なら種類不問。</param>
@@ -51,6 +57,12 @@ public sealed class JobQuest
     /// 120本のうち47本は、これが最後の段（255）より前（途中で渡し、その後に報告などが残る。解析ツール jqa handover）。
     /// </summary>
     public byte LastItemSeq { get; init; } = 255;
+
+    /// <summary>
+    /// 品を受け取る相手ごとの段・手順・品（ゲームデータから：<see cref="QuestCatalog"/> の FindHandovers）。
+    /// 同じ段で複数の相手に渡すクエスト（Q65601 段2・Q65677 段2）で、どの相手に渡し済みかを見て、残りの相手の品だけを用意するのに使う。
+    /// </summary>
+    public IReadOnlyList<QuestHandover> Handovers { get; init; } = [];
 
     /// <summary>画面・記録用の短い表記。</summary>
     public override string ToString() => $"Lv{this.Level} {this.Name}";
@@ -169,6 +181,7 @@ public sealed class QuestCatalog
 
             var materia = FindMateria(all, todo, ritems, materiaItems);
             var (firstSeq, lastSeq) = FindItemSeqs(q, texts, ritems, notes);
+            var handovers = FindHandovers(q, texts, ritems);
 
             var name = questsJa.TryGetRow(q.RowId, out var ja) ? ja.Name.ExtractText() : q.Name.ExtractText();
             result.Add(new JobQuest
@@ -181,6 +194,7 @@ public sealed class QuestCatalog
                 Materia = materia,
                 FirstItemSeq = firstSeq,
                 LastItemSeq = lastSeq,
+                Handovers = handovers,
             });
         }
 
@@ -255,6 +269,59 @@ public sealed class QuestCatalog
         }
 
         return (seqs.Min(), seqs.Max());
+    }
+
+    /// <summary>
+    /// 品を受け取る相手ごとの品。相手は QuestListenerParams のうち品を受け取る印（ItemBool）のあるもの。品は次の規則で決める
+    /// （クエストのスクリプトの受け渡し GetNpcTradeItemInfo から取った正解の表 72件と全件一致。スクリプトは読まない）：
+    ///  1. その相手の手順（TODO_NN）の文章に出てくる納品物（品のマクロ）。文章に品名が無ければ（「依頼品」等）、クエストの納品物を全部
+    ///  2. 同じ段に相手が2人以上いて、相手の数＝納品物の数で、どの相手の手順の文章にも品名が無ければ、手順の番号の順に RITEM の並び順で1つずつ
+    ///     （Q65601 段2：ピモ→3651・リューリック→2270・ナゴ→4360。Q65677 は文章に品名があるので規則1）
+    ///  3. 前の段の相手の手順が1品だけを名指ししていて、この相手の手順がその品を含む2品以上を名指ししているなら、その品を除く
+    ///     （Q66075 段3：前の段で渡したローズウッド材の名前が文章に出るだけ）
+    /// 読めなければ空（呼び出し側は今までの段だけの判断に戻る）。
+    /// </summary>
+    private static List<QuestHandover> FindHandovers(Quest q, List<KeyValuePair<string, string>> texts, List<uint> ritems)
+    {
+        var order = ritems.Distinct().ToList();
+        var named = new Dictionary<int, List<uint>>();
+        foreach (var (key, value) in texts)
+        {
+            var at = key.IndexOf("_TODO_", StringComparison.Ordinal);
+            if (at < 0 || !int.TryParse(key[(at + 6)..], out var index))
+                continue;
+            named[index] = order.Where(it => Regex.IsMatch(value, $@"sheet\(Item(HQ)?,\s*{it},")).ToList();
+        }
+
+        var listeners = q.QuestListenerParams.Where(l => l.ItemBool && l.Listener != 0).ToList();
+        var result = new List<QuestHandover>();
+        foreach (var group in listeners.GroupBy(l => l.ActorSpawnSeq))
+        {
+            var here = group.OrderBy(l => l.ActorDespawnSeq).ToList();
+            if (here.Count >= 2 && here.Count == order.Count && here.All(l => named.GetValueOrDefault(l.ActorDespawnSeq) is not { Count: > 0 }))
+            {
+                for (var i = 0; i < here.Count; i++)
+                    result.Add(new QuestHandover(here[i].ActorSpawnSeq, here[i].ActorDespawnSeq, here[i].Listener, [order[i]]));
+                continue;
+            }
+
+            foreach (var l in here)
+            {
+                var items = named.GetValueOrDefault(l.ActorDespawnSeq) is { Count: > 0 } n ? n.ToList() : order.ToList();
+                if (items.Count >= 2)
+                {
+                    foreach (var earlier in listeners.Where(e => e.ActorSpawnSeq < l.ActorSpawnSeq))
+                    {
+                        if (named.GetValueOrDefault(earlier.ActorDespawnSeq) is [var only] && items.Contains(only))
+                            items.Remove(only);
+                    }
+                }
+
+                result.Add(new QuestHandover(l.ActorSpawnSeq, l.ActorDespawnSeq, l.Listener, items));
+            }
+        }
+
+        return result.OrderBy(h => h.Seq).ThenBy(h => h.Todo).ToList();
     }
 
     /// <summary>

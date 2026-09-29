@@ -34,6 +34,9 @@ public sealed class Services : IDisposable
     private DateTime nextLeftoverTry = DateTime.MinValue;
     private DateTime nextRsrLeftoverTry = DateTime.MinValue;
     private DateTime nextConsumableTry = DateTime.MinValue;
+
+    // 特殊通貨の控えをクライアントの表で確かめる次の時刻（ログイン中、1分おき）
+    private DateTime nextCurrencyRefresh = DateTime.MinValue;
     private DateTime nextHeartbeat = DateTime.MinValue;
 
     public Services(Configuration config, RunLog log)
@@ -160,6 +163,21 @@ public sealed class Services : IDisposable
             var n = this.Ctx.Artisan.RestoreLeftoverConsumables(this.Config);
             if (n > 0)
                 this.Log.Write("Artisan", $"一時的に「使わない」にしていた食事・薬の指定を {n} レシピ分戻しました");
+        }
+
+        // 特殊通貨の控えを、クライアントの表で確かめて書き換える（違っていたら記録して保存）
+        if (Me.Available && DateTime.UtcNow >= this.nextCurrencyRefresh)
+        {
+            this.nextCurrencyRefresh = DateTime.UtcNow.AddMinutes(1);
+            try
+            {
+                if (Data.SpecialCurrency.RefreshFallback(this.Config.SpecialCurrencyFallback))
+                    this.Config.Save();
+            }
+            catch (Exception ex)
+            {
+                this.Debug.Exception("通貨", "特殊通貨の控えの確かめ", ex);
+            }
         }
 
         this.Ctx.YesAlready.KeepSuppressed();

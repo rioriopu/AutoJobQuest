@@ -99,15 +99,19 @@ public sealed unsafe class QuestTask : AutoTask
         // （渡した後に止めて再開したとき、無い品を理由に止まらないように）
         var inv = Inventory.Snapshot();
         var seq = QuestManager.GetQuestSequence(this.quest.RowId);
-        var stage = QuestItemStage.Decide(seq, this.quest.FirstItemSeq, this.quest.LastItemSeq);
+        var needs = QuestItemNeeds.Decide(this.quest.Items, seq, this.quest.FirstItemSeq, this.quest.LastItemSeq, this.quest.Handovers,
+            todo => QuestTodo.IsChecked(this.quest.RowId, todo), (item, hq) => hq ? inv.CountHq(item) : inv.CountAll(item));
+        var stage = needs.Stage;
+        if (needs.Detail.Length > 0)
+            ctx.Log.Write("クエスト", $"{this.quest} の今の段 {seq} の相手：{needs.Detail}（変数 {NpcStepTask.Hex(NpcStepTask.QuestState(this.quest.RowId).Vars)}）");
         if (stage != QuestItemStage.Stage.All)
         {
             ctx.Log.Write("クエスト", stage == QuestItemStage.Stage.None
                 ? $"{this.quest} は納品物を渡し終えています（今の段 {seq}・品を使う最後の段 {this.quest.LastItemSeq}）。残りの手順を進めます"
-                : $"{this.quest} は納品物を途中まで渡しています（今の段 {seq}）。手持ちの品で続けます（作り足しません）");
+                : $"{this.quest} は納品物を途中まで渡しています（今の段 {seq}）。まだ要る品：{(needs.Needed.Count == 0 ? "なし" : string.Join("、", needs.Needed.Select(n => $"{CraftPlanner.ItemName(n.ItemId)}×{n.Count}")))}");
         }
 
-        foreach (var r in stage == QuestItemStage.Stage.All ? this.quest.Items : [])
+        foreach (var r in needs.Needed)
         {
             var have = r.Hq ? inv.CountHq(r.ItemId) : inv.CountAll(r.ItemId);
             if (have < r.Count)
@@ -117,7 +121,7 @@ public sealed unsafe class QuestTask : AutoTask
                 ctx.Log.Debug("クエスト", $"{CraftPlanner.ItemName(r.ItemId)} を NQ でも持っています（納品窓ではこちらが HQ を選んで入れます）");
         }
 
-        if (stage == QuestItemStage.Stage.All && this.quest.Materia is { } m)
+        if (this.quest.Materia is { } m && needs.Needed.Any(n => n.ItemId == m.TargetItemId))
         {
             var hq = this.quest.Items.FirstOrDefault(x => x.ItemId == m.TargetItemId)?.Hq ?? false;
             if (!Inventory.HasMelded(m.TargetItemId, hq, m.MateriaItemId))
@@ -208,8 +212,9 @@ public sealed unsafe class QuestTask : AutoTask
             if (this.paths != null && this.pathCrafts != null)
             {
                 var inv = Inventory.Snapshot();
+                var seqNow = (byte)stepData.Sequence;
                 var rest = QuestTakeOver.Decide(this.paths, stepData.Sequence, stepData.Step, stepData.InteractionType, this.pathCrafts,
-                    (item, count, hq) => (hq ? inv.CountHq(item) : inv.CountAll(item)) >= count);
+                    (item, count, hq) => (hq ? inv.CountHq(item) : inv.CountAll(item)) >= count, npc => this.RecipientDone(seqNow, npc));
                 if (rest != null)
                 {
                     ctx.Questionable.Stop(Plugin.InternalNameConst);
@@ -219,6 +224,23 @@ public sealed unsafe class QuestTask : AutoTask
                                          + $"この段の残り（{string.Join("→", rest.Select(x => $"{x.Type}（{NpcStepTask.NpcName(x.DataId)}）"))}）をこちらで行います"
                                          + "（納品物は用意済み。既製リストの追加製作・材料の買い足しをさせないため）");
                     this.NextPhase("この段の残りをこちらで行います");
+                    return TaskResult.Running;
+                }
+            }
+
+            // 同じ段で複数の相手に渡すクエストで、Questionable が渡し済みの相手との手順に来たら、止めて残りの相手だけをこちらで行う
+            if (this.paths != null && this.quest.Handovers.Count(h => h.Seq == stepData.Sequence) >= 2)
+            {
+                var seqNow = (byte)stepData.Sequence;
+                var rest = QuestTakeOver.SkipDone(this.paths, stepData.Sequence, stepData.Step, stepData.InteractionType, npc => this.RecipientDone(seqNow, npc));
+                if (rest != null)
+                {
+                    ctx.Questionable.Stop(Plugin.InternalNameConst);
+                    this.own = new Queue<QuestionableStep>(rest);
+                    this.ownFromSeq = stepData.Sequence;
+                    ctx.Log.Write("クエスト", $"Questionable が段 {stepData.Sequence} の渡し済みの相手（{NpcStepTask.NpcName(this.paths.FirstOrDefault(s => s.Sequence == stepData.Sequence && s.Index == stepData.Step)?.DataId)}）に向かったので止め、"
+                                         + $"残りの相手（{string.Join("→", rest.Select(x => NpcStepTask.NpcName(x.DataId)))}）にこちらで渡します（日誌の✓で渡し済みを確かめた）");
+                    this.NextPhase("残りの相手にこちらで渡します");
                     return TaskResult.Running;
                 }
             }
@@ -257,6 +279,18 @@ public sealed unsafe class QuestTask : AutoTask
         }
 
         return TaskResult.Running;
+    }
+
+    /// <summary>
+    /// その段の品を受け取る相手に渡し済みか。同じ段に相手が2人以上いるときだけ、日誌の✓（ゲームの判定）で見る。
+    /// ✓が読めなければ「渡し済みではない」とする（飛ばさない：話しかけても変わらなければ NpcStepTask が「済んだ相手の可能性」として先へ進む）。
+    /// </summary>
+    private bool RecipientDone(byte seq, uint npc)
+    {
+        var here = this.quest.Handovers.Where(h => h.Seq == seq).ToList();
+        if (here.Count < 2)
+            return false;
+        return here.Where(h => h.Npc == npc).Any(h => QuestTodo.IsChecked(this.quest.RowId, h.Todo) == true);
     }
 
     /// <summary>

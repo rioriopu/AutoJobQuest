@@ -406,8 +406,10 @@ public sealed class CombatTask : AutoTask
 
     /// <summary>
     /// FATE の敵か（GameObject.FateId が 0 でない。ClientStructs の GameObject.cs で確認）。
-    /// RSR は既定の設定（IgnoreNonFateInFate）で、自分が入っていない FATE の敵を殴らないので、狙っても HP が減らず 45 秒むだになる
-    /// （RSR の ObjectHelper.cs）。FATE の敵は素材集めでは狙わない（攻撃してくる敵なら反撃はする）。
+    /// RSR は既定の設定（IgnoreNonFateInFate）で、自分が入っていない FATE の敵を殴らない（FATE の中では FATE の敵しか殴らない）ので、
+    /// 狙っても HP が減らず 45 秒むだになる（RSR の ObjectHelper.cs）。戦闘の間はこの設定を OFF にする（RotationSolverIpc.HenchedFalseSettings）ので
+    /// 殴れるようになるが、OFF にできなかったとき（RSR の版の違い等。記録と注意が出る）に備え、FATE の敵は素材集めでは狙わない
+    /// （FATE の敵は同じ名前でも FATE 用の個体で、素材を落とすかも分からない）。攻撃してくる敵なら反撃はする。
     /// </summary>
     private static unsafe bool IsFateMob(IBattleNpc npc)
         => ((FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)npc.Address)->FateId != 0;

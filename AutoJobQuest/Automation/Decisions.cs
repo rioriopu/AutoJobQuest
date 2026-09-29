@@ -376,7 +376,10 @@ public static class QuestItemStage
         /// <summary>まだ品を使っていない（受けていない・品を使う段の前か、その段の途中）。全部要る。</summary>
         All,
 
-        /// <summary>品を使う段の途中まで進んだ（段が2つ以上あるクエストで、先の段を終えた）。どの品を使い終えたかは段だけでは分からないので、手持ちで進める（作り足さない）。</summary>
+        /// <summary>
+        /// 品を使う段の途中まで進んだ（先の段を終えた・同じ段の一部の相手に渡した）。残りの相手の品を用意する（<see cref="QuestItemNeeds"/>）。
+        /// 相手ごとの品が分からないクエストでは、段だけではどの品を使い終えたか分からないので、手持ちで進める（作り足さない）。
+        /// </summary>
         HeldOnly,
 
         /// <summary>品を使う最後の段を過ぎた（渡し終えた）。もう要らない。</summary>
@@ -404,6 +407,88 @@ public static class QuestItemStage
                 .ToList(),
             _ => items.ToList(),
         };
+}
+
+/// <summary>
+/// クエストの今の段と、相手ごとの渡し済み（日誌の✓）から、まだ要る納品物を決める。
+///
+/// 【以前】段だけで決めていた（QuestItemStage）。
+///  ・Q65677（品を使う最初の段＝最後の段＝2、段2で2人に別々の品）：1人に渡した後に止めて再開すると「全部要る」になり、渡した品を作り直すか
+///    「0/1 しかありません」で止まった。
+///  ・品を使う段の途中は「手持ちの数まで」（作り足さない）だったので、売った・捨てた品があると、渡す相手の前で止まった。
+/// 【いま】相手ごとの品（JobQuest.Handovers）があれば、今の段〜品を使う最後の段の相手のうち、まだ渡していない相手の品を「全部の数」要るとする
+/// （無ければ作る）。同じ段に相手が2人以上いるときだけ、日誌の✓（ゲームの判定 QuestTodo.IsChecked）で渡し済みかを見る
+/// （相手が1人の段は、その相手に渡せば段が進むので、今の段にいる＝まだ渡していない）。✓が読めない相手の品は、今までどおり手持ちの数まで。
+/// 相手ごとの品が無い・今の段の相手が見つからないときは、今までの段だけの判断のまま。
+/// </summary>
+public static class QuestItemNeeds
+{
+    /// <param name="Stage">段の区分（画面の注記・マテリア装着の判断に使う）。</param>
+    /// <param name="Needed">まだ要る納品物（数は用意する数）。</param>
+    /// <param name="Detail">相手ごとの状態（記録用。無ければ空）。</param>
+    public sealed record Result(QuestItemStage.Stage Stage, List<QuestItemReq> Needed, string Detail);
+
+    /// <param name="items">クエストの納品物。</param>
+    /// <param name="currentSeq">今の段（受けていなければ 0）。</param>
+    /// <param name="firstItemSeq">品を使う最初の段。</param>
+    /// <param name="lastItemSeq">品を使う最後の段。</param>
+    /// <param name="handovers">相手ごとの段・手順・品。</param>
+    /// <param name="todoDone">日誌の手順に✓が付いているか（読めなければ null）。</param>
+    /// <param name="held">手持ちの数（品, HQ だけ数えるか）。</param>
+    public static Result Decide(IReadOnlyList<QuestItemReq> items, byte currentSeq, byte firstItemSeq, byte lastItemSeq,
+        IReadOnlyList<QuestHandover> handovers, Func<byte, bool?> todoDone, Func<uint, bool, int> held)
+    {
+        var stage = QuestItemStage.Decide(currentSeq, firstItemSeq, lastItemSeq);
+        if (stage == QuestItemStage.Stage.None)
+            return new Result(stage, [], string.Empty);
+
+        // 今の段の相手（2人以上なら、それぞれ渡し済みかを日誌の✓で見る）
+        var here = handovers.Where(h => h.Seq == currentSeq).ToList();
+        var done = here.ToDictionary(h => h, h => here.Count >= 2 ? todoDone(h.Todo) : false);
+        var detail = here.Count >= 2
+            ? string.Join("・", here.Select(h => $"手順{h.Todo}（相手 {h.Npc}）：{(done[h] switch { true => "渡し済み", false => "まだ", _ => "読めない" })}"))
+            : string.Empty;
+
+        if (stage == QuestItemStage.Stage.All)
+        {
+            if (currentSeq == 0 || currentSeq < firstItemSeq || !done.Values.Any(d => d == true))
+                return new Result(stage, items.ToList(), detail);
+            stage = QuestItemStage.Stage.HeldOnly;
+        }
+
+        // 相手ごとの品で決める。今の段の相手が見つからなければ（データが合わない）、今までの手持ちで進める判断に戻る
+        var range = handovers.Where(h => h.Seq >= currentSeq && h.Seq <= lastItemSeq).ToList();
+        if (here.Count == 0 || range.Count == 0)
+            return new Result(stage, QuestItemStage.StillNeeded(items, stage, held), detail);
+
+        var full = new HashSet<uint>();
+        var heldOnly = new HashSet<uint>();
+        foreach (var h in range)
+        {
+            var d = h.Seq == currentSeq ? done[h] : false;
+            if (d == true)
+                continue;
+            foreach (var it in h.Items)
+                (d == null ? heldOnly : full).Add(it);
+        }
+
+        var needed = new List<QuestItemReq>();
+        foreach (var r in items)
+        {
+            if (full.Contains(r.ItemId))
+            {
+                needed.Add(r);
+            }
+            else if (heldOnly.Contains(r.ItemId))
+            {
+                var n = Math.Min(r.Count, held(r.ItemId, r.Hq));
+                if (n > 0)
+                    needed.Add(r with { Count = n });
+            }
+        }
+
+        return new Result(stage, needed, detail);
+    }
 }
 
 /// <summary>

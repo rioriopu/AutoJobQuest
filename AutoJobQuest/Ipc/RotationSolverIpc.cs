@@ -11,7 +11,8 @@ namespace AutoJobQuest.Ipc;
 /// 一致しない（RSR IPCProvider.cs:19）。導入判定は InternalName、呼び出しは前置詞で行う。
 ///
 /// 【型】ChangeOperatingMode の引数は enum StateCommandType : byte。byte で渡しても Dalamud が JSON 変換する
-/// （Questionable が自前の enum で同じように呼んでいる）。
+/// （Questionable も自前の enum で同じように呼んでいる：Questionable の External\RotationSolverRebornIpc.cs。
+/// Dalamud の型の変換は、ソースと手元の再現で確かめた）。
 ///   Off=0, Auto=1, TargetOnly=2, Manual=3, AutoDuty=4, Henched=5, PvP=6
 ///
 /// 【Henched（5）を使う理由】IsManual=true になり、敵への行動は「いまのハードターゲット」だけが対象になる
@@ -297,8 +298,10 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
     /// Henched を送っても RSR が動作中にならない（false）か、状態が読めない（null）ことが続いたか（それぞれ3回）。
     /// RSR の AutorotationActive は Henched で true になる（State と IsManual が立つ：RSR の RSCommands_StateSpecialCommand.cs・
     /// DataCenter.IsActivatedIPC）。これが続くのは IPC が効いていないということ
-    /// （BeastHelper の作者は「自前の enum で呼んだら黙って効かなかった」と記録している。Dalamud は型が違う引数を
-    /// JSON で変換するので byte は通るはずだが、実機では未確認のため、黙って送り続けずに気づけるようにする）。
+    /// （BeastHelper の作者は「自前の enum で呼んだら黙って効かなかった」と記録している。Dalamud が型の違う引数を JSON で変換して
+    /// byte が通ることは、ソースと手元の再現で確かめた（BeastHelper の失敗の原因は、失敗した版が
+    /// 履歴に無く分からなかった）。残る原因は PvP のエリア・RSR の自動 OFF。送った直後にモードを読んで確かめ（EnsureHenched）、
+    /// それでも黙って送り続けないよう、ここでも数える）。
     ///
     /// 【true だけを成功とみなす】以前は「読めない（null）」も成功側に数えていたので、
     /// 状態の読み出しだけが壊れていると、攻撃しないまま近づき続け、3回で止める仕組みも働かなかった。

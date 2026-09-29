@@ -140,6 +140,9 @@ public sealed class JobQuestPlan
     /// <summary>クエストの今の段（納品物がもう要らない・手持ちで進めるものだけ。画面・記録用）。</summary>
     public Dictionary<uint, Automation.QuestItemStage.Stage> ItemStages { get; } = [];
 
+    /// <summary>途中まで渡したクエストの、まだ要る納品物（マテリア装着の判断に使う）。</summary>
+    public Dictionary<uint, List<QuestItemReq>> PartialNeeds { get; } = [];
+
     /// <summary>
     /// 残りのジョブクエのうち、前提のクエスト（メインクエスト等）が未完了で進められないもの。
     /// 計画（素材・製作・装着）には入れない（進められないクエストの素材を集めない）。
@@ -231,12 +234,19 @@ public static class PlanBuilder
 
         // 0) 途中の段で納品物を渡すクエスト（120本中47本）は、今の段によっては納品物がもう要らない・手持ちで足りる
         //    （以前は、渡した後に止めて再開すると、同じ品をもう一度作っていた）
+        //    同じ段で複数の相手に渡すクエストは、相手ごとの渡し済み（日誌の✓）を見て、残りの相手の品を用意する（QuestItemNeeds）
         foreach (var q in plan.RemainingQuests)
         {
-            var stage = Automation.QuestItemStage.Decide(QuestManager.GetQuestSequence(q.RowId), q.FirstItemSeq, q.LastItemSeq);
+            var needs = Automation.QuestItemNeeds.Decide(q.Items, QuestManager.GetQuestSequence(q.RowId), q.FirstItemSeq, q.LastItemSeq, q.Handovers,
+                todo => QuestTodo.IsChecked(q.RowId, todo), (item, hq) => hq ? inv.CountHq(item) : inv.CountAll(item));
+            var stage = needs.Stage;
             if (stage != Automation.QuestItemStage.Stage.All)
+            {
                 plan.ItemStages[q.RowId] = stage;
-            plan.Targets.AddRange(Automation.QuestItemStage.StillNeeded(q.Items, stage, (item, hq) => hq ? inv.CountHq(item) : inv.CountAll(item)));
+                plan.PartialNeeds[q.RowId] = needs.Needed;
+            }
+
+            plan.Targets.AddRange(needs.Needed);
 
             // Questionable の「Craft」手順のうち、納品物ではない品（中間素材）の手順は、手元に無いと Artisan の既製リストが動いて
             // 追加製作・材料の買い足しになる。その数も手元に残るよう作る（まだ手順の前のクエストだけ）
@@ -283,10 +293,10 @@ public static class PlanBuilder
 
             var hq = q.Items.FirstOrDefault(x => x.ItemId == m.TargetItemId)?.Hq ?? false;
 
-            // 納品物を渡し終えたクエストは装着も要らない。途中まで渡したクエストは、付ける品が手元にあるときだけ
+            // 納品物を渡し終えたクエストは装着も要らない。途中まで渡したクエストは、付ける品がまだ要る品に入っているときだけ
             var stage = plan.ItemStages.GetValueOrDefault(q.RowId, Automation.QuestItemStage.Stage.All);
             if (stage == Automation.QuestItemStage.Stage.None
-                || (stage == Automation.QuestItemStage.Stage.HeldOnly && (hq ? inv.CountHq(m.TargetItemId) : inv.CountAll(m.TargetItemId)) == 0))
+                || (stage == Automation.QuestItemStage.Stage.HeldOnly && !plan.PartialNeeds.GetValueOrDefault(q.RowId, []).Any(n => n.ItemId == m.TargetItemId)))
                 continue;
             plan.Materia.Add(new MateriaNeed
             {

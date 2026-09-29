@@ -151,9 +151,10 @@ public static class QuestTakeOver
     /// <param name="type">その手順の種類。</param>
     /// <param name="crafts">その段の Craft 手順（品・数・HQ）。</param>
     /// <param name="held">品を持っているか（品, 数, HQ で数えるか）。</param>
+    /// <param name="doneRecipient">その相手に渡し済みか（渡し済みの相手との手順はこちらでも行わない）。省略時は誰も渡し済みでない。</param>
     /// <returns>こちらで行う手順（引き継がないなら null）。</returns>
     public static List<QuestionableStep>? Decide(IReadOnlyList<QuestionableStep> steps, int sequence, int stepIndex, string type,
-        IReadOnlyList<QuestionableCraftStep> crafts, Func<uint, int, bool, bool> held)
+        IReadOnlyList<QuestionableCraftStep> crafts, Func<uint, int, bool, bool> held, Func<uint, bool>? doneRecipient = null)
     {
         if (type is not ("PurchaseItem" or "Craft"))
             return null;
@@ -181,8 +182,37 @@ public static class QuestTakeOver
         var rest = inSeq.Where(s => s.Index > last).ToList();
         if (rest.Count == 0 || rest.Any(s => !OwnTypes.Contains(s.Type)))
             return null;
-        return rest;
+        return WithoutDone(rest, doneRecipient);
     }
+
+    /// <summary>
+    /// Questionable が、同じ段の渡し済みの相手との手順（Interact）に来たら引き継ぐ。
+    /// 経路データの「話しかける」手順には、渡し済みで飛ばす条件（CompletionQuestVariablesFlags）が無いので（Q65601・Q65677 の段2）、
+    /// Questionable は渡し済みの相手の前で頭上のマーカーを待ち続けると見込まれる。
+    /// そこで止めて、その段の残りのうち、まだの相手との手順だけをこちらで行う。
+    /// </summary>
+    /// <param name="steps">そのクエストの全手順（経路データ）。</param>
+    /// <param name="sequence">Questionable がいま進めている段。</param>
+    /// <param name="stepIndex">Questionable がいま進めている手順の番号。</param>
+    /// <param name="type">その手順の種類。</param>
+    /// <param name="doneRecipient">その相手に渡し済みか。</param>
+    /// <returns>こちらで行う手順（引き継がないなら null）。</returns>
+    public static List<QuestionableStep>? SkipDone(IReadOnlyList<QuestionableStep> steps, int sequence, int stepIndex, string type, Func<uint, bool> doneRecipient)
+    {
+        if (type != "Interact")
+            return null;
+        var current = steps.FirstOrDefault(s => s.Sequence == sequence && s.Index == stepIndex);
+        if (current?.DataId is not { } npc || !doneRecipient(npc))
+            return null;
+
+        var rest = steps.Where(s => s.Sequence == sequence && s.Index >= stepIndex).OrderBy(s => s.Index).ToList();
+        if (rest.Any(s => !OwnTypes.Contains(s.Type)))
+            return null;
+        return WithoutDone(rest, doneRecipient);
+    }
+
+    private static List<QuestionableStep> WithoutDone(List<QuestionableStep> rest, Func<uint, bool>? doneRecipient)
+        => doneRecipient == null ? rest : rest.Where(s => !(s.Type == "Interact" && s.DataId is { } id && doneRecipient(id))).ToList();
 }
 
 /// <summary>
@@ -471,7 +501,7 @@ public sealed unsafe class NpcStepTask : AutoTask
         return TaskResult.Running;
     }
 
-    private static string Hex(byte[] v) => v.Length == 0 ? "-" : string.Join(" ", v.Select(b => b.ToString("X2")));
+    internal static string Hex(byte[] v) => v.Length == 0 ? "-" : string.Join(" ", v.Select(b => b.ToString("X2")));
 
     public override void Cleanup(TaskContext ctx)
     {
