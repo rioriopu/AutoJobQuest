@@ -42,6 +42,12 @@ public sealed class TaskContext
     /// </summary>
     public List<(string Name, DateTime Until, Func<bool> Step)> AfterStop { get; } = [];
 
+    /// <summary>
+    /// 実行係が止まるところで、後始末をしている最中か（「停止」・失敗・完了・読み込みの解除）。
+    /// 作業の後始末は、実行の途中で子の作業を取り替えるときにも呼ばれるので、止めた後に残す見張りはこれが true のときだけ置く。
+    /// </summary>
+    public bool Stopping { get; set; }
+
     /// <summary>マーケットの検索結果（件数）の通知。</summary>
     public required Automation.MarketBoardWatcher MarketWatcher { get; init; }
 

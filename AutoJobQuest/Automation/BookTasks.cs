@@ -29,6 +29,9 @@ public sealed class RunQuestTask : AutoTask
     private bool jobChecked;
     private EquipJobTask? equip;
 
+    // Questionable がまだ動いているのを最初に見た時刻（前のクエストの後片付けが終わるのを少し待つ）
+    private DateTime? busySince;
+
     public RunQuestTask(uint questRowId, string label)
     {
         this.questRowId = questRowId;
@@ -74,8 +77,8 @@ public sealed class RunQuestTask : AutoTask
                     return this.Fail(failed);
             }
 
-            if (ctx.Questionable.IsRunning() == true)
-                return this.Fail("Questionable がすでに動いています");
+            if (!this.QuestionableIdle(ctx, out var busyResult))
+                return busyResult;
             if (!GameUi.PlayerFree())
                 return TaskResult.Running;
             if (!ctx.Questionable.StartSingleQuest(this.questRowId))
@@ -102,6 +105,30 @@ public sealed class RunQuestTask : AutoTask
         }
 
         return TaskResult.Running;
+    }
+
+    /// <summary>Questionable が止まっているか。動いていれば少し待ち（戻り値 false・Running）、待っても止まらなければ止める。</summary>
+    private bool QuestionableIdle(TaskContext ctx, out TaskResult result)
+    {
+        var running = ctx.Questionable.IsRunning();
+        if (running == true)
+            this.busySince ??= DateTime.UtcNow;
+        else
+            this.busySince = null;
+
+        switch (Automation.QuestionableIdle.Decide(running, this.busySince is { } since ? DateTime.UtcNow - since : TimeSpan.Zero))
+        {
+            case Automation.QuestionableIdle.Verdict.Wait:
+                this.Status = "Questionable が前の動作を終えるのを待っています";
+                result = TaskResult.Running;
+                return false;
+            case Automation.QuestionableIdle.Verdict.Fail:
+                result = this.Fail($"Questionable が {Automation.QuestionableIdle.Limit.TotalSeconds:0} 秒たっても動いたままです（利用者の操作を横取りしないため止めました）");
+                return false;
+            default:
+                result = TaskResult.Running;
+                return true;
+        }
     }
 
     public override void Cleanup(TaskContext ctx)
@@ -261,6 +288,11 @@ public static class MenuPicker
 ///  ・選択肢：手がかりの順に試す。同じ選択を4回・合計9回選んでも進まなければ失敗。選択肢が変わらないまま
 ///    2秒たっても合うものが無ければ失敗。メニューが閉じたら1度だけ話しかけ直す。
 ///  ・マウントに乗っていたら降りてから話しかける。
+///  ・触るのは、自分が最初に話しかけた後の会話と選択肢だけ（名前で引いた窓を誰のものでも進めないため）。
+///    選択肢（SelectString・SelectIconString）は開くたびに作られる（YesAlready も PostSetup で扱っている）ので、
+///    「最初に話しかけた後に開いた自分のもの」で確かめる。会話（Talk）は開くたびに作られるとは限らない（YesAlready は PostUpdate で扱う）ので、
+///    持ち主の記録では確かめず、「自分が話しかける前から出ていた会話は送らない」だけにする。
+///    呼び出し側は、この作業の間 <see cref="AddonOwnership.IsClaiming"/> を true にしておくこと。
 /// </summary>
 public sealed unsafe class TalkToNpcTask : AutoTask
 {
@@ -285,6 +317,9 @@ public sealed unsafe class TalkToNpcTask : AutoTask
 
     private DateTime lastTalk = DateTime.MinValue;
     private DateTime lastInteract = DateTime.MinValue;
+
+    // 最初に話しかけた時刻。これより後に開いた選択肢だけを自分のものとして扱う
+    private DateTime firstInteractAt = DateTime.MinValue;
     private DateTime lastMenu = DateTime.MinValue;
     private DateTime lastReapproach = DateTime.MinValue;
     private DateTime lastDismount = DateTime.MinValue;
@@ -394,10 +429,28 @@ public sealed unsafe class TalkToNpcTask : AutoTask
             return TaskResult.Running;
         }
 
-        if (GameUi.MenuEntries(out _) != null)
+        // 自分が話しかける前から会話が出ている（利用者・他のプラグインの会話）。送らずに待ち、消えなければ止める
+        if (this.firstInteractAt == DateTime.MinValue && GameUi.IsVisible("Talk"))
         {
-            this.GoTo(TalkStep.Menu, "会話の選択肢を選んでいます", TimeSpan.FromSeconds(45));
-            return TaskResult.Running;
+            this.Status = "話しかける前から会話が出ています（自分のものではないので送りません）";
+            return DateTime.UtcNow > this.stepDeadline
+                ? this.Fail($"{this.label} に話しかける前から会話が出ていて、消えませんでした（自分のものではないので送りません）")
+                : TaskResult.Running;
+        }
+
+        if (GameUi.MenuEntries(out var menuNow) != null)
+        {
+            if (this.IsOwnMenu(ctx, menuNow))
+            {
+                this.GoTo(TalkStep.Menu, "会話の選択肢を選んでいます", TimeSpan.FromSeconds(45));
+                return TaskResult.Running;
+            }
+
+            // 自分が話しかけた後に開いたものではない選択肢。触らずに待ち、消えなければ止める
+            this.Status = "選択肢が開いていますが、自分が話しかけた後に開いたものではないので触りません";
+            return DateTime.UtcNow > this.stepDeadline
+                ? this.Fail($"選択肢が開いていますが、{this.label} に話しかけた後に開いたものではないので触りませんでした。閉じてからやり直してください")
+                : TaskResult.Running;
         }
 
         var npc = FindNpc(this.spot.NpcId);
@@ -443,7 +496,10 @@ public sealed unsafe class TalkToNpcTask : AutoTask
         // 動けない状態（会話の開始待ち・詠唱など）なら待つ。ターゲット → 次の呼び出しで話しかけ、を1秒おきに
         if (GameUi.PlayerFree() && DateTime.UtcNow - this.lastInteract >= TimeSpan.FromSeconds(1))
         {
+            // 時刻は話しかける前に取る（話しかけと同じフレームで開いた選択肢も「後に開いた」に入るように）
             this.lastInteract = DateTime.UtcNow;
+            if (this.firstInteractAt == DateTime.MinValue)
+                this.firstInteractAt = this.lastInteract;
             GameUi.Interact(npc);
             this.Status = $"{npc.Name} に話しかけています";
         }
@@ -463,6 +519,8 @@ public sealed unsafe class TalkToNpcTask : AutoTask
         }
 
         var entries = GameUi.MenuEntries(out var menu);
+        if (entries != null && !this.IsOwnMenu(ctx, menu))
+            return this.Fail($"選択肢が開いていますが、{this.label} に話しかけた後に開いたものではないので触りませんでした（選択肢: {string.Join(" / ", entries)}）");
         if (entries == null)
         {
             // 選択肢が閉じただけかもしれないので、話しかけからやり直す。ただし1度だけ
@@ -527,8 +585,25 @@ public sealed unsafe class TalkToNpcTask : AutoTask
             : $"合う選択肢がありません。手がかり: {string.Join(" / ", this.hints)} / 選択肢: {string.Join(" / ", entries)}");
     }
 
+    /// <summary>その選択肢の窓が、最初に話しかけた後に開いた自分のものか。</summary>
+    private bool IsOwnMenu(TaskContext ctx, AtkUnitBase* menu)
+    {
+        if (this.firstInteractAt == DateTime.MinValue || menu == null)
+            return false;
+        foreach (var name in new[] { "SelectString", "SelectIconString" })
+        {
+            if (ctx.Ownership.TryGetOwnedSince(name, this.firstInteractAt, out var own) && own == menu)
+                return true;
+        }
+
+        return false;
+    }
+
     private bool TryAdvanceTalk()
     {
+        // 自分が話しかける前の会話は送らない
+        if (this.firstInteractAt == DateTime.MinValue)
+            return false;
         if (!GameUi.IsReady("Talk", out _))
             return false;
         if (DateTime.UtcNow - this.lastTalk >= TimeSpan.FromMilliseconds(300))
@@ -565,12 +640,13 @@ public sealed unsafe class TalkToNpcTask : AutoTask
         this.StopSub(ctx);
 
         // 失敗して止まったとき、自分の操作で開いた選択肢が残っていれば閉じる（
-        // 残ると次の実行のテレポが「ショップ等の画面が開いている」で待ち続ける）
-        if (!this.opened())
+        // 残ると次の実行のテレポが「ショップ等の画面が開いている」で待ち続ける）。
+        // 閉じるのは、最初に話しかけた後に開いたものだけ（移動の間に開いた他人の選択肢を閉じない）
+        if (!this.opened() && this.firstInteractAt != DateTime.MinValue)
         {
             foreach (var name in new[] { "SelectString", "SelectIconString" })
             {
-                if (ctx.Ownership.TryGetOwned(name, out var own))
+                if (ctx.Ownership.TryGetOwnedSince(name, this.firstInteractAt, out var own))
                 {
                     DebugLog.Current?.Line("操作", $"止めたので {name} を閉じます");
                     GameUi.Fire(own, true, -1);
@@ -591,7 +667,7 @@ public sealed unsafe class TalkToNpcTask : AutoTask
 ///    「選ぶ前の行数から変わった」のを見るまで撃たない。納品ボタン（node 51）が押せるだけでは撃たない。2秒で諦める。
 ///  ・やめる：交換に要る紫貨（呼び出し側が渡す）に届いたら、収集品が残っていてもやめる。
 ///  ・渡す：Fire(15, 0u)。確認ダイアログは出ず、1回で1個。
-///  ・成功は「その収集品が減った AND 紫貨が増えた」（2.5秒まで待つ）。狙っていない収集品が減ったら即停止。
+///  ・成功は「その収集品が減った AND 紫貨が増えた」（10秒まで待つ）。狙っていない収集品が減ったら即停止。
 ///    変わらなければ1度だけ撃ち直す。
 ///  ・終わったら（成功でも失敗でも）自分が開いた画面だけを閉じる（1手目 Close、2手目以降 Fire(-1)。0.8秒おき。10秒で失敗）。
 /// </summary>
@@ -608,7 +684,9 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
 
     private static readonly TimeSpan TradeReadyLimit = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan TradeReadyDumpAfter = TimeSpan.FromSeconds(1);
-    private static readonly TimeSpan VerifyLimit = TimeSpan.FromMilliseconds(2500);
+    // 納品の反映を待つ上限。これを過ぎても変わらなければ1度だけ撃ち直すので、混雑で反映が遅いときに二重に渡さないよう長めにとる
+    // （以前は 2.5 秒。成功ならその時点で次へ進むので、長くしても普段は遅くならない）
+    private static readonly TimeSpan VerifyLimit = TimeSpan.FromSeconds(10);
 
     private readonly BookData data;
     private readonly NpcSpot npc;
@@ -640,6 +718,8 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
 
     private DateTime lastClose = DateTime.MinValue;
     private int closeAttempts;
+    private bool shopFallbackLogged;
+    private bool startedWithShopOpen;
 
     public int Delivered { get; private set; }
 
@@ -664,6 +744,14 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
         if (SpecialCurrency.ItemId(this.data.RewardSpecialCurrencyId) == 0)
             return this.Fail($"納品の報酬の特殊通貨（番号 {this.data.RewardSpecialCurrencyId}）をアイテムに直せません（クライアントの表にも、設定の控えにもありません）");
 
+        // 始める前から開いている納品画面は、利用者か他の操作のもの。使わない（以前は
+        // 開いていれば話しかけを飛ばし、そのまま撃っていた）
+        if (GameUi.IsVisible("CollectablesShop"))
+        {
+            this.startedWithShopOpen = true;
+            return this.Fail("収集品の納品画面が開いています（自分が開いたものではないので使いません）。閉じてからやり直してください");
+        }
+
         ctx.Ownership.Clear();
         ctx.Ownership.IsClaiming = true;
         return TaskResult.Running;
@@ -684,15 +772,15 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
                 return this.RunSub(ctx, DeliverStep.Talk);
 
             case DeliverStep.Talk:
-                this.sub ??= new TalkToNpcTask(this.npc, () => GameUi.IsReady("CollectablesShop", out _), "収集品納品窓口", [this.data.CollectablesShopName]);
+                this.sub ??= new TalkToNpcTask(this.npc, () => this.TryGetShop(ctx, out _), "収集品納品窓口", [this.data.CollectablesShopName]);
                 return this.RunSub(ctx, DeliverStep.Select);
 
             case DeliverStep.Close:
                 return this.Close(ctx);
         }
 
-        // ここから先は納品画面が開いている前提。閉じたら撃ち続けない
-        if (!GameUi.IsReady("CollectablesShop", out var addon))
+        // ここから先は自分が開いた納品画面が開いている前提。閉じたら撃ち続けない
+        if (!this.TryGetShop(ctx, out var addon))
             return this.Fail($"納品画面が閉じました（{this.Delivered} 個まで納品済み）");
 
         return this.step switch
@@ -701,6 +789,26 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
             DeliverStep.WaitTrade => this.TickWaitTrade(ctx, addon),
             _ => this.TickVerify(ctx),
         };
+    }
+
+    /// <summary>
+    /// 自分の納品画面か。持ち主の記録があればそれ。無ければ、始める前は閉じていた（OnStart で確かめた）ので、その後に開いた画面を自分のものとして扱う。
+    /// 納品画面が開くたびに作り直されるかは確かめていない（作り直されないと記録が付かない）ので、記録だけに頼らない
+    /// （記録だけに頼ると、話しかけても「画面が開かない」で止まりうる）。
+    /// </summary>
+    private bool TryGetShop(TaskContext ctx, out AtkUnitBase* addon)
+    {
+        if (ctx.Ownership.TryGetOwned("CollectablesShop", out addon))
+            return true;
+        if (!GameUi.IsReady("CollectablesShop", out addon))
+            return false;
+        if (!this.shopFallbackLogged)
+        {
+            this.shopFallbackLogged = true;
+            ctx.Log.Debug("納品", "納品画面に持ち主の記録がありません（開くたびに作り直されない画面の可能性）。始める前は閉じていたので、自分が開いたものとして扱います");
+        }
+
+        return true;
     }
 
     private TaskResult RunSub(TaskContext ctx, DeliverStep next)
@@ -909,7 +1017,7 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
         }
 
         // 自分が開いたものでなければ触らない
-        if (!ctx.Ownership.TryGetOwned("CollectablesShop", out var addon))
+        if (!this.TryGetShop(ctx, out var addon))
         {
             ctx.Log.Warn("納品", "納品画面は自分が開いたものではないため閉じません");
             return TaskResult.Done;
@@ -935,7 +1043,9 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
     {
         this.sub?.Cleanup(ctx);
         this.sub = null;
-        if (ctx.Ownership.TryGetOwned("CollectablesShop", out var addon))
+
+        // 始める前から開いていて止めた（OnStart の失敗）ときは、利用者の画面なので閉じない
+        if (!this.startedWithShopOpen && this.TryGetShop(ctx, out var addon))
         {
             DebugLog.Current?.Line("操作", "止めたので納品画面を閉じます");
             addon->Close(true);
@@ -1076,14 +1186,11 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
     private const uint ExchangeButtonNode = 18; // ShopExchangeItemDialog の「交換する」（ECommons と同じ）
 
     private static readonly TimeSpan OutcomeLimit = TimeSpan.FromSeconds(15);
-    private static readonly TimeSpan OwnedDialogWindow = TimeSpan.FromSeconds(10);
 
     /// <summary>撃つ前に開いていてはいけない画面。</summary>
     private static readonly string[] BlockingAddons =
         ["ShopExchangeCurrencyDialog", "ShopExchangeItemDialog", "SelectYesno", "SelectString", "SelectIconString", "Talk", "_TextInput"];
 
-    /// <summary>本文にこれが出ていたら、交換の確認ではないとみなして押さない。</summary>
-    private static readonly string[] DangerousWords = ["捨て", "破棄", "削除", "分解", "精製", "売却", "ログアウト", "タイトル", "トレード"];
 
     private readonly BookData data;
     private readonly NpcSpot npc;
@@ -1120,8 +1227,15 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
                 return this.Fail($"{CraftPlanner.ItemName(o.BookItemId)} の値段の特殊通貨（番号 {o.SpecialCurrencyId}）をアイテムに直せません（クライアントの表にも、設定の控えにもありません）");
         }
 
+        // 始める前から開いているアイテム交換の画面は、利用者か他の操作のもの。使わない
+        if (GameUi.IsVisible("InclusionShop"))
+            return this.Fail("アイテム交換の画面が開いています（自分が開いたものではないので使いません）。閉じてからやり直してください");
+
         ctx.Ownership.Clear();
         ctx.Ownership.IsClaiming = true;
+
+        // 交換の確認はこちらが本文を確かめて答える。YesAlready が先に押さないよう、この作業の間は止めてもらう
+        ctx.YesAlready.Suppress();
         return TaskResult.Running;
     }
 
@@ -1134,7 +1248,7 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
                 if (!this.PickNext(ctx))
                     return TaskResult.Done;
 
-                this.sub ??= new TalkToNpcTask(this.npc, IsShopReady, "スクリップ取引窓口", this.MenuHints());
+                this.sub ??= new TalkToNpcTask(this.npc, () => IsShopReady(ctx), "スクリップ取引窓口", this.MenuHints());
                 var r = this.sub.Step(ctx);
                 this.Status = this.sub.Status;
                 if (r == TaskResult.Running)
@@ -1206,9 +1320,10 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
                 yield return row.Name.ExtractText();
     }
 
-    private static bool IsShopReady()
+    /// <summary>自分が開いたアイテム交換の画面が、操作できる状態か。</summary>
+    private static bool IsShopReady(TaskContext ctx)
     {
-        if (!GameUi.IsReady("InclusionShop", out _))
+        if (!ctx.Ownership.TryGetOwned("InclusionShop", out _))
             return false;
         var agent = AgentInclusionShop.Instance();
         return agent != null && agent->IsAgentActive() && agent->Data != null && agent->Data->IsShopReady;
@@ -1224,10 +1339,10 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
             return TaskResult.Running;
         }
 
-        if (!IsShopReady())
+        if (!IsShopReady(ctx))
         {
             if (this.TimedOut(TimeSpan.FromSeconds(30)))
-                return this.Fail("アイテム交換の画面が開いていません");
+                return this.Fail("自分が開いたアイテム交換の画面が開いていません");
             return TaskResult.Running;
         }
 
@@ -1275,7 +1390,7 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
         }
 
         // 系統は合っている。目的の品が一覧に出ていれば撃つ段へ
-        if (GameUi.IsReady("InclusionShop", out var addon) && ReadEntries(addon, out var entries, out _, out _)
+        if (ctx.Ownership.TryGetOwned("InclusionShop", out var addon) && ReadEntries(addon, out var entries, out _, out _)
             && entries.Any(e => e.ItemId == this.current.BookItemId))
         {
             this.Go(ExStep.Fire, "交換の直前確認をしています");
@@ -1342,8 +1457,8 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
             return this.Fail($"{name} が開いています（交換で自分が開いたものではないので触りません）。閉じてから始めてください");
         }
 
-        if (!GameUi.IsReady("InclusionShop", out var addon))
-            return this.Fail("アイテム交換の画面が閉じられました");
+        if (!ctx.Ownership.TryGetOwned("InclusionShop", out var addon))
+            return this.Fail("アイテム交換の画面が閉じられました（または自分の開いたものと確かめられなくなりました）");
         if (!ReadEntries(addon, out var entries, out var currencyOnScreen, out var readFailure))
             return this.Fail(readFailure);
 
@@ -1387,8 +1502,9 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
         this.beforeBooks = Inventory.CountNow(offer.BookItemId);
         this.beforeScrips = scrips;
         ctx.Log.Write("交換", $"{CraftPlanner.ItemName(offer.BookItemId)} を交換します（紫貨 {offer.Price}・index {entry.Index}）");
-        GameUi.Fire(addon, true, 14, entry.Index, 1u); // 実測：コマンドは Int、index と個数は UInt
+        // 時刻は撃つ前に取る（撃ったのと同じフレームで開いた確認窓も「撃った後に開いた」に入るように）
         this.firedAt = DateTime.UtcNow;
+        GameUi.Fire(addon, true, 14, entry.Index, 1u); // 実測：コマンドは Int、index と個数は UInt
         this.Go(ExStep.Outcome, "確認に答えています");
         return TaskResult.Running;
     }
@@ -1509,49 +1625,38 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
         if (yesno == null)
             return false;
 
-        if (!ctx.Ownership.TryGetOwnedSince("SelectYesno", this.firedAt, out var own) || (nint)own != (nint)yesno)
-        {
-            if (DateTime.UtcNow - this.lastUnmatchedLog >= TimeSpan.FromSeconds(5))
-            {
-                this.lastUnmatchedLog = DateTime.UtcNow;
-                ctx.Log.Warn("交換", $"確認が出ていますが、撃った後に自分の操作で開いたものではないので押しません：{body}");
-            }
-
-            return false;
-        }
+        var owned = ctx.Ownership.TryGetOwnedSince("SelectYesno", this.firedAt, out var own) && (nint)own == (nint)yesno;
+        var currencyName = CraftPlanner.ItemName(this.scripItemId);
+        var verdict = ConfirmPolicy.Decide(owned, body, [currencyName], offer.Price, DateTime.UtcNow - this.firedAt, out var bad);
 
         // 記録は5秒に1回まで（毎フレーム呼ばれるため）
         var logNow = DateTime.UtcNow - this.lastUnmatchedLog >= TimeSpan.FromSeconds(5);
-        if (logNow)
+        if (logNow && verdict != ConfirmPolicy.Verdict.PressByText)
             this.lastUnmatchedLog = DateTime.UtcNow;
 
-        var bad = DangerousWord(body);
-        if (bad != null)
+        switch (verdict)
         {
-            if (logNow)
-                ctx.Log.Warn("交換", $"確認に「{bad}」が含まれるので押しません：{body}");
-            return false;
+            case ConfirmPolicy.Verdict.PressByText:
+                addon = own;
+                return true;
+            case ConfirmPolicy.Verdict.PressFresh:
+                if (logNow)
+                    ctx.Log.Warn("交換", $"確認の本文が想定と違いますが、撃った直後に自分の操作で開いたものなので答えます：{body}（探した語：{currencyName}・{offer.Price}）");
+                addon = own;
+                return true;
+            case ConfirmPolicy.Verdict.NotOurs:
+                if (logNow)
+                    ctx.Log.Warn("交換", $"確認が出ていますが、撃った後に自分の操作で開いたものではないので押しません：{body}");
+                return false;
+            case ConfirmPolicy.Verdict.Dangerous:
+                if (logNow)
+                    ctx.Log.Warn("交換", $"確認に「{bad}」が含まれるので押しません：{body}");
+                return false;
+            default:
+                if (logNow)
+                    ctx.Log.Warn("交換", $"確認が出ていますが、交換のものと判断できないので押しません：{body}");
+                return false;
         }
-
-        var currencyName = CraftPlanner.ItemName(this.scripItemId);
-        if (currencyName.Length > 0 && body.Contains(currencyName, StringComparison.Ordinal) && TextMatch.ContainsNumber(body, offer.Price))
-        {
-            addon = own;
-            return true;
-        }
-
-        if (DateTime.UtcNow - this.firedAt <= OwnedDialogWindow)
-        {
-            if (logNow)
-                ctx.Log.Warn("交換", $"確認の本文が想定と違いますが、撃った直後に自分の操作で開いたものなので答えます：{body}（探した語：{currencyName}・{offer.Price}）");
-            addon = own;
-            return true;
-        }
-
-        if (logNow)
-            ctx.Log.Warn("交換", $"確認が出ていますが、交換のものと判断できないので押しません：{body}");
-
-        return false;
     }
 
     // ---- 閉じる ----
@@ -1587,10 +1692,11 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
         this.sub?.Cleanup(ctx);
         this.sub = null;
 
-        // 自分が開いたものだけを閉じる（確認窓は「いいえ」相当の -1、交換画面は Close）
+        // 自分が開いたものだけを閉じる（確認窓は「いいえ」相当の -1、交換画面は Close）。
+        // 確認窓は、撃った後に開いたものだけ（移動・会話の間に出た他人の確認まで閉じない）
         foreach (var name in new[] { "SelectYesno", "ShopExchangeCurrencyDialog", "ShopExchangeItemDialog" })
         {
-            if (ctx.Ownership.TryGetOwned(name, out var own))
+            if (this.firedAt != DateTime.MinValue && ctx.Ownership.TryGetOwnedSince(name, this.firedAt, out var own))
             {
                 DebugLog.Current?.Line("操作", $"止めたので {name} を閉じます");
                 GameUi.Fire(own, true, -1);
@@ -1604,6 +1710,7 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
         }
 
         ctx.Ownership.Clear();
+        ctx.YesAlready.Release();
     }
 
     // ---- 画面の読み取り ----
@@ -1643,9 +1750,8 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
         return true;
     }
 
-    /// <summary>本文に押してはいけない語（捨てる・売る・ログアウト等）があればその語、無ければ null。</summary>
-    public static string? DangerousWord(string body)
-        => DangerousWords.FirstOrDefault(w => body.Contains(w, StringComparison.Ordinal));
+    /// <summary>本文に押してはいけない語（捨て・売却・ログアウト等）があればその語、無ければ null（ConfirmPolicy と同じ）。</summary>
+    public static string? DangerousWord(string body) => ConfirmPolicy.DangerousWord(body);
 
     /// <summary>画面の「払う通貨」の値をアイテム ID に直す（8 以上ならそのまま、未満なら特殊通貨の番号）。</summary>
     private static uint? ResolveCurrency(uint value)
@@ -1695,6 +1801,9 @@ public sealed unsafe class UseBooksTask : AutoTask
     {
         ctx.Ownership.Clear();
         ctx.Ownership.IsClaiming = true;
+
+        // 使うときの確認はこちらが本文を確かめて答える。YesAlready が先に押さないよう、この作業の間は止めてもらう
+        ctx.YesAlready.Suppress();
         return TaskResult.Running;
     }
 
@@ -1733,8 +1842,9 @@ public sealed unsafe class UseBooksTask : AutoTask
 
             this.ownedBefore = owned;
             ctx.Log.Write("秘伝書", $"{name} を使います");
-            AgentInventoryContext.Instance()->UseItem(this.current.BookItemId);
+            // 時刻は使う前に取る（同じフレームで開いた確認も「使った後に開いた」に入るように）
             this.usedAt = DateTime.UtcNow;
+            AgentInventoryContext.Instance()->UseItem(this.current.BookItemId);
             return TaskResult.Running;
         }
 
@@ -1753,14 +1863,12 @@ public sealed unsafe class UseBooksTask : AutoTask
         var text = GameUi.YesnoText(out var yesno);
         if (text != null && DateTime.UtcNow - this.lastClick > TimeSpan.FromMilliseconds(400))
         {
-            var bad = ExchangeBooksTask.DangerousWord(text);
             var owned2 = ctx.Ownership.TryGetOwnedSince("SelectYesno", this.usedAt, out var own) && (nint)own == (nint)yesno;
-            var byName = text.Contains(name, StringComparison.Ordinal);
-            var fresh = DateTime.UtcNow - this.usedAt <= TimeSpan.FromSeconds(10);
-            if (bad == null && owned2 && (byName || fresh))
+            var verdict = ConfirmPolicy.Decide(owned2, text, [name], null, DateTime.UtcNow - this.usedAt, out var bad);
+            if (verdict is ConfirmPolicy.Verdict.PressByText or ConfirmPolicy.Verdict.PressFresh)
             {
                 this.lastClick = DateTime.UtcNow;
-                ctx.Log.Write("秘伝書", $"確認に「はい」と答えます（{(byName ? "本の名前が本文にある" : "使った直後に自分の操作で開いた確認")}）：{text}");
+                ctx.Log.Write("秘伝書", $"確認に「はい」と答えます（{(verdict == ConfirmPolicy.Verdict.PressByText ? "本の名前が本文にある" : "使った直後に自分の操作で開いた確認")}）：{text}");
                 if (!GameUi.ClickYes(yesno))
                     return this.Fail($"確認の「はい」が押せる状態ではありません：{text}");
                 return TaskResult.Running;
@@ -1769,11 +1877,12 @@ public sealed unsafe class UseBooksTask : AutoTask
             if (DateTime.UtcNow - this.lastUnmatchedLog >= TimeSpan.FromSeconds(5))
             {
                 this.lastUnmatchedLog = DateTime.UtcNow;
-                ctx.Log.Warn("秘伝書", bad != null
-                    ? $"確認に「{bad}」が含まれるので押しません：{text}"
-                    : !owned2
-                        ? $"確認が出ていますが、本を使った後に自分の操作で開いたものではないので押しません：{text}"
-                        : $"確認が出ていますが、秘伝書のものと判断できないので押しません：{text}");
+                ctx.Log.Warn("秘伝書", verdict switch
+                {
+                    ConfirmPolicy.Verdict.Dangerous => $"確認に「{bad}」が含まれるので押しません：{text}",
+                    ConfirmPolicy.Verdict.NotOurs => $"確認が出ていますが、本を使った後に自分の操作で開いたものではないので押しません：{text}",
+                    _ => $"確認が出ていますが、秘伝書のものと判断できないので押しません：{text}",
+                });
             }
         }
 
@@ -1797,5 +1906,6 @@ public sealed unsafe class UseBooksTask : AutoTask
         }
 
         ctx.Ownership.Clear();
+        ctx.YesAlready.Release();
     }
 }

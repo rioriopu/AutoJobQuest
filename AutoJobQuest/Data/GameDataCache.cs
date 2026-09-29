@@ -51,8 +51,11 @@ public sealed class GameDataCache
     /// <summary>上の秘伝書すべてについての交換店・収集品・窓口の情報。</summary>
     public BookData? Books => this.ready?.Books;
 
-    /// <summary>作っている最中の例外（画面に出す）。</summary>
-    public string? BuildError { get; private set; }
+    // 作っている最中の例外。別のスレッドで書くので volatile
+    private volatile string? buildError;
+
+    /// <summary>作っている最中の例外（画面に出す）。表を作り終えた後の例外（記録の書き出し等）は入れない。</summary>
+    public string? BuildError => this.buildError;
 
     /// <summary>全部の表を作り終えたか（一部だけでは true にならない）。</summary>
     public bool IsReady => this.ready != null;
@@ -65,7 +68,7 @@ public sealed class GameDataCache
         if (this.IsReady || this.IsBuilding)
             return;
 
-        this.BuildError = null;
+        this.buildError = null;
         var collectable = this.collectableItemId();
         this.building = Task.Run(() =>
         {
@@ -101,8 +104,10 @@ public sealed class GameDataCache
             }
             catch (Exception ex)
             {
-                // 途中まで作った表は公開しない（次の EnsureBuilding で作り直す）
-                this.BuildError = $"{ex.GetType().Name}: {ex.Message}";
+                // 途中まで作った表は公開しない（次の EnsureBuilding で作り直す）。
+                // 表を公開した後の例外（記録の書き出し等）なら、表はそろっているので失敗にしない
+                if (this.ready == null)
+                    this.buildError = $"{ex.GetType().Name}: {ex.Message}";
                 Svc.Log.Error(ex, "[AutoJobQuest] ゲームデータの読み込みに失敗");
                 Core.DebugLog.Current?.Exception("データ", "ゲームデータの読み込みに失敗", ex);
             }

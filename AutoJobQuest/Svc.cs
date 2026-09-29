@@ -22,6 +22,7 @@ public sealed class Svc
     [PluginService] public static IAetheryteList Aetherytes { get; private set; } = null!;
     [PluginService] public static IGameInteropProvider Hook { get; private set; } = null!;
     [PluginService] public static IAddonLifecycle AddonLifecycle { get; private set; } = null!;
+    [PluginService] public static IMarketBoard MarketBoard { get; private set; } = null!;
 }
 
 /// <summary>自分の位置など、よく使う小物。</summary>

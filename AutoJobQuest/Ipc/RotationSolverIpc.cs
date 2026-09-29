@@ -46,6 +46,12 @@ public sealed class RotationSolverIpc : IpcGate
     // こちらが Henched にする前の RSR のモード（RsrStateReader で読む。読めなければ null）。使い終わったらこれに戻す
     private byte? originalMode;
 
+    // 動作中（AutorotationActive）のとき、本当に Henched かを内部のモードで確かめた時刻と、その結果。
+    // 内部を読むのはリフレクションで重いので、送り直しの間隔（3秒）に1回だけにし、結果は次に確かめるまで使う
+    // （毎フレーム「動作中」で数え直すと、Henched にならないまま送り続け、3回で止める仕組みが働かない）
+    private DateTime lastModeCheck = DateTime.MinValue;
+    private bool modeMismatch;
+
     /// <summary>
     /// Henched を送っても RSR が動作中にならない（false）か、状態が読めない（null）ことが続いたか（それぞれ3回）。
     /// RSR の AutorotationActive は Henched で true になる（State と IsManual が立つ：RSR の RSCommands_StateSpecialCommand.cs・
@@ -74,6 +80,21 @@ public sealed class RotationSolverIpc : IpcGate
     public bool EnsureHenched()
     {
         var active = this.IsActive();
+
+        // 動作中でも Henched とは限らない（AutorotationActive は「State か IsManual」。利用者が Auto に切り替えた等）。
+        // 内部のモードが読めれば、それで確かめる（読めなければ今までどおり動作中かで判断する）
+        if (active == true && this.tracker.HenchedByMe && DateTime.UtcNow - this.lastModeCheck >= HenchedTracker.ResendInterval)
+        {
+            this.lastModeCheck = DateTime.UtcNow;
+            var mode = RsrStateReader.ReadMode();
+            this.modeMismatch = mode is { } m && m != ModeHenched;
+            if (this.modeMismatch)
+                Core.DebugLog.Current?.Line("IPC", $"RSR は動作中ですが、モードが {RsrStateReader.ModeName(mode!.Value)} です（Henched ではない）。Henched に入れ直します");
+        }
+
+        if (active == true && this.tracker.HenchedByMe && this.modeMismatch)
+            active = false;
+
         var firstTake = !this.tracker.HenchedByMe;
         var action = this.tracker.Decide(active, DateTime.UtcNow);
         if (action != HenchedTracker.Action.Send)
@@ -105,12 +126,24 @@ public sealed class RotationSolverIpc : IpcGate
         if (!this.tracker.HenchedByMe)
             return;
 
-        var back = this.originalMode ?? ModeOff;
+        // 戻すのは、いまも Henched のときだけ（こちらが使っている間に利用者が別のモードにしたなら、そのままにする）。
+        // いまのモードが読めなければ、今までどおり使う前のモードに戻す
+        var current = RsrStateReader.ReadMode();
+        if (RsrRestore.Decide(current, this.originalMode) is not { } back)
+        {
+            Core.DebugLog.Current?.Line("IPC", $"RSR はもう {RsrStateReader.ModeName(current!.Value)} になっている（利用者か RSR が切り替えた）ので、モードは戻しません");
+            this.tracker.Released();
+            this.originalMode = null;
+            this.modeMismatch = false;
+            return;
+        }
+
         if (this.ChangeOperatingMode(back))
         {
             Core.DebugLog.Current?.Line("IPC", $"RSR を {RsrStateReader.ModeName(back)} に戻しました{(this.originalMode == null ? "（使う前のモードが読めなかったため Off）" : string.Empty)}");
             this.tracker.Released();
             this.originalMode = null;
+            this.modeMismatch = false;
         }
     }
 
@@ -147,6 +180,23 @@ public sealed class RotationSolverIpc : IpcGate
 
     /// <summary>こちらが足した優先指定が残っているか。</summary>
     public bool HasOwnPriorities => this.ownPriorities.Count > 0;
+
+    /// <summary>こちらが Henched にしたまま戻していないか。</summary>
+    public bool HenchedByMe => this.tracker.HenchedByMe;
+}
+
+/// <summary>使い終わったときに RSR のモードを戻すかの決まり（IPC を呼ばない部分。ゲームを起動せずに試せるように分けた）。</summary>
+public static class RsrRestore
+{
+    /// <summary>
+    /// 戻すモード。戻さないなら null。
+    ///  ・いまのモードが読めて Henched でない（利用者か RSR が切り替えた）→ 戻さない（利用者の選んだモードを上書きしない）
+    ///  ・いまも Henched、または読めない → 使う前のモードに戻す（使う前が読めなかったなら Off）
+    /// </summary>
+    /// <param name="current">いまのモード（読めなければ null）。</param>
+    /// <param name="original">使う前のモード（読めなかったなら null）。</param>
+    public static byte? Decide(byte? current, byte? original)
+        => current is { } c && c != RotationSolverIpc.ModeHenched ? null : original ?? RotationSolverIpc.ModeOff;
 }
 
 /// <summary>

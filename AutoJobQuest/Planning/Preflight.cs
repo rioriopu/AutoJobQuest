@@ -75,6 +75,10 @@ public static class Preflight
         if (!installed.Any(x => x.IsLoaded && x.InternalName is "InventoryTools" or "AllaganItemSearch"))
             list.Add(new PreflightItem(Severity.Warn, "Allagan Tools（または Allagan Item Search）が無いため、GBR の NPC 購入が使えません。NPC で買える素材は別の手段で集めます"));
 
+        // 1.5) 画面の開閉の知らせ（AddonLifecycle）を受け取れないと、自分が開いた選択肢・確認窓を見分けられず、会話や交換が進まない
+        if (!ctx.Ownership.Registered)
+            list.Add(new PreflightItem(Severity.Error, "画面の開閉の知らせを受け取る仕組みを登録できませんでした（自分が開いた画面を見分けられません）。プラグインを読み込み直してください"));
+
         // 2) ジョブの並び（定数の前提）
         if (Jobs.VerifyLayout() is { } layoutProblem)
             list.Add(new PreflightItem(Severity.Error, layoutProblem));
@@ -197,9 +201,15 @@ public static class Preflight
         {
             var mode = ctx.Rotation.CurrentModeName();
             list.Add(mode != null
-                ? new PreflightItem(Severity.Ok, $"RotationSolverReborn は今 {mode} で動いています。戦闘の間だけ Henched に切り替え、終わったら {mode} に戻します")
+                ? new PreflightItem(Severity.Ok, $"RotationSolverReborn は今 {mode} で動いています。戦闘の間だけ Henched に切り替え、終わったら {mode} に戻します（途中で RSR が Off や別のモードになっていたら、そのままにします）")
                 : new PreflightItem(Severity.Warn, $"RotationSolverReborn が動いていますが、今のモードを読めません（{Ipc.RsrStateReader.LastError}）。戦闘の後は Off になります"));
         }
+
+        // 5.9) Artisan がすでに動いている（リスト実行中・連続製作中）。こちらの製作と取り合うので始めない。
+        // 止めるのは Artisan の側の操作になるので、こちらからは止めない。
+        // Questionable が動かしたリストが前回から残っている場合がある
+        if (ctx.Artisan.IsLoaded && (ctx.Artisan.IsListRunning() == true || ctx.Artisan.IsEndurance() == true))
+            list.Add(new PreflightItem(Severity.Error, "Artisan が動いています（リスト実行中か連続製作中）。Artisan の画面で止めてから始めてください"));
 
         // 6) Artisan の簡易製作（設定ファイルを読むだけ）
         var quick = ReadArtisanBool("QuickSynthMode");

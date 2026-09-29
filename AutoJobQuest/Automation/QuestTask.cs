@@ -32,17 +32,29 @@ public sealed unsafe class QuestTask : AutoTask
     private int restarts;
     private int notRunningFrames;
 
+    // Questionable がまだ動いているのを最初に見た時刻（前のクエストの後片付けが終わるのを少し待つ）
+    private DateTime? busySince;
+
     // 報告を自前で行うとき
     private bool manualTurnIn;
     private MoveToTask? moving;
     private Vector3? turnInPos;
     private DateTime interactedAt = DateTime.MinValue;
+    private int interactions;
+    private bool textAdvanceWarned;
+
+    // 手動の報告で話しかける回数の上限（会話が終わっても完了しないときに、延々と話しかけ続けないため）
+    private const int MaxInteractions = 10;
 
     // 納品窓の扱い（窓ごとに状態を持つ。準備待ちなら次のフレームで続きから）
     private readonly RequestFiller filler = new();
     private readonly HashSet<uint> questItems;
     private DateTime claimedAt = DateTime.MinValue;
     private bool foreignRequestLogged;
+    private bool materiaNoteLogged;
+
+    // 始める前に Artisan のリストが動いていたか（止めた後、Questionable が動かしたリストが残っていないかを見分ける）
+    private bool? artisanListAtStart;
 
     // 渡す操作を送った後の確かめ（求めた品が減ったか）
     private DateTime? submittedAt;
@@ -87,9 +99,6 @@ public sealed unsafe class QuestTask : AutoTask
         if (risky.Count > 0)
             ctx.Log.Warn("クエスト", $"Questionable が Artisan の既製リストを動かしたとき、手持ちの材料で追加製作される可能性があります：{string.Join("、", risky)}");
 
-        if (ctx.Questionable.IsRunning() == true)
-            return this.Fail("Questionable がすでに動いています（利用者の操作を横取りしないため止めました）");
-
         // 始める前から開いている納品窓は、利用者か他の操作のもの。触らない。
         // 開いたままだと Questionable が進めないので、閉じてもらう
         if (GameUi.IsVisible("Request"))
@@ -99,6 +108,12 @@ public sealed unsafe class QuestTask : AutoTask
         ctx.Ownership.Clear();
         ctx.Ownership.IsClaiming = true;
         this.claimedAt = DateTime.UtcNow;
+
+        this.artisanListAtStart = ctx.Artisan.IsListRunning();
+
+        // YesAlready の納品窓の自動入力は一覧の先頭を入れる（HQ 指定でも NQ が入りうる）。こちらが入れるので、
+        // クエストの間は止めてもらう（止めるのは自分の停止要求を入れるだけで、設定は変えない）
+        ctx.YesAlready.Suppress();
         return TaskResult.Running;
     }
 
@@ -123,6 +138,21 @@ public sealed unsafe class QuestTask : AutoTask
 
         if (!this.started)
         {
+            // Questionable が動いたままなら少し待つ（前のクエストの後片付け）。待っても止まらなければ、利用者の操作とみなして止める
+            var busy = ctx.Questionable.IsRunning();
+            if (busy == true)
+                this.busySince ??= DateTime.UtcNow;
+            else
+                this.busySince = null;
+            switch (QuestionableIdle.Decide(busy, this.busySince is { } since ? DateTime.UtcNow - since : TimeSpan.Zero))
+            {
+                case QuestionableIdle.Verdict.Wait:
+                    this.Status = "Questionable が前の動作を終えるのを待っています";
+                    return TaskResult.Running;
+                case QuestionableIdle.Verdict.Fail:
+                    return this.Fail($"Questionable が {QuestionableIdle.Limit.TotalSeconds:0} 秒たっても動いたままです（利用者の操作を横取りしないため止めました）");
+            }
+
             if (!GameUi.PlayerFree())
                 return TaskResult.Running;
 
@@ -225,6 +255,12 @@ public sealed unsafe class QuestTask : AutoTask
         }
 
         var result = this.filler.Tick(GameRequestWindow.Instance, (nint)request, openedAt, this.questItems, out var detail);
+        if (this.filler.MateriaNote is { } note && !this.materiaNoteLogged)
+        {
+            this.materiaNoteLogged = true;
+            ctx.Log.Write("納品", note);
+        }
+
         switch (result)
         {
             case RequestFiller.Outcome.Submitted:
@@ -285,8 +321,15 @@ public sealed unsafe class QuestTask : AutoTask
                 return this.Fail(failed);
         }
 
-        if (!ctx.TextAdvance.TakeControlForTurnIn() && ctx.TextAdvance.IsInExternalControl() != true)
-            ctx.Log.Warn("クエスト", "TextAdvance の外部制御を取れませんでした（会話と納品の入力が進まない可能性）");
+        // 外部制御を取れなかったら1回だけ知らせる（毎フレーム呼ばれるので繰り返さない）。
+        // ほかのプラグインが制御中なら、その設定で納品窓が入力される恐れもある（こちらの設定は納品窓の入力を任せない）
+        if (!ctx.TextAdvance.TakeControlForTurnIn() && !this.textAdvanceWarned)
+        {
+            this.textAdvanceWarned = true;
+            ctx.Log.Warn("クエスト", ctx.TextAdvance.IsInExternalControl() == true
+                ? "TextAdvance はほかのプラグインが外部制御しています（こちらの設定にならないので、会話送りや納品窓の入力がその設定で動く可能性）"
+                : "TextAdvance の外部制御を取れませんでした（会話と納品の入力が進まない可能性）");
+        }
 
         if (!GameUi.PlayerFree())
         {
@@ -309,9 +352,13 @@ public sealed unsafe class QuestTask : AutoTask
             return TaskResult.Running;
         }
 
-        GameUi.Interact(npc);
+        if (this.interactions >= MaxInteractions)
+            return this.Fail($"報告先の {npc.Name} に {MaxInteractions} 回話しかけても、クエストが完了しません");
+
         this.interactedAt = DateTime.UtcNow;
-        this.Status = $"{npc.Name} に話しかけました";
+        this.interactions++;
+        GameUi.Interact(npc);
+        this.Status = $"{npc.Name} に話しかけました（{this.interactions} 回目）";
         return TaskResult.Running;
     }
 
@@ -326,6 +373,28 @@ public sealed unsafe class QuestTask : AutoTask
             ctx.Questionable.Stop(Plugin.InternalNameConst);
 
         ctx.TextAdvance.ReleaseControl();
+        ctx.YesAlready.Release();
+
+        // Questionable の「Craft」の手順は Artisan の既製リストを動かす。Questionable を止めても、そのリストは止まらない
+        // 止めるのは Artisan の側の操作になるので、こちらからは止めずに知らせる
+        if (this.everStarted && this.artisanListAtStart == false && ctx.Artisan.IsListRunning() == true)
+        {
+            const string msg = "Questionable が動かした Artisan のリストが、まだ動いています（手持ちの材料で作り続けることがあります）。要らなければ Artisan の画面で止めてください";
+            ctx.Log.Warn("クエスト", msg);
+            Svc.Chat.Print($"[AutoJobQuest] {msg}");
+        }
+
+        // こちらが欄を選ぶ・入れる操作をした納品窓が、渡さないまま残っていれば閉じる
+        // （残すと、再開したとき「始める前から開いている納品窓」として止まるため。閉じれば品は渡らない）。
+        // 閉じるのは、こちらが触った窓だけ（以前はクエストの間に開いた窓なら、触っていなくても閉じていた）
+        if (this.claimedAt != DateTime.MinValue && this.filler.Touched && !this.filler.HasSubmitted
+            && ctx.Ownership.TryGetOwnedSince("Request", this.claimedAt, out var request, out var openedAt)
+            && (nint)request == this.filler.Addon && openedAt == this.filler.AddonOpenedAt)
+        {
+            DebugLog.Current?.Line("操作", "止めたので、こちらが入力していた納品窓を閉じます");
+            request->Close(true);
+        }
+
         ctx.Ownership.Clear();
     }
 

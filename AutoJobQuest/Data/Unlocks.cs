@@ -34,6 +34,13 @@ public static class Unlocks
     /// <summary>この実行で解放をあきらめた一般アクション（前提が満たせない等）。実行の最初に空にする。</summary>
     public static HashSet<uint> GaveUp { get; } = [];
 
+    /// <summary>
+    /// この実行の「機能の解放」の段を終えたか。終えた後は解放クエストを進めないので、未解放の機能は使えない
+    /// （以前は段の後でも「解放できる見込み」で精選を手段に入れ、精選の作業で失敗してから外していた）。
+    /// 実行の最初と終わりに false に戻す（止まっている間の計画の表示は、解放できる見込みも含めて出す）。
+    /// </summary>
+    public static bool UnlockStagePassed { get; set; }
+
     public static string Name(uint generalAction)
         => Svc.Data.GetExcelSheet<GeneralAction>().TryGetRow(generalAction, out var r) ? r.Name.ExtractText() : $"一般アクション{generalAction}";
 

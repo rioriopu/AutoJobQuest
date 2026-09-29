@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Threading;
 using AutoJobQuest.Core;
 using AutoJobQuest.Data;
 using Dalamud.Game.ClientState.Objects.Enums;
@@ -173,8 +174,20 @@ public static class MarketBoardLocator
 public sealed unsafe class MarketBoardWatcher : IDisposable
 {
     private readonly Hook<InfoProxyItemSearch.Delegates.ProcessRequestResult>? hook;
+    private readonly bool purchaseSubscribed;
+
+    // 「買えた」の通知（Dalamud の IMarketBoard.ItemPurchased。サーバーの応答から出る）の通し番号と、最後に買えた品。
+    // 通知がどのスレッドで来るかは確かめていないので、読み書きは Interlocked / volatile で行う
+    private int purchaseSerial;
+    private volatile uint lastPurchasedItem;
 
     public int Serial { get; private set; }
+
+    /// <summary>「買えた」の通知の通し番号（送る前に控え、送った後に増えたかを見る）。</summary>
+    public int PurchaseSerial => Volatile.Read(ref this.purchaseSerial);
+
+    /// <summary>最後に「買えた」の通知が来た品（アイテム ID）。</summary>
+    public uint LastPurchasedItem => this.lastPurchasedItem;
 
     public int LastCount { get; private set; }
 
@@ -191,6 +204,30 @@ public sealed unsafe class MarketBoardWatcher : IDisposable
         catch (Exception ex)
         {
             Svc.Log.Error(ex, "[AutoJobQuest] マーケットの検索結果フックを作れませんでした");
+        }
+
+        try
+        {
+            Svc.MarketBoard.ItemPurchased += this.OnItemPurchased;
+            this.purchaseSubscribed = true;
+        }
+        catch (Exception ex)
+        {
+            // 通知が取れなくても買えるが、反映が遅いときに買い直しうる（記録に残す）
+            Svc.Log.Error(ex, "[AutoJobQuest] マーケットの購入の通知を受け取れませんでした");
+        }
+    }
+
+    private void OnItemPurchased(Dalamud.Game.Network.Structures.IMarketBoardPurchase purchase)
+    {
+        try
+        {
+            this.lastPurchasedItem = purchase.CatalogId;
+            Interlocked.Increment(ref this.purchaseSerial);
+        }
+        catch
+        {
+            // 通知の中では例外を外へ出さない
         }
     }
 
@@ -211,7 +248,21 @@ public sealed unsafe class MarketBoardWatcher : IDisposable
         }
     }
 
-    public void Dispose() => this.hook?.Dispose();
+    public void Dispose()
+    {
+        this.hook?.Dispose();
+        if (this.purchaseSubscribed)
+        {
+            try
+            {
+                Svc.MarketBoard.ItemPurchased -= this.OnItemPurchased;
+            }
+            catch
+            {
+                // アンロード中なので握り潰す
+            }
+        }
+    }
 }
 
 /// <summary>
@@ -303,6 +354,9 @@ public sealed unsafe class MarketBoardTask : AutoTask
 
     // 候補が複数のときの「始めた時点の候補の所持数の合計」（不足数をカバンの増え方で数えるため）
     private int candidatesOwnedAtStart;
+
+    // 購入の要求を送る前の「買えた」の通知の通し番号（送った後に、その品の通知が来たかを見る）
+    private int purchaseSerialBefore;
 
     /// <summary>この実行で MB に払った合計（ギル）。</summary>
     public static long SpentThisRun { get; set; }
@@ -421,11 +475,18 @@ public sealed unsafe class MarketBoardTask : AutoTask
 
     private TaskResult OpenBoard(TaskContext ctx)
     {
-        // 「自分が開いた」の印は、こちらが話しかけたときだけ立てる（最初から開いていた画面は利用者のものなので、最後に閉じない）
-        if (GameUi.IsReady("ItemSearch", out _))
+        // 「自分が開いた」の印は、こちらが話しかけたときだけ立てる（最初から開いていた画面は利用者のものなので、最後に閉じない）。
+        // 話しかける前から開いていた画面は使わない（以前はそのまま検索・購入に使っていた）
+        if (GameUi.IsVisible("ItemSearch") || GameUi.IsVisible("ItemSearchResult"))
         {
-            this.Go(Phase.Next, "マーケットボードを開きました");
-            return TaskResult.Running;
+            if (!this.openedByMe)
+                return this.Fail("マーケットボードの画面が開いています（自分が開いたものではないので使いません）。閉じてからやり直してください");
+
+            if (GameUi.IsReady("ItemSearch", out _))
+            {
+                this.Go(Phase.Next, "マーケットボードを開きました");
+                return TaskResult.Running;
+            }
         }
 
         if (this.TimedOut(TimeSpan.FromSeconds(15)))
@@ -781,6 +842,7 @@ public sealed unsafe class MarketBoardTask : AutoTask
 
         this.gilBefore = Inventory.Gil();
         this.countBefore = Inventory.CountNow(this.buyingItem);
+        this.purchaseSerialBefore = this.watcher.PurchaseSerial;
 
         if (!proxy->SetLastPurchasedItem(target) || !proxy->SendPurchaseRequestPacket())
             return this.Retry(ctx, "購入の要求を送れませんでした");
@@ -793,9 +855,11 @@ public sealed unsafe class MarketBoardTask : AutoTask
     {
         var gil = Inventory.Gil();
         var count = Inventory.CountNow(this.buyingItem);
+        var confirmed = this.watcher.PurchaseSerial != this.purchaseSerialBefore && this.watcher.LastPurchasedItem == this.buyingItem;
+        var verdict = PurchaseOutcome.Decide(this.gilBefore, gil, this.countBefore, count, confirmed, this.PhaseElapsed);
 
         // 減った AND 増えた
-        if (gil < this.gilBefore && count > this.countBefore)
+        if (verdict == PurchaseOutcome.Verdict.Bought)
         {
             var paid = this.gilBefore - gil;
             SpentThisRun += paid;
@@ -813,13 +877,18 @@ public sealed unsafe class MarketBoardTask : AutoTask
             return TaskResult.Running;
         }
 
-        if (this.TimedOut(TimeSpan.FromSeconds(15)))
+        switch (verdict)
         {
-            // 片方だけ変わった＝買えたかどうか分からない。もう一度買うと二重購入になりうるので止める
-            if (gil != this.gilBefore || count != this.countBefore)
-                return this.Fail($"購入の結果を確かめられません（ギル {this.gilBefore:N0}→{gil:N0}、{CraftPlanner.ItemName(this.buyingItem)} {this.countBefore}→{count}）。二重に買わないよう止めました");
-
-            return this.Retry(ctx, "購入が確認できませんでした（売り切れ・混雑・カバンがいっぱい等）");
+            case PurchaseOutcome.Verdict.Unknown:
+                // 片方だけ変わった、または「買えた」の通知が来たのに所持が変わらない＝買えたかどうか分からない。
+                // もう一度買うと二重購入になりうるので止める
+                return this.Fail($"購入の結果を確かめられません（ギル {this.gilBefore:N0}→{gil:N0}、{CraftPlanner.ItemName(this.buyingItem)} {this.countBefore}→{count}"
+                                 + $"{(confirmed ? "、買えた通知あり" : string.Empty)}）。二重に買わないよう止めました");
+            case PurchaseOutcome.Verdict.Retry:
+                return this.Retry(ctx, "購入が確認できませんでした（売り切れ・混雑・カバンがいっぱい等）");
+            case PurchaseOutcome.Verdict.Wait when confirmed && this.PhaseElapsed >= PurchaseOutcome.RetryAfter:
+                this.Status = "買えた通知は届きました。所持に反映されるのを待っています";
+                break;
         }
 
         return TaskResult.Running;

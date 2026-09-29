@@ -137,6 +137,18 @@ public sealed class Runner
         this.stopReason = reason;
     }
 
+    /// <summary>
+    /// その場で止めて後始末まで済ませる（次のフレームを待たない）。読み込みの解除（更新・無効化）のときに使う
+    /// （解除の後はフレームが来ないため）。フレームワークのスレッドから呼ぶこと。
+    /// </summary>
+    public void StopNow(string reason)
+    {
+        if (this.root == null)
+            return;
+
+        this.Finish($"止めました（{reason}）", false);
+    }
+
     public void Tick()
     {
         if (this.root == null)
@@ -192,6 +204,7 @@ public sealed class Runner
 
         if (task != null)
         {
+            this.ctx.Stopping = true;
             try
             {
                 task.Cleanup(this.ctx);
@@ -199,6 +212,10 @@ public sealed class Runner
             catch (Exception ex)
             {
                 this.ctx.Log.Warn("実行", $"後始末で例外: {ex.Message}");
+            }
+            finally
+            {
+                this.ctx.Stopping = false;
             }
         }
 

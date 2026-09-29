@@ -29,6 +29,12 @@ public sealed class GoToInnTask : AutoTask
     private bool sawBusy;
     private int attempts;
 
+    // Lifestream の IsBusy が読めない（null）のを最初に見た時刻。読めないのを「終わった」と扱わない
+    private DateTime? unknownSince;
+
+    /// <summary>他のプラグインの状態が読めないまま待つ上限。</summary>
+    public static readonly TimeSpan UnknownLimit = TimeSpan.FromSeconds(30);
+
     public override string Name => "グリダニアの宿屋へ";
 
     public static bool InGridaniaInn()
@@ -56,6 +62,17 @@ public sealed class GoToInnTask : AutoTask
         var busy = ctx.Lifestream.IsBusy();
         if (this.requested)
         {
+            // 読めないのは「終わった」ではない。頼み直すと二重に頼むので、読めるようになるまで待つ（上限を過ぎたら止める）
+            if (busy == null && !GameUi.BetweenAreas)
+            {
+                this.unknownSince ??= DateTime.UtcNow;
+                this.Status = "Lifestream の状態を読めません（待っています）";
+                return DateTime.UtcNow - this.unknownSince.Value > UnknownLimit
+                    ? this.Fail($"Lifestream の状態（IsBusy）を {UnknownLimit.TotalSeconds:0} 秒読めません。宿屋へ向かっているか分からないので止めます")
+                    : TaskResult.Running;
+            }
+
+            this.unknownSince = null;
             if (busy == true || GameUi.BetweenAreas)
             {
                 this.sawBusy = true;
@@ -113,6 +130,9 @@ public sealed class CraftOneTask : AutoTask
     private bool requested;
     private bool sawBusy;
     private bool collectable;
+
+    // Artisan の IsBusy が読めない（null）のを最初に見た時刻。読めないのを「終わった」と扱わない
+    private DateTime? unknownSince;
 
     // 作る前の材料の所持数（「材料が減った」を確かめるため）
     private readonly Dictionary<uint, int> ingredientsBefore = [];
@@ -176,6 +196,22 @@ public sealed class CraftOneTask : AutoTask
             return TaskResult.Running;
         }
 
+        // 読めないのは「終わった」ではない（以前は読めないと製作が終わった扱いにして、途中の数で判断していた）。
+        // 読めるようになるまで待ち、上限を過ぎたら製作を止めて理由を出す
+        if (busy == null)
+        {
+            this.unknownSince ??= DateTime.UtcNow;
+            this.Status = "Artisan の状態を読めません（待っています）";
+            if (DateTime.UtcNow - this.unknownSince.Value > GoToInnTask.UnknownLimit)
+            {
+                ctx.Artisan.SetEndurance(false);
+                return this.Fail($"Artisan の状態（IsBusy）を {GoToInnTask.UnknownLimit.TotalSeconds:0} 秒読めません。製作が続いているか分からないので止めます");
+            }
+
+            return TaskResult.Running;
+        }
+
+        this.unknownSince = null;
         if (busy == true)
         {
             this.sawBusy = true;
@@ -241,12 +277,21 @@ public sealed class CraftOneTask : AutoTask
         // Artisan の CraftItem は「レシピ選択 → Endurance を ON」を内部の順番待ちに積むので、
         // 止めた直後に遅れて Endurance が ON になり、製作が進むことがある。
         // Artisan が空く（IsBusy が false）まで見張り、その間に ON になったら OFF にする。
-        var artisan = ctx.Artisan;
-        ctx.AfterStop.Add(("Artisan の製作を止め切る", DateTime.UtcNow.AddSeconds(30), () =>
+        ctx.AfterStop.Add(ArtisanStopWatch(ctx.Artisan, TimeSpan.FromSeconds(30)));
+    }
+
+    /// <summary>見張りの名前（読み込みの解除をまたいで引き継ぐときの目印）。</summary>
+    public const string ArtisanWatchName = "Artisan の製作を止め切る";
+
+    /// <summary>
+    /// 止めた後の見張り：Artisan が空くまで、遅れて Endurance が ON になったら OFF にする。
+    /// 読み込みの解除（更新・無効化）の後は見張れないので、次に読み込んだとき同じ見張りを置き直す（Services）。
+    /// </summary>
+    public static (string Name, DateTime Until, Func<bool> Step) ArtisanStopWatch(ArtisanIpc artisan, TimeSpan duration)
+        => (ArtisanWatchName, DateTime.UtcNow + duration, () =>
         {
             if (artisan.IsEndurance() == true)
                 artisan.SetEndurance(false);
             return artisan.IsBusy() == false;
-        }));
-    }
+        });
 }

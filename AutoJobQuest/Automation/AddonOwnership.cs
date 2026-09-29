@@ -30,8 +30,14 @@ public sealed unsafe class AddonOwnership : IDisposable
 
     private static readonly TimeSpan Lifetime = TimeSpan.FromSeconds(60);
 
-    private readonly Dictionary<nint, DateTime> owned = [];
+    // アドレス → （開いた時刻〔変えない〕, 期限の延長に使う時刻）。
+    // 開いた時刻を延長のたびに書き換えると、撃つ前から開いていた窓が「撃った後に開いた窓」として通り、
+    // 納品窓では同じ窓を別の窓と取り違えるので、2つを分けて持つ
+    private readonly Dictionary<nint, (DateTime OpenedAt, DateTime Touched)> owned = [];
     private bool registered;
+
+    /// <summary>画面の開閉の知らせを受け取れているか（false なら、自分が開いた画面を見分けられない。事前点検で止める）。</summary>
+    public bool Registered => this.registered;
     private bool claiming;
 
     public AddonOwnership()
@@ -64,7 +70,8 @@ public sealed unsafe class AddonOwnership : IDisposable
     {
         if (!this.claiming)
             return;
-        this.owned[args.Addon.Address] = DateTime.UtcNow;
+        var now = DateTime.UtcNow;
+        this.owned[args.Addon.Address] = (now, now);
     }
 
     private void OnPreFinalize(AddonEvent type, AddonArgs args) => this.owned.Remove(args.Addon.Address);
@@ -77,15 +84,16 @@ public sealed unsafe class AddonOwnership : IDisposable
             return false;
 
         var address = (nint)candidate;
-        if (!this.owned.TryGetValue(address, out var at))
+        if (!this.owned.TryGetValue(address, out var rec))
             return false;
 
-        if (DateTime.UtcNow - at > Lifetime)
+        if (DateTime.UtcNow - rec.Touched > Lifetime)
         {
             if (this.claiming)
             {
-                // 自分の操作が続いていて同じ画面が開いたままなら延長する（長い操作の途中で持ち主を失わない）
-                this.owned[address] = DateTime.UtcNow;
+                // 自分の操作が続いていて同じ画面が開いたままなら延長する（長い操作の途中で持ち主を失わない）。
+                // 開いた時刻は変えない
+                this.owned[address] = (rec.OpenedAt, DateTime.UtcNow);
             }
             else
             {
@@ -112,11 +120,11 @@ public sealed unsafe class AddonOwnership : IDisposable
         openedAt = DateTime.MinValue;
         if (!GameUi.IsReady(name, out var candidate))
             return false;
-        if (!this.owned.TryGetValue((nint)candidate, out var at) || at < sinceUtc)
+        if (!this.owned.TryGetValue((nint)candidate, out var rec) || rec.OpenedAt < sinceUtc)
             return false;
 
         addon = candidate;
-        openedAt = at;
+        openedAt = rec.OpenedAt;
         return true;
     }
 

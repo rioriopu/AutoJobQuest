@@ -91,10 +91,22 @@ public sealed class Configuration : IPluginConfiguration
     public bool GbrOwnListActive { get; set; }
 
     /// <summary>
+    /// GBR の NPC 購入リスト「AutoJobQuest」に品目を入れたまま、まだ消していない（購入が止まってから消す）。
+    /// 止めた直後は GBR がまだ購入中と答えるので、その場で消せないことがある。
+    /// </summary>
+    public bool GbrVendorListPending { get; set; }
+
+    /// <summary>
     /// 一時的に無効にしたが、戻すときに1つに決まらなかった（見つからない・同じ名前が複数ある）GBR のリスト。
     /// 自動ではやり直さない（時間がたっても変わらないため）。画面に出し、利用者が GBR で確かめて「確認した」を押すまで残す。
     /// </summary>
     public List<GbrListRef> GbrUnresolvedListRefs { get; set; } = [];
+
+    /// <summary>
+    /// 読み込みの解除（更新・無効化）で止めたとき、Artisan の「遅れて始まる製作」の見張りが残っていたなら、その見張りの期限（UTC）。
+    /// 解除の後は見張れないので、次に読み込んだとき、期限までの残りの時間だけ見張りを置き直す（期限を過ぎていれば捨てる）。
+    /// </summary>
+    public DateTime? PendingArtisanWatchUtc { get; set; }
 
     [NonSerialized]
     private Dalamud.Plugin.IDalamudPluginInterface? pluginInterface;

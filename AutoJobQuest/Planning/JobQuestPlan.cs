@@ -163,12 +163,9 @@ public static class PlanBuilder
         // 残りのジョブクエ。前提のクエスト（メインクエスト等）が未完了で自動では進められないものは分けて、計画に入れない
         // （開始時に「未達なので動作保証しない」と注意を出し、進められる分だけ進める。
         //   進められないクエストの素材まで集めると、ギルと時間が無駄になるため）
-        var candidates = data.Quests!.Quests
-            .Where(q => jobs.Contains(q.ClassJobId) && !QuestManager.IsQuestComplete(q.RowId))
-            .ToList();
-        plan.Blocked.AddRange(FindBlocked(candidates, QuestManager.IsQuestComplete));
-        var blockedIds = plan.Blocked.Select(b => b.Quest.RowId).ToHashSet();
-        plan.RemainingQuests.AddRange(candidates.Where(q => !blockedIds.Contains(q.RowId)));
+        var (runnable, blocked) = SplitQuests(data.Quests!.Quests, jobs, QuestManager.IsQuestComplete);
+        plan.Blocked.AddRange(blocked);
+        plan.RemainingQuests.AddRange(runnable);
 
         var inv = Inventory.Snapshot();
 
@@ -221,6 +218,19 @@ public static class PlanBuilder
         }
 
         return plan;
+    }
+
+    /// <summary>
+    /// 選んだ職の未完了のジョブクエを「進められる」と「前提が未達で進められない」に分ける（計画の最初の段。
+    /// 完了済みかは外から渡す：ゲームを起動せずに、完了済みの組み合わせを仮定して試せるように）。
+    /// 進められないクエストの納品物は計画（素材・製作・装着）に入れない。
+    /// </summary>
+    public static (List<JobQuest> Runnable, List<BlockedQuest> Blocked) SplitQuests(IEnumerable<JobQuest> all, IReadOnlySet<uint> jobs, Func<uint, bool> isComplete)
+    {
+        var candidates = all.Where(q => jobs.Contains(q.ClassJobId) && !isComplete(q.RowId)).ToList();
+        var blocked = FindBlocked(candidates, isComplete);
+        var blockedIds = blocked.Select(b => b.Quest.RowId).ToHashSet();
+        return (candidates.Where(q => !blockedIds.Contains(q.RowId)).ToList(), blocked);
     }
 
     /// <summary>

@@ -145,6 +145,48 @@ public sealed class MoveToTask : AutoTask
     {
         if ((this.started || this.pausedByUi) && ctx.Navmesh.IsMoving())
             ctx.Navmesh.Stop();
+        if (this.started || this.pausedByUi)
+            WatchPendingPath(ctx, this.destination, Math.Max(1f, this.range * 0.7f));
+    }
+
+    /// <summary>見張りの名前。</summary>
+    public const string PendingPathWatchName = "計算中だった経路が遅れて動き出さないか";
+
+    /// <summary>
+    /// 止めたときに経路の計算が進行中なら、止めた後の見張りを置く（計算が終わってこちらの行き先へ動き出したら止める。25秒まで）。
+    /// Path.Stop は計算中の経路を取り消せないため（以前は止めた後に遅れて歩き出すことがあった）。
+    /// 置くのは実行係が止まるときだけ（<see cref="TaskContext.Stopping"/>）。実行の途中で移動を取り替えたときに置くと、
+    /// 実行中は見張りが動かないので、実行が終わってから古い行き先で判断してしまう。
+    /// 実行の途中の取り替えでは、次の移動の作業が自分の経路を頼み直す。
+    /// </summary>
+    public static void WatchPendingPath(TaskContext ctx, Vector3 destination, float range)
+    {
+        if (!ctx.Stopping || ctx.Navmesh.SimplePathfindInProgress() != true)
+            return;
+
+        var nav = ctx.Navmesh;
+        var tolerance = range + 3f;
+        var giveUpAt = DateTime.UtcNow + TimeSpan.FromSeconds(25);
+        ctx.AfterStop.RemoveAll(a => a.Name == PendingPathWatchName);
+        ctx.AfterStop.Add((PendingPathWatchName, DateTime.UtcNow + TimeSpan.FromSeconds(30), () =>
+        {
+            switch (PendingPath.Decide(nav.IsFollowingPath(), nav.LastWaypoint(), nav.SimplePathfindInProgress(), destination, tolerance))
+            {
+                case PendingPath.Verdict.StopAndFinish:
+                    Core.DebugLog.Current?.Line("見張り", "止めた後に、こちらの行き先への経路が動き出したので止めました");
+                    nav.Stop();
+                    return true;
+                case PendingPath.Verdict.Finish:
+                    return true;
+                default:
+                    // 計算が長引いている（または読めない）。期限切れの警告（「相手が止まったか確かめて」）は当たらないので、
+                    // 期限の少し前に黙って外す（その後に歩き出したら、利用者が止める）
+                    if (DateTime.UtcNow < giveUpAt)
+                        return false;
+                    Core.DebugLog.Current?.Line("見張り", "計算中だった経路が25秒たっても終わらないので、見張りをやめます");
+                    return true;
+            }
+        }));
     }
 
     private static bool CanMountHere()

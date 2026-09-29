@@ -64,6 +64,9 @@ public sealed class CombatTask : AutoTask
 
     // 自分が頼んだ近づく移動（画面が開いたときに止めてよいのはこれと出現点への移動だけ）
     private bool approachIssued;
+
+    // 近づく移動を頼んだ行き先（止めた後、計算中だった経路の見張りに使う）
+    private Vector3? approachDestination;
     private bool pausedByUi;
     private DateTime uiOpenSince = DateTime.MinValue;
 
@@ -145,6 +148,9 @@ public sealed class CombatTask : AutoTask
             return TaskResult.Running;
         }
 
+        // 画面が閉じた。待っていた間は「HP が減らない時間」に数えない
+        if (this.uiOpenSince != DateTime.MinValue)
+            this.stall.Resume(DateTime.UtcNow);
         this.pausedByUi = false;
         this.uiOpenSince = DateTime.MinValue;
 
@@ -269,7 +275,11 @@ public sealed class CombatTask : AutoTask
             if (!ctx.Navmesh.IsMoving() && DateTime.UtcNow - this.lastApproach > TimeSpan.FromSeconds(1))
             {
                 this.lastApproach = DateTime.UtcNow;
-                this.approachIssued = ctx.Navmesh.MoveCloseTo(t.Position, false, 2.5f) || this.approachIssued;
+                if (ctx.Navmesh.MoveCloseTo(t.Position, false, 2.5f))
+                {
+                    this.approachIssued = true;
+                    this.approachDestination = t.Position;
+                }
             }
         }
         else if (this.approachIssued && ctx.Navmesh.IsMoving())
@@ -395,6 +405,8 @@ public sealed class CombatTask : AutoTask
         this.CancelMove(ctx);
         if ((this.approachIssued || this.pausedByUi) && ctx.Navmesh.IsMoving())
             ctx.Navmesh.Stop();
+        if (this.approachIssued && this.approachDestination is { } dest)
+            MoveToTask.WatchPendingPath(ctx, dest, 2.5f);
         this.approachIssued = false;
         this.pausedByUi = false;
 

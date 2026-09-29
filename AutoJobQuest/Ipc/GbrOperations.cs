@@ -168,7 +168,11 @@ public sealed class GbrOperations
 
     /// <summary>元に戻すべき一時変更が残っているか。</summary>
     public bool HasLeftovers
-        => this.config.GbrOwnListActive || this.config.GbrDisabledListRefs.Count > 0 || this.config.GbrConfigOriginals.Count > 0;
+        => this.config.GbrOwnListActive || this.config.GbrDisabledListRefs.Count > 0 || this.config.GbrConfigOriginals.Count > 0
+           || this.config.GbrVendorListPending;
+
+    // 直前に出した「まだ戻しません」の記録（同じ内容を10秒ごとに繰り返し書かない）
+    private string? lastWaitNote;
 
     /// <summary>
     /// GBR の自動採集が止まっているときだけ、リストと設定を元に戻す。
@@ -189,13 +193,21 @@ public sealed class GbrOperations
 
         if (!CanRestore(gbrEnabled, vendorBusy))
         {
-            Note($"GBR が動いている（または状態が読めない）ので、リストと設定はまだ戻しません（自動採集={gbrEnabled?.ToString() ?? "不明"}、購入中={vendorBusy?.ToString() ?? "不明"}）");
+            var note = $"GBR が動いている（または状態が読めない）ので、リストと設定はまだ戻しません（自動採集={gbrEnabled?.ToString() ?? "不明"}、購入中={vendorBusy?.ToString() ?? "不明"}）";
+            if (note != this.lastWaitNote)
+            {
+                this.lastWaitNote = note;
+                Note(note);
+            }
+
             return false;
         }
 
+        this.lastWaitNote = null;
+        var vendor = !this.config.GbrVendorListPending || this.ClearVendorList();
         var lists = this.RestoreGatherLists();
         var cfg = this.RestoreConfig();
-        return lists && cfg;
+        return vendor && lists && cfg;
     }
 
     /// <summary>戻してよいか：自動採集も NPC 購入も「止まっている（false）」と読めたときだけ（読めない null は戻さない）。</summary>
@@ -510,6 +522,10 @@ public sealed class GbrOperations
             var entryList = (IList)def.GetType().GetProperty("Entries")!.GetValue(def)!;
             var removeEntry = vt.GetMethod("RemoveEntry", GbrHandle.PubInst, null, [typeof(Guid)], null)!;
 
+            // 品目を入れる前に控えを立てる（途中で例外が出ても、後で消せるように。設定の一時変更と同じく「控えが先」）
+            this.config.GbrVendorListPending = true;
+            this.config.Save();
+
             // 前回の品目を消す
             foreach (var e in entryList.Cast<object>().ToList())
                 removeEntry.Invoke(vblm, [(Guid)e.GetType().GetProperty("Id")!.GetValue(e)!]);
@@ -631,24 +647,27 @@ public sealed class GbrOperations
 
     /// <summary>
     /// 購入リスト「AutoJobQuest」の品目を消す（実行後に GBR の設定へ品目が残らないように）。
-    /// GBR の購入が動いているときは何もしない。
+    /// GBR の購入が動いているときは何もしない（false）。消せたか、消す物が無ければ true で、控えも消す。
     /// </summary>
-    public void ClearVendorList()
+    public bool ClearVendorList()
     {
         var h = this.reflection.Get();
         if (h == null)
-            return;
+            return false;
         try
         {
             var vblm = h.VendorBuyListManager;
             var vt = vblm.GetType();
             if ((bool)vt.GetProperty("IsBusy", GbrHandle.PubInst)!.GetValue(vblm)!)
-                return;
+                return false;
 
             var def = ((IEnumerable)vt.GetProperty("Lists", GbrHandle.PubInst)!.GetValue(vblm)!).Cast<object>()
                 .FirstOrDefault(d => string.Equals(d.GetType().GetProperty("Name")!.GetValue(d) as string, OwnListName, StringComparison.OrdinalIgnoreCase));
             if (def == null)
-                return;
+            {
+                this.MarkVendorListCleared();
+                return true;
+            }
 
             var entryList = (IList)def.GetType().GetProperty("Entries")!.GetValue(def)!;
             var removeEntry = vt.GetMethod("RemoveEntry", GbrHandle.PubInst, null, [typeof(Guid)], null)!;
@@ -661,11 +680,22 @@ public sealed class GbrOperations
 
             if (n > 0)
                 Note($"NPC 購入リスト「{OwnListName}」の品目を消しました（{n} 件）");
+            this.MarkVendorListCleared();
+            return true;
         }
         catch (Exception ex)
         {
             this.SetError($"NPC 購入リストの品目を消せませんでした: {Unwrap(ex)}");
+            return false;
         }
+    }
+
+    private void MarkVendorListCleared()
+    {
+        if (!this.config.GbrVendorListPending)
+            return;
+        this.config.GbrVendorListPending = false;
+        this.config.Save();
     }
 
     /// <summary>

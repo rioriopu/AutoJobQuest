@@ -10,11 +10,25 @@ using FFXIVClientStructs.FFXIV.Component.GUI;
 
 namespace AutoJobQuest.Automation;
 
-/// <summary>納品窓の1つの欄が求めるもの（品番は HQ の +1,000,000 を外したもの）。</summary>
-public sealed record RequestSlot(uint ItemId, int Quantity, bool WantHq, int WantMateria, bool WantCollectible, int MinCollectibility);
+/// <summary>マテリア1個（Materia シートの行と等級）。納品窓が求める種類と、品に付いている種類を比べるのに使う。</summary>
+public readonly record struct MateriaRef(ushort Id, byte Grade);
+
+/// <summary>納品窓の1つの欄が求めるもの（品番は HQ の +1,000,000・収集品の +500,000 を外したもの）。</summary>
+public sealed record RequestSlot(uint ItemId, int Quantity, bool WantHq, int WantMateria, bool WantCollectible, int MinCollectibility)
+{
+    /// <summary>
+    /// 求めるマテリアの種類（0 でないものだけ）。値の意味（Materia シートの行と等級か）は実機で確かめていないので、
+    /// 選ぶときの「優先」にだけ使い、合う候補が無ければ数だけで選ぶ。
+    /// </summary>
+    public IReadOnlyList<MateriaRef> WantMateriaTypes { get; init; } = [];
+}
 
 /// <summary>カバンの品・納品窓の候補1つ（品番は元の品番）。</summary>
-public sealed record TurnInItem(uint BaseItemId, bool Hq, int Materia, bool Collectable, int Collectability, int Quantity);
+public sealed record TurnInItem(uint BaseItemId, bool Hq, int Materia, bool Collectable, int Collectability, int Quantity)
+{
+    /// <summary>付いているマテリアの種類。</summary>
+    public IReadOnlyList<MateriaRef> MateriaTypes { get; init; } = [];
+}
 
 /// <summary>
 /// 納品窓（Request）の読み書きの口。<see cref="RequestFiller"/> の判断をゲームから切り離すためのもの
@@ -24,6 +38,9 @@ public interface IRequestWindow
 {
     /// <summary>窓の情報（エージェント）が使える状態か。</summary>
     bool Ready { get; }
+
+    /// <summary>ゲーム自身の判定で、手持ちで窓の条件を満たせるか（NpcTrade.CanSatisfyRequests。読めなければ null）。</summary>
+    bool? CanSatisfy { get; }
 
     /// <summary>欄の数（まだ入っていなければ 0）。</summary>
     int RequestCount { get; }
@@ -62,7 +79,7 @@ public interface IRequestWindow
 /// 違いは候補の選び方だけ。YesAlready は常に 0 番目を入れるが、こちらは窓が求める条件
 /// （UIState.NpcTrade.Requests の WantHQ・WantMateriaFilledSlots・WantCollectible/MinCollectibility）を、
 /// 候補のカバンの品（AgentNpcTrade.SelectedTurnInSlotItemOptionValues）と照らして、合うものを選ぶ。
-/// HQ 指定が無ければ NQ を先に使う（HQ を残すため）。
+/// 選ぶ順は <see cref="Choose"/>（後の欄を満たせなくなる候補は避ける → 1つの山で求める数に届く → マテリアの種類 → HQ 指定が無ければ NQ）。
 ///
 /// 【窓1つにつき1回だけ試す、をやめた】
 /// 以前は窓を見つけた時点で「処理済み」にしてから入れていたので、窓の準備（エージェントの情報）が次のフレームで
@@ -87,7 +104,7 @@ public sealed class RequestFiller
         /// <summary>他の操作（利用者・他のプラグイン）が欄を選んでいる。触らずに待つ。</summary>
         Busy,
 
-        /// <summary>候補が出るのを待っている（こちらが欄を選んだ直後）。</summary>
+        /// <summary>候補が出るのを待っている（こちらが欄を選んだ直後）・入れた後に欄の選択が戻るのを待っている。</summary>
         Waiting,
 
         /// <summary>このクエストの納品物ではない品を求める窓。触らない。</summary>
@@ -114,7 +131,20 @@ public sealed class RequestFiller
     private int nextSlot;
     private int selectedByUs = -1;
     private DateTime selectedAt = DateTime.MinValue;
+
+    // 入れた欄（選択が戻るのを待つ。-1 なら無し）。YesAlready は同じフレームで次の欄へ進むが、戻る前に次の欄を選ぶと
+    // 取り違えるので、戻ったのを見てから進む。最後の欄の後は待たずに渡す（YesAlready と同じ）。
+    // ゲームが自分で次の欄を選んだときは、それをこちらの選択として使う（戻るのを待ち続けない）
+    private int putPending = -1;
+    private DateTime putAt = DateTime.MinValue;
     private readonly List<string> picked = [];
+
+    // この窓に入れた品（ゲームは渡すまでカバンから消さないので、後の欄の見積もりではこちらで引く）
+    private readonly List<(TurnInKey Key, int Quantity)> used = [];
+
+    private readonly record struct TurnInKey(uint Item, bool Hq, int Materia, bool Collectable, int Collectability);
+
+    private static TurnInKey KeyOf(TurnInItem it) => new(it.BaseItemId, it.Hq, it.Materia, it.Collectable, it.Collectability);
 
     /// <param name="clock">いまの時刻（省略時は UtcNow。試すときに時計を差し替える）。</param>
     public RequestFiller(Func<DateTime>? clock = null)
@@ -124,6 +154,24 @@ public sealed class RequestFiller
 
     /// <summary>渡す直前の、求められた品の所持数（渡した後に「減った」を確かめるため。Submitted のときに入る）。</summary>
     public Dictionary<uint, int> CountsBeforeSubmit { get; } = [];
+
+    /// <summary>
+    /// いまの窓で、こちらが欄を選ぶ・入れる操作をしたか。止めたときに閉じてよいのは、この窓だけ
+    /// （以前はクエストの間に開いた納品窓なら、触っていなくても閉じていた）。
+    /// </summary>
+    public bool Touched { get; private set; }
+
+    /// <summary>いま扱っている窓のアドレス（0 なら無し）。</summary>
+    public nint Addon => this.addon;
+
+    /// <summary>いま扱っている窓の開いた時刻。</summary>
+    public DateTime AddonOpenedAt => this.addonOpenedAt;
+
+    /// <summary>いまの窓で渡す操作を送ったか。</summary>
+    public bool HasSubmitted { get; private set; }
+
+    /// <summary>納品窓が求めるマテリアの値（読めたときだけ。実機で意味を確かめるために記録に残す）。</summary>
+    public string? MateriaNote { get; private set; }
 
     /// <summary>窓が閉じた・別の窓になったときに呼ぶ。</summary>
     public void Reset()
@@ -135,8 +183,14 @@ public sealed class RequestFiller
         this.nextSlot = 0;
         this.selectedByUs = -1;
         this.selectedAt = DateTime.MinValue;
+        this.putPending = -1;
+        this.putAt = DateTime.MinValue;
         this.picked.Clear();
+        this.used.Clear();
         this.CountsBeforeSubmit.Clear();
+        this.Touched = false;
+        this.HasSubmitted = false;
+        this.MateriaNote = null;
     }
 
     /// <summary>
@@ -172,33 +226,75 @@ public sealed class RequestFiller
         if (!this.checkedOnce)
         {
             this.checkedOnce = true;
-            var owned = window.OwnedItems();
+            var reqs = Enumerable.Range(0, count).Select(window.GetRequest).ToList();
             for (var slot = 0; slot < count; slot++)
             {
-                var req = window.GetRequest(slot);
-                if (!expectedItems.Contains(req.ItemId))
+                if (!expectedItems.Contains(reqs[slot].ItemId))
                 {
                     this.finished = true;
-                    detail = $"納品窓が求める品（{CraftPlanner.ItemName(req.ItemId)}）はこのクエストの納品物ではないので触りません";
+                    detail = $"納品窓が求める品（{CraftPlanner.ItemName(reqs[slot].ItemId)}）はこのクエストの納品物ではないので触りません";
                     return Outcome.NotOurs;
                 }
-
-                var have = owned.Where(it => it.BaseItemId == req.ItemId && Matches(req, it)).Sum(it => Math.Max(1, it.Quantity));
-                if (have < Math.Max(1, req.Quantity))
-                {
-                    this.finished = true;
-                    detail = $"納品窓の {slot + 1} 番目（{Describe(req)}×{req.Quantity}）に合う品が {have} 個しかありません";
-                    return Outcome.Failed;
-                }
             }
+
+            // 同じ品を求める欄が複数あっても、1つの品を2つの欄に数えない（取り置きながら数える）
+            if (!Reserve(reqs, window.OwnedItems(), out var failedSlot, out var have))
+            {
+                this.finished = true;
+                var req = reqs[failedSlot];
+                detail = $"納品窓の {failedSlot + 1} 番目（{Describe(req)}×{Math.Max(1, req.Quantity)}）に合う品が、ほかの欄の分を除くと {have} 個しかありません";
+                return Outcome.Failed;
+            }
+
+            // ゲーム自身の判定でも満たせないなら入れない（YesAlready と同じ確かめ）
+            if (window.CanSatisfy == false)
+            {
+                this.finished = true;
+                detail = $"ゲームの判定（CanSatisfyRequests）では、手持ちで納品窓の条件を満たせません（求める品：{string.Join("、", reqs.Select(r => $"{Describe(r)}×{Math.Max(1, r.Quantity)}"))}）";
+                return Outcome.Failed;
+            }
+
+            var types = reqs.Where(r => r.WantMateriaTypes.Count > 0).ToList();
+            if (types.Count > 0)
+                this.MateriaNote = $"納品窓が求めるマテリアの値：{string.Join(" / ", types.Select(r => $"{CraftPlanner.ItemName(r.ItemId)}＝{string.Join("・", r.WantMateriaTypes.Select(m => $"{m.Id}-{m.Grade}"))}"))}（実機で意味を確かめるための記録）";
         }
 
-        // 他の操作が欄を選んでいる途中なら触らない（こちらが選んだ欄なら続ける）
-        if (window.SelectedSlot >= 0 && window.SelectedSlot != this.selectedByUs)
-            return Outcome.Busy;
-
-        while (this.nextSlot < count)
+        while (true)
         {
+            // 入れた後、欄の選択が戻るのを待つ（上限を過ぎたら止める）
+            if (this.putPending >= 0)
+            {
+                if (window.SelectedSlot == this.putPending)
+                {
+                    if (this.clock() - this.putAt < OptionWaitLimit)
+                        return Outcome.Waiting;
+
+                    this.finished = true;
+                    detail = $"納品窓の {this.putPending + 1} 番目に入れた後、{OptionWaitLimit.TotalSeconds:0}秒たっても欄の選択が戻りません";
+                    return Outcome.Failed;
+                }
+
+                // ゲームが自分で次の欄を選んだ：こちらの選択として続ける（「他の操作が選択中」と取り違えない）
+                if (this.nextSlot < count && window.SelectedSlot == this.nextSlot)
+                {
+                    this.selectedByUs = this.nextSlot;
+                    this.selectedAt = this.clock();
+                }
+
+                this.putPending = -1;
+            }
+
+            if (this.nextSlot >= count)
+                break;
+
+            // 他の操作が欄を選んでいる途中なら触らない（こちらが選んだ欄なら続ける）。
+            // 解除されたら、こちらの欄を選び直す（以前は「選んだ」のまま候補を待ち続けて、5秒で止まった）
+            if (window.SelectedSlot >= 0 && window.SelectedSlot != this.selectedByUs)
+            {
+                this.selectedByUs = -1;
+                return Outcome.Busy;
+            }
+
             var slot = this.nextSlot;
             var req = window.GetRequest(slot);
             if (this.selectedByUs != slot)
@@ -206,6 +302,7 @@ public sealed class RequestFiller
                 window.SelectSlot(slot);
                 this.selectedByUs = slot;
                 this.selectedAt = this.clock();
+                this.Touched = true;
             }
 
             // 候補がまだ出ていなければ、次のフレームで続ける（上限を過ぎたら止める）
@@ -219,7 +316,11 @@ public sealed class RequestFiller
                 return Outcome.Failed;
             }
 
-            var option = Choose(req, window, out var why);
+            // 後の欄を満たせなくなる候補は避ける（取り置きの確かめと同じ数え方。
+            // 以前は「1つの山で届く」を先にしたので、後の HQ の欄に要る HQ を先の欄で使いうった）
+            var rest = Enumerable.Range(slot + 1, count - slot - 1).Select(window.GetRequest).ToList();
+            var pool = rest.Count > 0 ? this.Available(window.OwnedItems()) : null;
+            var option = Choose(req, window, out var why, pool == null ? null : it => KeepsRest(rest, pool, it, req.Quantity));
             if (option < 0)
             {
                 this.finished = true;
@@ -227,10 +328,19 @@ public sealed class RequestFiller
                 return Outcome.Failed;
             }
 
+            var chosen = window.GetOption(option)!;
             window.PutOption(option);
+            this.used.Add((KeyOf(chosen), Math.Min(Math.Max(1, req.Quantity), Math.Max(1, chosen.Quantity))));
             this.picked.Add($"{CraftPlanner.ItemName(req.ItemId)}：{why}");
             this.selectedByUs = -1;
             this.nextSlot++;
+
+            // 最後の欄なら待たずに渡す。まだ欄が残っていれば、選択が戻るのを見てから次へ
+            if (this.nextSlot < count)
+            {
+                this.putPending = slot;
+                this.putAt = this.clock();
+            }
         }
 
         // 渡す（ここで初めて「渡した」にする。二度は送らない）
@@ -239,10 +349,15 @@ public sealed class RequestFiller
 
         window.Submit();
         this.finished = true;
+        this.HasSubmitted = true;
 
         detail = $"納品窓に入れて、渡す操作を送りました：{string.Join(" / ", this.picked)}";
         return Outcome.Submitted;
     }
+
+    /// <summary>納品窓の品番を元の品番に直す（HQ は +1,000,000、収集品は +500,000 されている）。</summary>
+    public static uint BaseItemId(uint raw)
+        => raw >= 1_000_000 ? raw - 1_000_000 : raw >= 500_000 ? raw - 500_000 : raw;
 
     private static string Describe(RequestSlot req)
         => $"{CraftPlanner.ItemName(req.ItemId)}{(req.WantHq ? " HQ" : string.Empty)}"
@@ -255,10 +370,121 @@ public sealed class RequestFiller
            && it.Materia >= req.WantMateria
            && (!req.WantCollectible || (it.Collectable && it.Collectability >= req.MinCollectibility));
 
-    /// <summary>候補の中から条件に合う品の番号を選ぶ。無ければ -1。why に選んだ理由（無ければ候補の中身）。</summary>
-    public static int Choose(RequestSlot req, IRequestWindow window, out string why)
+    /// <summary>求めるマテリアの種類（0 でないもの）が、その品に全部付いているか。求める種類が無ければ true。</summary>
+    public static bool MateriaTypesMatch(RequestSlot req, TurnInItem it)
     {
-        var fallback = -1;
+        var want = req.WantMateriaTypes.Where(m => m.Id != 0).ToList();
+        if (want.Count == 0)
+            return true;
+        var have = it.MateriaTypes.ToList();
+        foreach (var m in want)
+        {
+            var at = have.IndexOf(m);
+            if (at < 0)
+                return false;
+            have.RemoveAt(at);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// 全部の欄を、ほかの欄の分を除いても満たせるか（同じ品を求める欄が複数あるとき、1つの品を2つの欄に数えない）。
+    /// 条件の厳しい欄（収集品・HQ・マテリアの数が多い）から先に、条件を満たす品のうち価値の低いもの（NQ・マテリアの少ないもの）を取り置く。
+    /// 満たせなければ、その欄の番号と、その欄に残っていた数を返す。
+    /// </summary>
+    public static bool Reserve(IReadOnlyList<RequestSlot> reqs, IReadOnlyList<TurnInItem> owned, out int failedSlot, out int have)
+    {
+        var left = owned.Select(it => Math.Max(1, it.Quantity)).ToArray();
+        var order = Enumerable.Range(0, reqs.Count)
+            .OrderByDescending(i => reqs[i].WantCollectible)
+            .ThenByDescending(i => reqs[i].WantHq)
+            .ThenByDescending(i => reqs[i].WantMateria)
+            .ThenBy(i => i)
+            .ToList();
+        foreach (var i in order)
+        {
+            var req = reqs[i];
+            var need = Math.Max(1, req.Quantity);
+            var candidates = Enumerable.Range(0, owned.Count)
+                .Where(j => left[j] > 0 && owned[j].BaseItemId == req.ItemId && Matches(req, owned[j]))
+                .OrderBy(j => owned[j].Hq)
+                .ThenBy(j => owned[j].Materia)
+                .ThenBy(j => owned[j].Collectability)
+                .ToList();
+            var total = candidates.Sum(j => left[j]);
+            if (total < need)
+            {
+                failedSlot = i;
+                have = total;
+                return false;
+            }
+
+            foreach (var j in candidates)
+            {
+                var take = Math.Min(need, left[j]);
+                left[j] -= take;
+                need -= take;
+                if (need == 0)
+                    break;
+            }
+        }
+
+        failedSlot = -1;
+        have = 0;
+        return true;
+    }
+
+    /// <summary>手持ちから、この窓にもう入れた分を引いた残り。</summary>
+    private List<TurnInItem> Available(IReadOnlyList<TurnInItem> owned)
+    {
+        var qty = owned.Select(it => Math.Max(1, it.Quantity)).ToArray();
+        foreach (var (key, q) in this.used)
+        {
+            var need = q;
+            for (var i = 0; i < owned.Count && need > 0; i++)
+            {
+                if (qty[i] <= 0 || KeyOf(owned[i]) != key)
+                    continue;
+                var take = Math.Min(need, qty[i]);
+                qty[i] -= take;
+                need -= take;
+            }
+        }
+
+        return owned.Select((it, i) => it with { Quantity = qty[i] }).Where(it => it.Quantity > 0).ToList();
+    }
+
+    /// <summary>その候補をこの欄に使っても、残りの欄を満たせるか（<see cref="Reserve"/> と同じ数え方）。</summary>
+    public static bool KeepsRest(IReadOnlyList<RequestSlot> rest, IReadOnlyList<TurnInItem> pool, TurnInItem candidate, int quantity)
+    {
+        var left = pool.ToList();
+        var take = Math.Min(Math.Max(1, quantity), Math.Max(1, candidate.Quantity));
+        for (var i = 0; i < left.Count && take > 0; i++)
+        {
+            if (KeyOf(left[i]) != KeyOf(candidate))
+                continue;
+            var n = Math.Min(take, Math.Max(1, left[i].Quantity));
+            take -= n;
+            left[i] = left[i] with { Quantity = Math.Max(1, left[i].Quantity) - n };
+        }
+
+        return Reserve(rest, left.Where(it => it.Quantity > 0).ToList(), out _, out _);
+    }
+
+    /// <summary>
+    /// 候補の中から条件に合う品の番号を選ぶ。無ければ -1。why に選んだ理由（無ければ候補の中身）。
+    /// 条件に合う候補のうち、次の順でよいものを選ぶ（同じなら候補の並びの先のもの）：
+    ///  0) 後の欄を満たせなくなる候補を避ける（<paramref name="keepsRest"/>。後の欄が無ければ見ない）
+    ///  1) 1つの山で求める数に届く（重ねられる品で、山が分かれているとき）
+    ///  2) マテリアの種類が求めるものと合う（求める種類が読めたときだけ。合う候補が無ければ数だけで選ぶ）
+    ///  3) HQ 指定が無ければ NQ（HQ は後の HQ 指定のために残す）
+    /// </summary>
+    public static int Choose(RequestSlot req, IRequestWindow window, out string why, Func<TurnInItem, bool>? keepsRest = null)
+    {
+        var best = -1;
+        var bestScore = (Keeps: 0, Enough: 0, Type: 0, Nq: 0);
+        TurnInItem? chosen = null;
         var seen = new List<string>();
         var n = window.OptionCount;
         for (var j = 0; j < n; j++)
@@ -267,31 +493,41 @@ public sealed class RequestFiller
             if (it == null)
                 continue;
 
-            seen.Add($"{(it.Hq ? "HQ" : "NQ")}・マテリア{it.Materia}{(it.Collectable ? $"・収集価値{it.Collectability}" : string.Empty)}");
+            seen.Add($"{(it.Hq ? "HQ" : "NQ")}・{it.Quantity}個・マテリア{it.Materia}{(it.Collectable ? $"・収集価値{it.Collectability}" : string.Empty)}");
 
             if (it.BaseItemId != req.ItemId || !Matches(req, it))
                 continue;
 
-            // HQ 指定が無いときは NQ を先に使う（HQ は後の HQ 指定のために残す）
-            if (!req.WantHq && it.Hq)
+            var score = (
+                Keeps: keepsRest == null || keepsRest(it) ? 1 : 0,
+                Enough: it.Quantity >= Math.Max(1, req.Quantity) ? 1 : 0,
+                Type: MateriaTypesMatch(req, it) ? 1 : 0,
+                Nq: !req.WantHq && !it.Hq ? 1 : 0);
+            if (best < 0 || score.CompareTo(bestScore) > 0)
             {
-                if (fallback < 0)
-                    fallback = j;
-                continue;
+                best = j;
+                bestScore = score;
+                chosen = it;
             }
-
-            why = $"{(it.Hq ? "HQ" : "NQ")}の品（候補 {j + 1}/{n}）";
-            return j;
         }
 
-        if (fallback >= 0)
+        if (best < 0 || chosen == null)
         {
-            why = $"HQの品（NQ が無いため。候補 {fallback + 1}/{n}）";
-            return fallback;
+            why = seen.Count == 0 ? "候補を読めませんでした" : "候補：" + string.Join("、", seen);
+            return -1;
         }
 
-        why = seen.Count == 0 ? "候補を読めませんでした" : "候補：" + string.Join("、", seen);
-        return -1;
+        var notes = new List<string> { $"候補 {best + 1}/{n}" };
+        if (bestScore.Keeps == 0)
+            notes.Add("後の欄が足りなくなる恐れ（ほかに候補が無い）");
+        if (bestScore.Enough == 0)
+            notes.Add($"1つの山では {req.Quantity} 個に届かない");
+        if (req.WantMateriaTypes.Any(m => m.Id != 0))
+            notes.Add(bestScore.Type == 1 ? "マテリアの種類が一致" : "マテリアの種類が一致する候補が無いので数だけで選んだ");
+        if (!req.WantHq && chosen.Hq)
+            notes.Add("NQ が無いため");
+        why = $"{(chosen.Hq ? "HQ" : "NQ")}の品（{string.Join("・", notes)}）";
+        return best;
     }
 }
 
@@ -315,6 +551,25 @@ public sealed unsafe class GameRequestWindow : IRequestWindow
         }
     }
 
+    public bool? CanSatisfy
+    {
+        get
+        {
+            // ゲームの関数を位置（シグネチャ）で呼ぶので、ゲームの更新で見つからなくなると例外になる。
+            // そのときは「読めない」（null）として、こちらの数えで進める（作業ごと止めない）
+            try
+            {
+                var ui = UIState.Instance();
+                return ui == null ? null : ui->NpcTrade.CanSatisfyRequests();
+            }
+            catch (Exception ex)
+            {
+                Core.DebugLog.Current?.Line("納品", $"CanSatisfyRequests を呼べませんでした（{ex.GetType().Name}）。こちらの数えだけで進めます");
+                return null;
+            }
+        }
+    }
+
     public int RequestCount
     {
         get
@@ -327,8 +582,18 @@ public sealed unsafe class GameRequestWindow : IRequestWindow
     public RequestSlot GetRequest(int slot)
     {
         var r = UIState.Instance()->NpcTrade.Requests.Items[slot];
-        var id = r.ItemId >= 1_000_000 ? r.ItemId - 1_000_000 : r.ItemId; // HQ の品番なら元の品番に直す
-        return new RequestSlot(id, r.RequiredQuantity, r.WantHQ, r.WantMateriaFilledSlots, r.WantCollectible, r.MinCollectibility);
+        var types = new List<MateriaRef>();
+        for (var i = 0; i < r.WantMateriaIds.Length && i < r.WantMateriaGrades.Length; i++)
+        {
+            if (r.WantMateriaIds[i] != 0)
+                types.Add(new MateriaRef(r.WantMateriaIds[i], r.WantMateriaGrades[i]));
+        }
+
+        // HQ・収集品の品番なら元の品番に直す
+        return new RequestSlot(RequestFiller.BaseItemId(r.ItemId), r.RequiredQuantity, r.WantHQ, r.WantMateriaFilledSlots, r.WantCollectible, r.MinCollectibility)
+        {
+            WantMateriaTypes = types,
+        };
     }
 
     public int SelectedSlot => Agent->SelectedTurnInSlot;
@@ -403,11 +668,30 @@ public sealed unsafe class GameRequestWindow : IRequestWindow
     public int CountOwned(uint itemId) => Inventory.Snapshot().CountAll(itemId);
 
     private static TurnInItem FromSlot(InventoryItem* it)
-        => new(
+    {
+        var count = it->GetMateriaCount();
+
+        // マテリアの種類は「優先」にだけ使う。読む関数（位置で呼ぶ）が見つからなければ空にして、数だけで選ぶ
+        var types = new List<MateriaRef>();
+        try
+        {
+            for (byte i = 0; i < count && i < 5; i++)
+                types.Add(new MateriaRef(it->GetMateriaId(i), it->GetMateriaGrade(i)));
+        }
+        catch (Exception)
+        {
+            types.Clear();
+        }
+
+        return new TurnInItem(
             it->GetBaseItemId(),
             (it->Flags & InventoryItem.ItemFlags.HighQuality) != 0,
-            it->GetMateriaCount(),
+            count,
             it->IsCollectable(),
             it->IsCollectable() ? it->GetCollectability() : 0,
-            it->Quantity);
+            it->Quantity)
+        {
+            MateriaTypes = types,
+        };
+    }
 }

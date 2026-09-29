@@ -39,6 +39,13 @@ public sealed unsafe class MeldTask : AutoTask
     private const uint MeldButtonNodeId = 35;   // ECommons / YesAlready / SimpleTweaks の3つで一致
     private const uint ReturnButtonNodeId = 36;  // ECommons
 
+    // 一覧の配列の長さ（FFXIVClientStructs の MateriaAttachData：ItemsSorted・MateriaSorted とも 140）。
+    // 画面の件数がこれを超えて読まないようにする
+    private const int SortedCapacity = 140;
+
+    // 確認画面の成功率の位置（FFXIVClientStructs の MateriaAttachDialogAtkValues：41 番目）
+    private const int SuccessRateIndex = 41;
+
     private readonly MateriaNeed need;
     private MeldStep step = MeldStep.Prepare;
 
@@ -60,6 +67,13 @@ public sealed unsafe class MeldTask : AutoTask
     public override string Name => $"マテリア装着: {CraftPlanner.ItemName(this.need.TargetItemId)}";
 
     private static AgentMateriaAttach* Agent => AgentMateriaAttach.Instance();
+
+    protected override TaskResult OnStart(TaskContext ctx)
+    {
+        // 装着の確認を YesAlready が先に押すと、成功率の確かめ（100% 未満なら押さない）を通らない。こちらの作業の間は止めてもらう
+        ctx.YesAlready.Suppress();
+        return TaskResult.Running;
+    }
 
     private InventoryItem* LiveTarget => InventoryManager.Instance()->GetInventorySlot(this.targetType, this.targetSlot);
 
@@ -133,7 +147,10 @@ public sealed unsafe class MeldTask : AutoTask
             {
                 var live = this.LiveTarget;
                 var data = Agent->Data;
-                for (var i = 0; i < Agent->ItemCount; i++)
+                // 画面の中身がまだ無い（読み込み中）。null のまま読むとゲームごと落ちるので待つ
+                if (data == null)
+                    return this.TimedOut(TimeSpan.FromSeconds(10)) ? this.Fail("装着画面の中身を読めません") : TaskResult.Running;
+                for (var i = 0; i < Math.Min((int)Agent->ItemCount, SortedCapacity); i++)
                 {
                     var entry = data->ItemsSorted[i].Value;
                     if (entry == null)
@@ -161,7 +178,9 @@ public sealed unsafe class MeldTask : AutoTask
             case MeldStep.SelectMateria:
             {
                 var data = Agent->Data;
-                for (var i = 0; i < Agent->MateriaCount; i++)
+                if (data == null)
+                    return this.TimedOut(TimeSpan.FromSeconds(10)) ? this.Fail("装着画面の中身を読めません") : TaskResult.Running;
+                for (var i = 0; i < Math.Min((int)Agent->MateriaCount, SortedCapacity); i++)
                 {
                     var entry = data->MateriaSorted[i].Value;
                     if (entry == null || entry->Item == null)
@@ -201,7 +220,17 @@ public sealed unsafe class MeldTask : AutoTask
                     return TaskResult.Running;
                 }
 
-                var rate = dialog->TypedAtkValues->SuccessRate.Int;
+                // 成功率を読めなければ押さない（値の数が足りない・型が違う＝配置が変わった可能性）
+                // （型は実機で確かめていないので、以前と同じく整数なら Int・UInt のどちらでも読む）
+                var atk = (AtkUnitBase*)dialog;
+                var rateValue = atk->AtkValues != null && atk->AtkValuesCount > SuccessRateIndex ? dialog->TypedAtkValues->SuccessRate : default;
+                if (rateValue.Type is not (AtkValueType.Int or AtkValueType.UInt))
+                {
+                    GameUi.ClickButton(atk, ReturnButtonNodeId);
+                    return this.Fail($"確認画面の成功率を読めないため中止しました（値の数 {atk->AtkValuesCount}・型 {rateValue.Type}）");
+                }
+
+                var rate = rateValue.Type == AtkValueType.UInt ? (int)Math.Min(rateValue.UInt, int.MaxValue) : rateValue.Int;
                 if (rate < 100)
                 {
                     GameUi.ClickButton((AtkUnitBase*)dialog, ReturnButtonNodeId);
@@ -367,6 +396,7 @@ public sealed unsafe class MeldTask : AutoTask
         if (this.openedByUs && Agent != null && Agent->IsAgentActive())
             Agent->Hide();
         this.openedByUs = false;
+        ctx.YesAlready.Release();
     }
 
     private bool MateriaCountIncreased()

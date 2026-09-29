@@ -119,14 +119,14 @@ public sealed class GatherTask : AutoTask
         var inv = Inventory.Snapshot();
         foreach (var n in this.needs)
         {
-            var add = n.ExtraFromNow > 0 ? n.ExtraFromNow : AcquireMath.Additional(n.TargetOwned, inv.CountAll(n.ItemId));
+            var (add, gbrTarget) = AcquireMath.GbrTarget(GbrCount(n.ItemId), n.TargetOwned, inv.CountAll(n.ItemId), n.ExtraFromNow);
             if (add <= 0)
             {
                 ctx.Log.Write("採集", $"{CraftPlanner.ItemName(n.ItemId)} はもう足りています（{inv.CountAll(n.ItemId)}/{n.TargetOwned}）");
                 continue;
             }
 
-            this.targets[n.ItemId] = (uint)(GbrCount(n.ItemId) + add);
+            this.targets[n.ItemId] = (uint)gbrTarget;
         }
 
         if (this.targets.Count == 0)
@@ -303,15 +303,15 @@ public sealed class VendorTask : AutoTask
         var inv = Inventory.Snapshot();
         foreach (var n in this.needs)
         {
-            var add = AcquireMath.Additional(n.TargetOwned, inv.CountAll(n.ItemId));
+            var (add, vendorTarget) = AcquireMath.GbrTarget(VendorCount(n.ItemId), n.TargetOwned, inv.CountAll(n.ItemId));
             if (add <= 0)
             {
                 ctx.Log.Write("購入", $"{CraftPlanner.ItemName(n.ItemId)} はもう足りています（{inv.CountAll(n.ItemId)}/{n.TargetOwned}）");
                 continue;
             }
 
-            this.before[n.ItemId] = VendorCount(n.ItemId);
-            this.targets[n.ItemId] = this.before[n.ItemId] + add;
+            this.before[n.ItemId] = vendorTarget - add;
+            this.targets[n.ItemId] = vendorTarget;
         }
 
         if (this.targets.Count == 0)
@@ -319,9 +319,9 @@ public sealed class VendorTask : AutoTask
 
         this.gilBefore = Inventory.Gil();
 
-        // 帰宅テレポの抑止（購入の後に採集へ続くことが多いので、ここでも切っておく）
-        ctx.Gbr.OverrideBool("GoHomeWhenDone", false);
-        ctx.Gbr.OverrideBool("GoHomeWhenIdle", false);
+        // 帰宅の設定（GoHomeWhenDone / GoHomeWhenIdle）はここでは変えない。GBR の NPC 購入はこの設定を読まない
+        // （GBR のソースで確認：読むのは自動採集と収集品の処理だけ）。変えると、購入の後に戻すまで控えが残るだけになる。
+        // 採集の作業（GatherTask）は自分で変える
 
         this.listId = ctx.Gbr.PrepareVendorList(this.targets.Select(t => (t.Key, (uint)t.Value)).ToList(), out var notGil);
         if (this.listId == null)
@@ -444,9 +444,7 @@ public sealed class VendorTask : AutoTask
         if (this.started && ctx.Gbr.VendorIsBusy() == true)
             ctx.Gbr.StopVendor();
 
-        // 購入が止まっていれば、リストの品目を消し、設定を戻す（動いていれば後で戻す）
-        if (ctx.Gbr.VendorIsBusy() == false)
-            ctx.Gbr.ClearVendorList();
+        // 購入が止まっていれば、リストの品目を消し、設定を戻す（動いていれば、止まってから消す・戻す：控えに残してある）
         if (!ctx.Gbr.RestoreIfIdle(ctx.GatherBuddy.IsAutoGatherEnabled(), ctx.Gbr.VendorIsBusy()))
             ctx.Log.Warn("購入", "GBR が止まったことを確かめられないので、設定は後で戻します");
     }

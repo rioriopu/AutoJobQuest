@@ -89,6 +89,19 @@ public sealed class VnavmeshIpc : IpcGate
                () => this.Func<bool>("vnavmesh.Path.IsRunning").InvokeFunc(), out var running)
            && running;
 
+    /// <summary>SimpleMove の経路の計算が進行中か（読めなければ null）。</summary>
+    public bool? SimplePathfindInProgress()
+        => this.TryInvoke("SimpleMove.PathfindInProgress",
+            () => this.Func<bool>("vnavmesh.SimpleMove.PathfindInProgress").InvokeFunc(), out var v) ? v : null;
+
+    /// <summary>いまたどっている経路の終点（経路が無い・読めなければ null）。自分の行き先の経路かを確かめるのに使う。</summary>
+    public Vector3? LastWaypoint()
+        => this.TryInvoke("Path.ListWaypoints",
+            () => this.Func<System.Collections.Generic.List<Vector3>>("vnavmesh.Path.ListWaypoints").InvokeFunc(), out var list)
+           && list is { Count: > 0 }
+            ? list[^1]
+            : null;
+
     /// <summary>移動を止める。自分が始めた移動のときだけ呼ぶこと（全体に効くため）。</summary>
     public bool Stop()
         => this.TraceThen("Path.Stop()") && this.TryAction("Path.Stop",

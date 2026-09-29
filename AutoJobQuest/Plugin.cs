@@ -113,10 +113,8 @@ public sealed class Plugin : IDalamudPlugin
 
         this.windows.RemoveAllWindows();
 
-        // 【アンロード経路では相手のプラグインに触れない】
-        // ここで他プラグインを止めたり設定を戻したりすると、こちらを再読み込みしただけで
-        // 相手の動作が変わってしまう。こちらが動かしていた処理の後始末は、
-        // 停止ボタン・停止コマンド・失敗時の経路で行う（Runner.RequestStop）。
+        // 【読み込みの解除（更新・無効化）】実行中なら、その時点で「停止」と同じ後始末をする。
+        // 取り消すのはこちらが頼んだ処理だけ。利用者や他のプラグインが自分で動かしている処理には触れない（Services.Dispose）。
         this.services.Dispose();
     }
 }

@@ -59,6 +59,13 @@ public sealed unsafe class ReduceTask : AutoTask
     private int wantedBefore;
     private DateTime reducedAt = DateTime.MinValue;
     private DateTime lastClose = DateTime.MinValue;
+
+    // 精選したときに結果の窓が開いていたか（開いていなかったなら、その後に開いた結果の窓は自分の精選のもの）
+    private bool resultOpenAtReduce = true;
+
+    // 自分の結果の窓を閉じ始めた時刻（閉じられないまま待ち続けない）
+    private DateTime closingSince = DateTime.MinValue;
+    private static readonly TimeSpan CloseLimit = TimeSpan.FromSeconds(10);
     private DateTime lastDismount = DateTime.MinValue;
     private int oddResults;
     private int reducedCount;
@@ -87,7 +94,7 @@ public sealed unsafe class ReduceTask : AutoTask
     {
         if (IsUnlocked())
             return true;
-        if (Unlocks.GaveUp.Contains(Unlocks.Reduction))
+        if (Unlocks.UnlockStagePassed || Unlocks.GaveUp.Contains(Unlocks.Reduction))
             return false;
         var quest = Unlocks.UnlockQuest(Unlocks.Reduction);
         if (quest == 0)
@@ -212,16 +219,15 @@ public sealed unsafe class ReduceTask : AutoTask
         if (GameUi.IsReady("PurifyResult", out _))
         {
             if (this.TryGetOwnResult(ctx, out var own))
-            {
-                this.CloseResult(own);
-                return TaskResult.Running;
-            }
+                return this.CloseResult(own);
 
             this.Status = "精選の結果の窓が開いています（自分の精選のものではないので閉じません）";
             return this.TimedOut(TimeSpan.FromSeconds(60))
                 ? this.Fail("自分の精選のものではない精選の結果の窓が開いたままです。閉じてからやり直してください")
                 : TaskResult.Running;
         }
+
+        this.closingSince = DateTime.MinValue;
 
         // 騎乗中は精選できない（GBR も騎乗中は精選しない：AutoGather.Purify.cs:15）
         if (GameUi.Mounted)
@@ -257,8 +263,10 @@ public sealed unsafe class ReduceTask : AutoTask
         this.sourceBefore = Inventory.HeldCollectables().GetValueOrDefault(this.reducingItem);
         this.wantedBefore = this.Owned;
         DebugLog.Current?.Line("操作", $"精選: {CraftPlanner.ItemName(this.reducingItem)}（{slot->Container} の {slot->Slot} 番、収集価値 {slot->GetCollectability()}）");
-        agent->ReduceItem(slot);
+        // 時刻は精選する前に取る（同じフレームで開いた結果の窓も「精選の後に開いた」に入るように）
         this.reducedAt = DateTime.UtcNow;
+        this.resultOpenAtReduce = GameUi.IsVisible("PurifyResult");
+        agent->ReduceItem(slot);
         this.Go(ReduceStep.WaitResult, $"{CraftPlanner.ItemName(this.reducingItem)} を精選しています");
         return TaskResult.Running;
     }
@@ -266,10 +274,8 @@ public sealed unsafe class ReduceTask : AutoTask
     private TaskResult TickWaitResult(TaskContext ctx)
     {
         if (this.TryGetOwnResult(ctx, out var result))
-        {
-            this.CloseResult(result);
-            return TaskResult.Running;
-        }
+            return this.CloseResult(result);
+        this.closingSince = DateTime.MinValue;
 
         var sourceNow = Inventory.HeldCollectables().GetValueOrDefault(this.reducingItem);
         var wantedNow = this.Owned;
@@ -302,20 +308,36 @@ public sealed unsafe class ReduceTask : AutoTask
         return this.Fail($"精選が受け付けられませんでした（{CraftPlanner.ItemName(this.reducingItem)} {this.sourceBefore}→{sourceNow}、{CraftPlanner.ItemName(this.need.ItemId)} {this.wantedBefore}→{wantedNow}）");
     }
 
-    /// <summary>自分の精選（最後に精選した時刻より後）で開いた結果の窓。</summary>
+    /// <summary>
+    /// 自分の精選（最後に精選した時刻より後）で開いた結果の窓。持ち主の記録で確かめ、記録が無ければ
+    /// 「精選したときは閉じていて、いま開いている」ことで確かめる（YesAlready は結果の窓を PostUpdate で扱っていて、
+    /// 開くたびに作り直されるとは限らない。作り直されないと記録が付かず、2回目から自分の窓と分からなくなる）。
+    /// </summary>
     private bool TryGetOwnResult(TaskContext ctx, out FFXIVClientStructs.FFXIV.Component.GUI.AtkUnitBase* result)
     {
         result = null;
-        return this.reducedAt != DateTime.MinValue && ctx.Ownership.TryGetOwnedSince("PurifyResult", this.reducedAt, out result);
+        if (this.reducedAt == DateTime.MinValue)
+            return false;
+        if (ctx.Ownership.TryGetOwnedSince("PurifyResult", this.reducedAt, out result))
+            return true;
+        return !this.resultOpenAtReduce && GameUi.IsReady("PurifyResult", out result);
     }
 
-    private void CloseResult(FFXIVClientStructs.FFXIV.Component.GUI.AtkUnitBase* result)
+    /// <summary>自分の結果の窓を閉じる（0.5 秒おき）。上限を過ぎても閉じられなければ止める。</summary>
+    private TaskResult CloseResult(FFXIVClientStructs.FFXIV.Component.GUI.AtkUnitBase* result)
     {
+        if (this.closingSince == DateTime.MinValue)
+            this.closingSince = DateTime.UtcNow;
+        else if (DateTime.UtcNow - this.closingSince > CloseLimit)
+            return this.Fail($"精選の結果の窓を {CloseLimit.TotalSeconds:0} 秒たっても閉じられませんでした。手で閉じてからやり直してください");
+
+        this.Status = "精選の結果の窓を閉じています";
         if (DateTime.UtcNow - this.lastClose < TimeSpan.FromMilliseconds(500))
-            return;
+            return TaskResult.Running;
         this.lastClose = DateTime.UtcNow;
         if (!GameUi.ClickButton(result, PurifyResultCloseNode))
             GameUi.Fire(result, true, -1);
+        return TaskResult.Running;
     }
 
     /// <summary>カバンの中の、精選の元にする収集品の枠（最初の1つ）。</summary>
