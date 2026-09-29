@@ -253,7 +253,7 @@ public static class Preflight
         // 5.97) Questionable の設定（pluginConfigs\Questionable.json を読むだけ）。
         // 止める条件に対象のクエストが入っている・完了を止める設定が ON だと、クエストの途中で Questionable が止まり、やり直しても進まない
         if (plan != null && plan.RemainingQuests.Count > 0)
-            list.AddRange(QuestionableSettings(plan));
+            list.AddRange(QuestionableSettings(plan, ctx.Config.HideOtherQuestsDuringRun));
 
         // 5.98) ジャーナルの受注数（受注中のクエストが上限だと、新しいクエストを受けられず Questionable が受注を待ち続ける）
         unsafe
@@ -299,7 +299,7 @@ public static class Preflight
     ///  ・キャラクターごとの設定（Profiles・CharacterProfiles）があれば、その値が使われる可能性（注意）
     /// あわせて、優先リストを一時的に差し替えることを知らせる。
     /// </summary>
-    private static IEnumerable<PreflightItem> QuestionableSettings(JobQuestPlan plan)
+    private static IEnumerable<PreflightItem> QuestionableSettings(JobQuestPlan plan, bool hideOthers)
     {
         JsonDocument? doc = null;
         try
@@ -364,6 +364,10 @@ public static class Preflight
                 yield return new PreflightItem(Severity.Warn, "Questionable にキャラクターごとの設定（プロファイル）があります。ここで確かめたのは基本の設定なので、プロファイルの値が違えばそちらが使われます");
         }
 
+        if (hideOthers)
+            yield return new PreflightItem(Severity.Ok,
+                "クエストの間、受注中のほかのクエストをジャーナルで非表示にし、止まったら元の状態（通常・優先表示）に戻します（「設定」タブで切れます）");
+
         yield return new PreflightItem(Severity.Ok,
             "クエストの間、Questionable の優先リストを一時的にそのクエストだけにし、終わったら元に戻します（別のクエストへ移って止まらないように）。"
             + "優先リストの「受注のみ」の印は戻せません。優先リストの窓で「Job Quests」プリセットを開いたままにしないでください（職が変わるたびに書き換わります）");
@@ -375,7 +379,9 @@ public static class Preflight
     /// </summary>
     private static IEnumerable<PreflightItem> HqOutlook(TaskContext ctx, JobQuestPlan plan)
     {
-        var targets = plan.Craft.Crafts.Where(c => c.WantHq).Select(c => (c.RecipeId, c.ItemId, c.ClassJobId)).ToList();
+        // 手持ちの HQ で足りている品は、実際の製作でも HQ を求めない（CraftOneTask.HqNeeded＝0）ので外す
+        var targets = plan.Craft.Crafts.Where(c => c.WantHq && (c.HqTarget <= 0 || Inventory.CountNow(c.ItemId, hqOnly: true) < c.HqTarget))
+            .Select(c => (c.RecipeId, c.ItemId, c.ClassJobId)).ToList();
         if (targets.Count == 0)
             yield break;
 

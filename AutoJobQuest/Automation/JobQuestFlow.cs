@@ -817,7 +817,10 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
                     return new StopTask($"紫貨のための収集品を作る職のギアセットがありません：{missing}");
 
                 this.craftCut = null;
-                return new SequenceTask("収集品の製作", plan.Crafts.Select(pc => (Func<TaskContext, AutoTask?>)(cc => this.NextCraft(cc, pc))));
+                // 最後に製作の構えを解く（以前は本編の製作の列だけに入れていたので、Artisan の ExitCraftStanceEndurance が OFF だと
+                // 収集品を作った後に構えのまま納品へ進み、動けないまま上限で止まった）
+                return new SequenceTask("収集品の製作", plan.Crafts.Select(pc => (Func<TaskContext, AutoTask?>)(cc => this.NextCraft(cc, pc)))
+                    .Append(_ => new ExitCraftStanceTask()));
             });
         }
 

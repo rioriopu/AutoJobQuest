@@ -156,6 +156,15 @@ public sealed class Configuration : IPluginConfiguration
     public bool UseArtisanConsumables { get; set; }
 
     /// <summary>
+    /// 実行の間、受注中のほかのクエストをジャーナルで非表示にするか（既定 true）。
+    /// 実行していない間に元の状態へ戻す（控え <see cref="JournalHiddenByMe"/>）。Automation.JournalHide の説明を参照。
+    /// </summary>
+    public bool HideOtherQuestsDuringRun { get; set; } = true;
+
+    /// <summary>こちらがジャーナルで非表示にしたクエスト（クエスト番号 → 元の状態：0＝通常・1＝優先表示）。戻ったのを確かめたら消す。</summary>
+    public Dictionary<ushort, byte> JournalHiddenByMe { get; set; } = [];
+
+    /// <summary>
     /// Artisan の食事・薬を一時的に「使わない」にしたまま、まだ戻していないレシピ（読み込みの解除をまたいで戻すための控え）。
     /// Artisan の一時指定は保存されない（Artisan を読み込み直せば消える）が、Artisan が動いたままなら残るので、次に読み込んだとき戻す。
     /// </summary>

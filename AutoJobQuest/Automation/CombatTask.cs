@@ -233,7 +233,7 @@ public sealed class CombatTask : AutoTask
         }
 
         // 4) いなければ出現点を回る
-        return this.Patrol(ctx);
+        return this.Patrol(ctx, wanted);
     }
 
     private TaskResult Engage(TaskContext ctx, IBattleNpc t)
@@ -309,7 +309,7 @@ public sealed class CombatTask : AutoTask
             ctx.Navmesh.Stop();
     }
 
-    private TaskResult Patrol(TaskContext ctx)
+    private TaskResult Patrol(TaskContext ctx, HashSet<uint> wanted)
     {
         // Henched はハードターゲットしか殴らないので、出現点を回る間は入れたままでよい
         // （止めたり入れたりを繰り返すと、RSR の切り替え表示がチャットにあふれる）
@@ -329,11 +329,17 @@ public sealed class CombatTask : AutoTask
             return TaskResult.Running;
         }
 
-        // 出現点に着いてから少し待っても湧かなければ次の出現点へ
-        if (this.spotArrivedAt != DateTime.MinValue && DateTime.UtcNow - this.spotArrivedAt < TimeSpan.FromSeconds(20))
+        // 出現点に着いた。目当ての死体か、他人と戦っている個体が近くにいれば、湧き直し・決着が近いので待つ（上限 20 秒）。
+        // 1体も見えなければ、待たずに次の出現点へ（湧きの時刻はサーバー側で決められないので、見えるものから決める。
+        // 以前は見えるものに関係なく 20 秒待っていた）
+        if (this.spotArrivedAt != DateTime.MinValue)
         {
-            this.Status = $"出現点 {this.spotIndex + 1}/{this.spots.Count} で湧きを待っています";
-            return TaskResult.Running;
+            var (dead, engaged) = NearbyWanted(wanted);
+            if (SpawnWait.Wait(DateTime.UtcNow - this.spotArrivedAt, dead, engaged))
+            {
+                this.Status = $"出現点 {this.spotIndex + 1}/{this.spots.Count} で湧きを待っています（倒れている {dead}・他人と戦っている {engaged}）";
+                return TaskResult.Running;
+            }
         }
 
         if (this.spotArrivedAt != DateTime.MinValue)
@@ -413,6 +419,25 @@ public sealed class CombatTask : AutoTask
     /// </summary>
     private static unsafe bool IsFateMob(IBattleNpc npc)
         => ((FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)npc.Address)->FateId != 0;
+
+    /// <summary>近くの指定モンスターのうち、倒れている個体と、他人と戦っている個体の数（出現点で待つかの判断：SpawnWait）。</summary>
+    private static (int Dead, int Engaged) NearbyWanted(HashSet<uint> wanted)
+    {
+        var meId = Svc.Objects.LocalPlayer?.GameObjectId ?? 0;
+        var dead = 0;
+        var engaged = 0;
+        foreach (var o in Svc.Objects.OfType<IBattleNpc>())
+        {
+            if (o.BattleNpcKind != BattleNpcSubKind.Combatant || !wanted.Contains(o.NameId) || Vector3.Distance(o.Position, Me.Position) >= 60f)
+                continue;
+            if (o.IsDead || o.CurrentHp == 0)
+                dead++;
+            else if (o.StatusFlags.HasFlag(StatusFlags.InCombat) && o.TargetObjectId != meId)
+                engaged++;
+        }
+
+        return (dead, engaged);
+    }
 
     /// <summary>近くの指定モンスター（生きている・ターゲットできる・他人と戦っていない・FATE の敵でない）。</summary>
     private static IBattleNpc? FindMob(HashSet<uint> wanted, HashSet<ulong> giveUp)

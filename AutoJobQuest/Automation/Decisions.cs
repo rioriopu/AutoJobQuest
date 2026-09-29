@@ -1063,6 +1063,23 @@ public static class TeleportWatch
 }
 
 /// <summary>
+/// 出現点で湧きを待つか。湧きの時刻はサーバー側で、ゲームデータにも無いので、見えるものから決める：
+/// 目当ての死体（倒されて湧き直しが近い）か、他人と戦っている個体（倒されれば湧き直す）が近くにいれば、上限まで待つ。
+/// 1体も見えなければ待たない（以前は見えるものに関係なく 20 秒待っていた）。
+/// </summary>
+public static class SpawnWait
+{
+    /// <summary>待つ上限。</summary>
+    public static readonly TimeSpan Limit = TimeSpan.FromSeconds(20);
+
+    /// <param name="sinceArrive">出現点に着いてからの時間。</param>
+    /// <param name="deadNearby">近くの目当ての死体の数。</param>
+    /// <param name="engagedByOthers">近くで他人と戦っている目当ての個体の数。</param>
+    public static bool Wait(TimeSpan sinceArrive, int deadNearby, int engagedByOthers)
+        => (deadNearby > 0 || engagedByOthers > 0) && sinceArrive < Limit;
+}
+
+/// <summary>
 /// ギアセットでの着替えの頼み直し（以前は頼んでから 3 秒たっても変わらなければ頼み直していた）。
 /// EquipGearset は「受け付けた 0／断った -1」を返す（FFXIVClientStructs の RaptureGearsetModule）。
 /// 受け付けたら、ジョブが変わるのを長い上限まで待つだけ（頼み直さない）。断られたら、同じフレームで何度も頼まないよう間隔を空けて頼み直す。

@@ -400,13 +400,15 @@ public sealed class CraftOneTask : AutoTask
 
     /// <summary>
     /// 製作の構え（製作手帳を開いた状態）のままか。Artisan の Crafting.State の IdleBetween と同じ見方
-    /// （ConditionFlag.PreparingToCraft が立ち、製作中・製作の操作中ではない）。
+    /// （ConditionFlag.Crafting と PreparingToCraft が両方立っている）。
+    /// 以前は「ExecutingCraftingAction が立っていない」も条件にしていたが、Artisan のソースに「簡易製作の後は ExecutingCraftingAction が
+    /// 立ったまま残る」とあり（Artisan の Crafting.cs）、簡易製作の後に構えを解けず上限で止まりえた。
     /// </summary>
     public static bool InCraftStanceIdle()
     {
         var c = Svc.Condition;
         return c[Dalamud.Game.ClientState.Conditions.ConditionFlag.PreparingToCraft]
-               && !c[Dalamud.Game.ClientState.Conditions.ConditionFlag.ExecutingCraftingAction];
+               && c[Dalamud.Game.ClientState.Conditions.ConditionFlag.Crafting];
     }
 
     /// <summary>

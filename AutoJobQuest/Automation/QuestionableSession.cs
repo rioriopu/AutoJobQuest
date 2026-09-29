@@ -560,6 +560,11 @@ public sealed unsafe class QuestionableStarter
     private DateTime? taWaitSince;
     private bool taWarned;
 
+    // ジャーナルの非表示の命令を最後に送った時刻（送りすぎの防止）と、送った本数（記録用）
+    private DateTime lastJournalSend = DateTime.MinValue;
+    private int journalHidden;
+    private bool journalLogged;
+
     public QuestionableStarter(uint questRowId, string label, bool takeTextAdvance)
     {
         this.questRowId = questRowId;
@@ -646,6 +651,13 @@ public sealed unsafe class QuestionableStarter
             return TaskResult.Failed;
         }
 
+        // 3.5) 受注中のほかのクエストをジャーナルで非表示にする（設定で切れる。控えを保存してから、1本ずつ間を空けて送る）
+        if (ctx.Config.HideOtherQuestsDuringRun && this.JournalStep(ctx, out var journalStatus))
+        {
+            status = journalStatus;
+            return TaskResult.Running;
+        }
+
         // 4) 優先リストをこのクエストだけにする
         if (!this.Priority.Active && this.Priority.Take(ctx.Questionable, this.questRowId, ctx.Log) is { } priorityFail)
         {
@@ -685,6 +697,67 @@ public sealed unsafe class QuestionableStarter
         this.Requested = true;
         this.wander = 0;
         return TaskResult.Done;
+    }
+
+    /// <summary>
+    /// ジャーナルの非表示を1歩進める（JournalHide）。送った・間隔を待っているなら true（まだ頼まない）、終わったら false。
+    /// 対象のクエストを前にこちらが隠していたら先に元へ戻し、そのあと受注中のほかのクエストを1本ずつ非表示にする。
+    /// 控え（元の状態）は送る前に保存する（読み込みの解除をまたいでも戻せるように）。送れなくても控えは残す（同じクエストに送り続けない。戻すときに「非表示ではない」として消える）。
+    /// </summary>
+    private bool JournalStep(TaskContext ctx, out string status)
+    {
+        status = string.Empty;
+        var records = ctx.Config.JournalHiddenByMe;
+        var own = (ushort)(this.questRowId & 0xFFFF);
+        var slots = JournalHide.ReadSlots();
+
+        JournalHide.Slot? target = null;
+        byte state;
+        if (JournalHide.OwnRestore(slots, own, records) is { } back)
+        {
+            target = slots.First(s => s.QuestId == own);
+            state = back;
+        }
+        else
+        {
+            var hide = JournalHide.ToHide(slots, own, records);
+            if (hide.Count == 0)
+            {
+                if (!this.journalLogged && this.journalHidden > 0)
+                {
+                    this.journalLogged = true;
+                    ctx.Log.Write("ジャーナル", $"受注中のほかのクエスト {this.journalHidden} 本を、実行の間だけジャーナルで非表示にしました（終わったら元の状態に戻します）");
+                }
+
+                return false;
+            }
+
+            target = hide[0];
+            state = JournalHide.Hidden;
+        }
+
+        if (DateTime.UtcNow - this.lastJournalSend < JournalHide.SendSpacing)
+        {
+            status = "ジャーナルでほかのクエストを非表示にしています";
+            return true;
+        }
+
+        var t = target.Value;
+        if (state == JournalHide.Hidden)
+            records[t.QuestId] = t.State;
+        else
+            records.Remove(t.QuestId);
+        ctx.Config.Save();
+
+        this.lastJournalSend = DateTime.UtcNow;
+        var ok = JournalHide.Send(t.Index, state);
+        if (state == JournalHide.Hidden)
+            this.journalHidden++;
+        ctx.Log.Debug("ジャーナル", state == JournalHide.Hidden
+            ? $"「{JournalHide.Name(t.QuestId)}」を非表示にする命令を{(ok ? "送りました" : "送れませんでした")}（元の状態 {t.State}・受注枠 {t.Index}）"
+            : $"このクエスト「{this.label}」を、前に非表示にしていたので元の状態 {state} に戻す命令を{(ok ? "送りました" : "送れませんでした")}");
+        status = "ジャーナルでほかのクエストを非表示にしています";
+        return true;
     }
 
     /// <summary>進行中の見張り（毎フレーム）。止めるべき理由があれば返す（無ければ null）。</summary>

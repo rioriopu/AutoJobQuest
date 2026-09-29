@@ -51,7 +51,7 @@ public static class ArtisanHqEstimate
         if (api == null)
             return [];
 
-        var prepared = new List<(string Key, Func<Result> Run)>();
+        var prepared = new List<(string Key, uint RecipeId, uint ItemId, Func<Result> Run)>();
         var results = new List<Result>();
         var recipeSheet = Svc.Data.GetExcelSheet<Recipe>();
         foreach (var (recipeId, itemId, job) in recipes.DistinctBy(r => r.RecipeId))
@@ -79,7 +79,7 @@ public static class ArtisanHqEstimate
                     }
                 }
 
-                prepared.Add((key, () => api.Run(recipeId, itemId, craft, solver, stats, solverName)));
+                prepared.Add((key, recipeId, itemId, () => api.Run(recipeId, itemId, craft, solver, stats, solverName)));
             }
             catch (Exception e)
             {
@@ -96,7 +96,7 @@ public static class ArtisanHqEstimate
             }
             catch (Exception e)
             {
-                computed[i] = new Result(0, 0, null, 0, string.Empty, string.Empty, $"計算に失敗（{Unwrap(e).Message}）");
+                computed[i] = new Result(prepared[i].RecipeId, prepared[i].ItemId, null, 0, string.Empty, string.Empty, $"計算に失敗（{Unwrap(e).Message}）");
             }
         });
 

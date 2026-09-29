@@ -121,7 +121,11 @@ public sealed class OwnPath
                 return State.NoPath;
 
             // いまの位置より先の点だけを渡す（出発点・通り過ぎた点は捨てる）。経路から離れていたら使わない
-            var route = AheadOf(points, this.from, now, StaleDistance);
+            // 探索の間に動いていなければ、従来どおり出発点だけを捨てて渡す（出発点が navmesh の外〔台の上など〕で、経路の最初の点から
+            // 5m 超離れて見えても使えるように）。動いていたら、いまの位置より先の点だけを渡す
+            var route = Vector3.Distance(now, this.from) <= StaleDistance
+                ? (points.Count > 1 ? points.Skip(1).ToList() : points)
+                : AheadOf(points, this.from, now, StaleDistance);
             if (route == null)
                 return State.Stale;
             if (!nav.MoveAlong(route, this.fly))

@@ -546,6 +546,16 @@ public sealed class MainWindow : Window
 
             ImGui.TextColored(Grey, "既定は OFF。Artisan はレシピごとの設定が無いと既定の食事・薬を使うので、高価な消耗品を Lv1〜60 の製作で使わないよう、"
                                     + "こちらが頼む製作の間だけ使わない指定にして、終わったら戻します。HQ 指定の品が HQ にならないときは ON にすると出やすくなります");
+
+            var hideOthers = this.config.HideOtherQuestsDuringRun;
+            if (ImGui.Checkbox("実行の間、受注中のほかのクエストをジャーナルで非表示にする", ref hideOthers))
+            {
+                this.config.HideOtherQuestsDuringRun = hideOthers;
+                this.config.Save();
+            }
+
+            ImGui.TextColored(Grey, "既定は ON。Questionable が無関係なクエストへ移らないように、進めるクエスト以外をジャーナルの「非表示」にし、"
+                                    + "止まったら元の状態（通常・優先表示）に戻します。途中で自分で表示の状態を変えたクエストは戻しません");
         }
 
         if (running)

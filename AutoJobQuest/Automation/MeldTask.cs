@@ -58,6 +58,10 @@ public sealed unsafe class MeldTask : AutoTask
     // 装着の画面を開けない理由（最後に見たもの）と、降りる操作を送った時刻（送りすぎない抑え。進む判断は騎乗の状態で行う）
     private string openBlocked = "まだ試していない";
     private DateTime lastDismount = DateTime.MinValue;
+
+    // 装着の一般アクションが「使えない」と答え始めた時刻と、開く操作を最後に試した時刻
+    private DateTime statusBlockedSince = DateTime.MinValue;
+    private DateTime lastOpenTry = DateTime.MinValue;
     private byte materiaCountBefore;
     private long materiaStockBefore;
     private uint targetItemIdBefore;
@@ -130,13 +134,29 @@ public sealed unsafe class MeldTask : AutoTask
                 }
 
                 // ゲームが装着の操作を「いま使える」と答えるまで待つ（GetActionStatus が 0。断られるのを先に避ける）
+                // 画面を開く種類の一般アクションで GetActionStatus を使った例が参照したソースに無く、使えるときに 0 を返すかは実機未確認。
+                // 動ける・降りている状態で3秒たっても 0 にならなければ、1秒おきに開く操作を試す（以前の作りと同じ）
                 var status = GameUi.GeneralActionStatus(GeneralActionMateriaMelding);
                 if (status != 0)
                 {
+                    if (this.statusBlockedSince == DateTime.MinValue)
+                        this.statusBlockedSince = DateTime.UtcNow;
                     this.openBlocked = $"ゲームが今は使えないと答えた（{status}）";
-                    this.Status = "マテリア装着が使えるようになるのを待っています";
-                    return TaskResult.Running;
+                    if (DateTime.UtcNow - this.statusBlockedSince < TimeSpan.FromSeconds(3))
+                    {
+                        this.Status = "マテリア装着が使えるようになるのを待っています";
+                        return TaskResult.Running;
+                    }
                 }
+                else
+                {
+                    this.statusBlockedSince = DateTime.MinValue;
+                }
+
+                // 開く操作は1秒おきまで（断られ続けても毎フレーム撃たない）
+                if (DateTime.UtcNow - this.lastOpenTry < TimeSpan.FromSeconds(1))
+                    return TaskResult.Running;
+                this.lastOpenTry = DateTime.UtcNow;
 
                 // 開く操作が一時的に断られても、その場で失敗にしない（以前は1回の拒否で止めていた）。上の60秒まで状態を見て開き直す
                 if (!GameUi.UseGeneralAction(GeneralActionMateriaMelding))

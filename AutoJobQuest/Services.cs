@@ -37,6 +37,10 @@ public sealed class Services : IDisposable
 
     // 特殊通貨の控えをクライアントの表で確かめる次の時刻（ログイン中、1分おき）
     private DateTime nextCurrencyRefresh = DateTime.MinValue;
+
+    // ジャーナルで非表示にしたクエストを元の状態へ戻す（実行していない間。JournalHide）
+    private readonly Automation.JournalRestorer journalRestorer = new();
+    private DateTime nextJournalRestore = DateTime.MinValue;
     private DateTime nextHeartbeat = DateTime.MinValue;
 
     public Services(Configuration config, RunLog log)
@@ -81,6 +85,22 @@ public sealed class Services : IDisposable
             var pending = new List<string>();
             if (this.Ctx.AfterStop.Count > 0)
                 pending.AddRange(this.Ctx.AfterStop.Select(a => a.Name));
+            // RSR の戻しは、実行していない間に10秒おきに確かめる作り。終わった瞬間は必ず控えが残っているので、ここで一度確かめる
+            // （RSR の IPC は同期で、戻した直後に読めば分かる。以前は戦闘を使った実行が成功しても必ず「後始末確認待ち」になった）
+            for (var i = 0; i < 2 && this.Ctx.Rotation.RestorePending && this.Ctx.Rotation.IsLoaded; i++)
+            {
+                try
+                {
+                    if (this.Ctx.Rotation.RestoreLeftover() is { } done)
+                        this.Log.Write("RSR", done);
+                }
+                catch (Exception ex)
+                {
+                    this.Debug.Exception("RSR", "終わったときの RSR の戻しの確かめ", ex);
+                    break;
+                }
+            }
+
             if (this.Ctx.Rotation.RestorePending)
                 pending.Add("RSR のモード・範囲攻撃の設定");
             if (this.Ctx.Gbr.HasLeftovers)
@@ -177,6 +197,25 @@ public sealed class Services : IDisposable
             catch (Exception ex)
             {
                 this.Debug.Exception("通貨", "特殊通貨の控えの確かめ", ex);
+            }
+        }
+
+        // 実行の間だけジャーナルで非表示にしたクエストを、止まっている間に元の状態へ戻す（1本ずつ間を空けて）
+        if (!this.Runner.IsRunning && this.Config.JournalHiddenByMe.Count > 0 && Me.Available && DateTime.UtcNow >= this.nextJournalRestore)
+        {
+            this.nextJournalRestore = DateTime.UtcNow + Automation.JournalHide.SendSpacing;
+            try
+            {
+                if (this.journalRestorer.Tick(this.Config) is { } msg)
+                {
+                    this.Log.Write("ジャーナル", msg);
+                    if (msg.StartsWith("⚠", StringComparison.Ordinal))
+                        Svc.Chat.Print($"[AutoJobQuest] {msg}");
+                }
+            }
+            catch (Exception ex)
+            {
+                this.Debug.Exception("ジャーナル", "非表示にしたクエストの戻し", ex);
             }
         }
 
