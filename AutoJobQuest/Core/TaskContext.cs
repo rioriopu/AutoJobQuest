@@ -48,6 +48,15 @@ public sealed class TaskContext
     /// </summary>
     public bool Stopping { get; set; }
 
+    /// <summary>戦闘の作業（CombatTask）の最中か。攻撃されたときの反撃（DefenseWatch）は、この間は何もしない（戦闘の作業が敵視リストの敵も倒す）。</summary>
+    public bool CombatInProgress { get; set; }
+
+    /// <summary>
+    /// こちらが NPC と会話している最中か（話しかけの作業が話しかけた後）。この間の会話の窓はこちらのものなので、
+    /// 「こちらの会話ではない会話の窓を閉じる」（ForeignTalk）は触らない。
+    /// </summary>
+    public bool InOwnConversation { get; set; }
+
     /// <summary>マーケットの検索結果（件数）の通知。</summary>
     public required Automation.MarketBoardWatcher MarketWatcher { get; init; }
 

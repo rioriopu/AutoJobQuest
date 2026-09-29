@@ -85,6 +85,10 @@ public sealed class JobQuestFlow : AutoTask
     // 戦闘に使えるジョブが無いことを記録に出したか（1回だけ出す）
     private bool noCombatJobLogged;
 
+    // 攻撃されたときの反撃と、こちらの会話ではない会話の窓を閉じる
+    private readonly DefenseWatch defense = new();
+    private readonly ForeignTalk foreignTalk = new();
+
     public JobQuestFlow(bool[] selected)
     {
         this.selected = selected;
@@ -104,6 +108,31 @@ public sealed class JobQuestFlow : AutoTask
 
     protected override TaskResult Tick(TaskContext ctx)
     {
+        // 攻撃されていれば反撃する（その間は次の作業を進めない）
+        if (this.defense.Tick(ctx, out var defenseStatus))
+        {
+            this.Status = defenseStatus;
+            return TaskResult.Running;
+        }
+
+        // こちらの会話ではない会話の窓は、状況を確かめてから閉じる（その間は次の作業を進めない）。
+        // こちらの会話（話しかけた後・手動の報告で TextAdvance を借りている間）は除く
+        if (!ctx.InOwnConversation && !ctx.TextAdvance.OwnsControl)
+        {
+            switch (this.foreignTalk.Tick(ctx, out var talkStatus))
+            {
+                case ForeignTalk.Result.Failed:
+                    return this.Fail(talkStatus);
+                case ForeignTalk.Result.Busy:
+                    this.Status = talkStatus;
+                    return TaskResult.Running;
+            }
+        }
+        else
+        {
+            this.foreignTalk.Reset();
+        }
+
         // 子の作業が動いていればそれを進める
         if (this.child != null)
         {
@@ -345,7 +374,7 @@ public sealed class JobQuestFlow : AutoTask
         if (extra.Count > 0)
         {
             var plan = this.Plan(ctx);
-            var craftAll = ctx.Data.Planner!.Build(plan.RemainingQuests.SelectMany(q => q.Items).Concat(extra), Inventory.Snapshot(), PlanBuilder.IsBookUnlocked);
+            var craftAll = ctx.Data.Planner!.Build(plan.Targets.Concat(extra), Inventory.Snapshot(), PlanBuilder.IsBookUnlocked);
             if (MissingGearsets(craftAll) is { } missing)
                 return this.Fail($"紫貨のための収集品を作る職のギアセットがありません：{missing}");
         }
@@ -424,7 +453,7 @@ public sealed class JobQuestFlow : AutoTask
         var extra = this.ExtraTargets().ToList();
         var craftAll = plan.Craft;
         if (extra.Count > 0)
-            craftAll = ctx.Data.Planner!.Build(plan.RemainingQuests.SelectMany(q => q.Items).Concat(extra), Inventory.Snapshot(), PlanBuilder.IsBookUnlocked);
+            craftAll = ctx.Data.Planner!.Build(plan.Targets.Concat(extra), Inventory.Snapshot(), PlanBuilder.IsBookUnlocked);
 
         var raw = craftAll.RawShortfall
             .Select(kv => (Item: kv.Key, Need: kv.Value, Routes: this.RoutesFor(ctx, kv.Key)))
@@ -1000,6 +1029,9 @@ public sealed class JobQuestFlow : AutoTask
         Safe(ctx, "GBR の設定を戻す", () => ctx.Gbr.RestoreIfIdle(ctx.GatherBuddy.IsAutoGatherEnabled(), ctx.Gbr.VendorIsBusy()));
         Safe(ctx, "TextAdvance の外部制御を戻す", ctx.TextAdvance.ReleaseControl);
         Safe(ctx, "YesAlready の停止要求を外す", ctx.YesAlready.Release);
+        Safe(ctx, "反撃を終える", () => this.defense.End(ctx));
+        ctx.CombatInProgress = false;
+        ctx.InOwnConversation = false;
         Unlocks.UnlockStagePassed = false;
     }
 

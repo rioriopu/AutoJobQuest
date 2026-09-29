@@ -35,6 +35,14 @@ public sealed class RotationSolverIpc : IpcGate
     // こちらが優先リストに足した名前 ID（足した回数ぶん並ぶ）
     private readonly List<uint> ownPriorities = [];
 
+    // Henched にしたことと使う前のモードの控え（設定ファイル）。試験では無し
+    private readonly Configuration? store;
+
+    public RotationSolverIpc(Configuration? store = null)
+    {
+        this.store = store;
+    }
+
     /// <summary>動作モードを切り替える。</summary>
     public bool ChangeOperatingMode(byte mode)
         => this.TraceThen($"ChangeOperatingMode({mode})") && this.TryAction("ChangeOperatingMode",
@@ -102,7 +110,13 @@ public sealed class RotationSolverIpc : IpcGate
 
         if (firstTake)
         {
-            this.originalMode = RsrStateReader.ReadMode();
+            // 前に Henched にしたまま戻せていない控えがあり、いまも Henched なら、それは前回こちらが入れたもの。
+            // 使う前のモードは控えのほうを使う（いまの Henched を使う前のモードとして覚えると、戻しても Henched のまま残る）
+            var current = RsrStateReader.ReadMode();
+            var pending = this.store?.RsrHenchedPending == true;
+            this.originalMode = RsrRestore.OriginalForNewTake(current, pending, this.store?.RsrOriginalMode);
+            if (pending && this.originalMode != current)
+                Core.DebugLog.Current?.Line("IPC", $"前回こちらが入れた Henched が残っています。使う前のモードは控えの {(this.originalMode is { } pm ? RsrStateReader.ModeName(pm) : "（読めなかった＝Off）")} とします");
             Core.DebugLog.Current?.Line("IPC", this.originalMode is { } m
                 ? $"RSR の使う前のモードは {RsrStateReader.ModeName(m)}。使い終わったら {RsrStateReader.ModeName(m)} に戻します"
                 : $"⚠ RSR の使う前のモードを読めません（{RsrStateReader.LastError}）。使い終わったら Off に戻します");
@@ -114,6 +128,8 @@ public sealed class RotationSolverIpc : IpcGate
         if (!this.ChangeOperatingMode(ModeHenched))
             return false;
         this.tracker.Sent(DateTime.UtcNow);
+        if (firstTake)
+            this.SaveStore(true, this.originalMode);
         return true;
     }
 
@@ -135,6 +151,7 @@ public sealed class RotationSolverIpc : IpcGate
             this.tracker.Released();
             this.originalMode = null;
             this.modeMismatch = false;
+            this.SaveStore(false, null);
             return;
         }
 
@@ -144,7 +161,44 @@ public sealed class RotationSolverIpc : IpcGate
             this.tracker.Released();
             this.originalMode = null;
             this.modeMismatch = false;
+            this.SaveStore(false, null);
         }
+    }
+
+    /// <summary>
+    /// 前に Henched にしたまま戻せていない控えがあれば戻す（実行していない間に、プラグインの側から呼ぶ）。
+    /// いまも Henched なら控えのモードへ戻し、もう別のモード（利用者か RSR が切り替えた）なら控えを消すだけ。
+    /// 戻したとき・控えを消したときは、その説明を返す。何もしなければ null。
+    /// </summary>
+    public string? RestoreLeftover()
+    {
+        if (this.store?.RsrHenchedPending != true || this.tracker.HenchedByMe)
+            return null;
+
+        var current = RsrStateReader.ReadMode();
+        if (current == null)
+            return null; // 読めるようになってから決める（RSR の読み込み直後など）
+
+        if (RsrRestore.Decide(current, this.store.RsrOriginalMode) is not { } back)
+        {
+            this.SaveStore(false, null);
+            return $"前回こちらが入れた RSR の Henched は、もう {RsrStateReader.ModeName(current.Value)} に変わっていたので、控えを消しました（モードは変えていません）";
+        }
+
+        if (!this.ChangeOperatingMode(back))
+            return null; // 次の機会にやり直す
+
+        this.SaveStore(false, null);
+        return $"前回戻せなかった RSR のモードを {RsrStateReader.ModeName(back)} に戻しました";
+    }
+
+    private void SaveStore(bool pending, byte? original)
+    {
+        if (this.store == null || (this.store.RsrHenchedPending == pending && this.store.RsrOriginalMode == original))
+            return;
+        this.store.RsrHenchedPending = pending;
+        this.store.RsrOriginalMode = original;
+        this.store.Save();
     }
 
     /// <summary>今の RSR のモードの名前（事前点検・画面用）。読めなければ null。</summary>
@@ -197,6 +251,17 @@ public static class RsrRestore
     /// <param name="original">使う前のモード（読めなかったなら null）。</param>
     public static byte? Decide(byte? current, byte? original)
         => current is { } c && c != RotationSolverIpc.ModeHenched ? null : original ?? RotationSolverIpc.ModeOff;
+
+    /// <summary>
+    /// これから Henched にするとき、「使う前のモード」として覚えるもの。
+    /// 前に Henched にしたまま戻せていない控えがあり、いまも Henched（または読めない）なら、控えのモード
+    /// （いまの Henched は前回こちらが入れたもので、利用者のモードではない）。それ以外はいまのモード。
+    /// </summary>
+    /// <param name="current">いまのモード（読めなければ null）。</param>
+    /// <param name="hasPending">戻せていない控えがあるか。</param>
+    /// <param name="pendingOriginal">控えの、使う前のモード。</param>
+    public static byte? OriginalForNewTake(byte? current, bool hasPending, byte? pendingOriginal)
+        => hasPending && current is null or RotationSolverIpc.ModeHenched ? pendingOriginal : current;
 }
 
 /// <summary>

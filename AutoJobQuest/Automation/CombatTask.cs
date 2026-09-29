@@ -118,6 +118,7 @@ public sealed class CombatTask : AutoTask
 
         // 近い出現点から回る
         this.spots.Sort((a, b) => DistanceToSpot(a).CompareTo(DistanceToSpot(b)));
+        ctx.CombatInProgress = true;
         return TaskResult.Running;
     }
 
@@ -402,6 +403,7 @@ public sealed class CombatTask : AutoTask
 
     public override void Cleanup(TaskContext ctx)
     {
+        ctx.CombatInProgress = false;
         this.CancelMove(ctx);
         if ((this.approachIssued || this.pausedByUi) && ctx.Navmesh.IsMoving())
             ctx.Navmesh.Stop();
@@ -451,7 +453,7 @@ public sealed class CombatTask : AutoTask
     /// 敵視リストが読めないときは、自分を狙っている敵で代える。
     /// 諦めた敵（<paramref name="giveUp"/>）は選ばない。諦めた敵しか残っていなければ <paramref name="onlyGivenUp"/> が true。
     /// </summary>
-    private static unsafe IBattleNpc? FindHater(HashSet<ulong> giveUp, out bool onlyGivenUp)
+    internal static unsafe IBattleNpc? FindHater(HashSet<ulong> giveUp, out bool onlyGivenUp)
     {
         onlyGivenUp = false;
         var meId = Svc.Objects.LocalPlayer?.GameObjectId ?? 0;

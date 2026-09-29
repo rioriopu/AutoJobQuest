@@ -40,6 +40,18 @@ public sealed class JobQuest
 
     public MateriaReq? Materia { get; init; }
 
+    /// <summary>
+    /// 納品物を使う（渡す・見せる）最初の段（ゲームのクエストの段＝Quest.TodoParams[].ToDoCompleteSeq）。
+    /// 本文から見つからなければ 255（最後の段まで要るとみなす）。
+    /// </summary>
+    public byte FirstItemSeq { get; init; } = 255;
+
+    /// <summary>
+    /// 納品物を使う最後の段。今の段がこれを過ぎていれば、残りの手順で納品物は要らない（渡し終えた）。
+    /// 120本のうち47本は、これが最後の段（255）より前（途中で渡し、その後に報告などが残る。解析ツール jqa handover）。
+    /// </summary>
+    public byte LastItemSeq { get; init; } = 255;
+
     /// <summary>画面・記録用の短い表記。</summary>
     public override string ToString() => $"Lv{this.Level} {this.Name}";
 }
@@ -78,6 +90,11 @@ public sealed class QuestCatalog
         RegexOptions.Compiled);
 
     private static readonly Regex MacroPattern = new(@"<[^>]*>", RegexOptions.Compiled);
+
+    // 納品物を使う手順の言い方（手順の本文）。品名のマクロの代わりに「依頼品」等と書くクエストがある（Q65601 等 21本）
+    private static readonly Regex UseVerbPattern = new("渡|届|納品|納め|見せ", RegexOptions.Compiled);
+
+    private static readonly Regex RequestedItemWordPattern = new("依頼品|依頼された|依頼の品", RegexOptions.Compiled);
 
     private static readonly Regex ItemMacroPattern = new(@"<sheet\(Item(?:HQ)?,\s*(\d+),", RegexOptions.Compiled);
 
@@ -151,6 +168,7 @@ public sealed class QuestCatalog
             }
 
             var materia = FindMateria(all, todo, ritems, materiaItems);
+            var (firstSeq, lastSeq) = FindItemSeqs(q, texts, ritems, notes);
 
             var name = questsJa.TryGetRow(q.RowId, out var ja) ? ja.Name.ExtractText() : q.Name.ExtractText();
             result.Add(new JobQuest
@@ -161,6 +179,8 @@ public sealed class QuestCatalog
                 Name = name,
                 Items = items,
                 Materia = materia,
+                FirstItemSeq = firstSeq,
+                LastItemSeq = lastSeq,
             });
         }
 
@@ -202,6 +222,39 @@ public sealed class QuestCatalog
         }
 
         return list;
+    }
+
+    /// <summary>
+    /// 納品物を使う（渡す・見せる）手順の段の最初と最後。手順の本文（TODO_NN）と、その手順が終わる段
+    /// （Quest.TodoParams[NN].ToDoCompleteSeq）を突き合わせる。
+    /// 使う手順＝品名のマクロか「依頼品」等の言い方があり、「渡す・届ける・納品・見せる」のどれかがある手順。
+    /// 段の番号はゲームのクエストの段と同じ（Questionable の経路データの段と、製作する段が 120本中119本で一致。
+    /// 残る1本 Q65802 は Questionable が1つ前の段で先に作るだけで、渡すのは本文どおりの段）。
+    /// 見つからなければ (255, 255)＝最後の段まで要るとみなす（止まる側）。
+    /// </summary>
+    private static (byte First, byte Last) FindItemSeqs(Quest q, List<KeyValuePair<string, string>> texts, List<uint> ritems, List<string> notes)
+    {
+        var seqs = new List<byte>();
+        foreach (var (key, value) in texts)
+        {
+            var at = key.IndexOf("_TODO_", StringComparison.Ordinal);
+            if (at < 0 || !int.TryParse(key[(at + 6)..], out var index) || index < 0 || index >= q.TodoParams.Count)
+                continue;
+            if (!UseVerbPattern.IsMatch(value))
+                continue;
+            var namesItem = ritems.Any(it => Regex.IsMatch(value, $@"sheet\(Item(HQ)?,\s*{it},"));
+            if (!namesItem && !RequestedItemWordPattern.IsMatch(value))
+                continue;
+            seqs.Add(q.TodoParams[index].ToDoCompleteSeq);
+        }
+
+        if (seqs.Count == 0)
+        {
+            notes.Add($"Quest {q.RowId}: 納品物を使う手順を本文から見つけられませんでした（最後の段まで要るとみなします）");
+            return (255, 255);
+        }
+
+        return (seqs.Min(), seqs.Max());
     }
 
     /// <summary>

@@ -29,6 +29,9 @@ public sealed class TextAdvanceIpc : IpcGate
 
     private bool ownControl;
 
+    /// <summary>こちらが外部制御を取っているか（手動の報告の間）。</summary>
+    public bool OwnsControl => this.ownControl;
+
     /// <summary>
     /// 報告（会話送り・受注・完了・報酬選び）を任せる設定で外部制御を取る。
     /// 納品窓への入力と受け渡し（RequestFill / RequestHandin）は任せない：こちらの RequestFill.cs が

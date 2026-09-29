@@ -31,6 +31,7 @@ public sealed class Services : IDisposable
     /// <summary>Artisan の見張りの長さ（止めたとき：CraftOneTask.Cleanup と同じ）。</summary>
     private static readonly TimeSpan ArtisanWatchLength = TimeSpan.FromSeconds(30);
     private DateTime nextLeftoverTry = DateTime.MinValue;
+    private DateTime nextRsrLeftoverTry = DateTime.MinValue;
     private DateTime nextHeartbeat = DateTime.MinValue;
 
     public Services(Configuration config, RunLog log)
@@ -52,7 +53,7 @@ public sealed class Services : IDisposable
             Navmesh = new VnavmeshIpc(),
             GatherBuddy = new GatherBuddyIpc(),
             Gbr = new GbrOperations(this.GbrReflection, config),
-            Rotation = new RotationSolverIpc(),
+            Rotation = new RotationSolverIpc(config),
             AutoHook = new AutoHookIpc(),
             TextAdvance = new TextAdvanceIpc(),
             YesAlready = new YesAlreadyIpc(),
@@ -111,6 +112,24 @@ public sealed class Services : IDisposable
         {
             this.nextLeftoverTry = DateTime.UtcNow.AddSeconds(10);
             this.Ctx.Gbr.RestoreIfIdle(this.Ctx.GatherBuddy.IsAutoGatherEnabled(), this.Ctx.Gbr.VendorIsBusy());
+        }
+
+        // 前に RSR を Henched にしたまま戻せていなければ（読み込み直しなど）、実行していない間に戻す（10秒おきに試す）
+        if (!this.Runner.IsRunning && this.Config.RsrHenchedPending && DateTime.UtcNow >= this.nextRsrLeftoverTry && this.Ctx.Rotation.IsLoaded)
+        {
+            this.nextRsrLeftoverTry = DateTime.UtcNow.AddSeconds(10);
+            try
+            {
+                if (this.Ctx.Rotation.RestoreLeftover() is { } done)
+                {
+                    this.Log.Write("RSR", done);
+                    Svc.Chat.Print($"[AutoJobQuest] {done}");
+                }
+            }
+            catch (Exception ex)
+            {
+                this.Debug.Exception("RSR", "戻せなかった Henched の戻し", ex);
+            }
         }
 
         this.Ctx.YesAlready.KeepSuppressed();

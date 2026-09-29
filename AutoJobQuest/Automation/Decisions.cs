@@ -327,6 +327,131 @@ public static class PendingPath
     }
 }
 
+/// <summary>
+/// クエストの今の段から、納品物がまだ要るかを決める（途中の段で渡すクエストは 120本中47本。
+/// 渡した後に止めて再開すると、以前は同じ品をもう一度作っていた）。
+/// 段は QuestManager.GetQuestSequence（受けていなければ 0）。品を使う段はクエスト一覧（JobQuest.FirstItemSeq・LastItemSeq）。
+/// </summary>
+public static class QuestItemStage
+{
+    public enum Stage
+    {
+        /// <summary>まだ品を使っていない（受けていない・品を使う段の前か、その段の途中）。全部要る。</summary>
+        All,
+
+        /// <summary>品を使う段の途中まで進んだ（段が2つ以上あるクエストで、先の段を終えた）。どの品を使い終えたかは段だけでは分からないので、手持ちで進める（作り足さない）。</summary>
+        HeldOnly,
+
+        /// <summary>品を使う最後の段を過ぎた（渡し終えた）。もう要らない。</summary>
+        None,
+    }
+
+    public static Stage Decide(byte currentSeq, byte firstItemSeq, byte lastItemSeq)
+    {
+        if (currentSeq == 0 || currentSeq <= firstItemSeq)
+            return Stage.All;
+        return currentSeq > lastItemSeq ? Stage.None : Stage.HeldOnly;
+    }
+
+    /// <summary>
+    /// 計画に入れる納品物。All ならそのまま、HeldOnly なら「手持ちの数まで」（作り足さない）、None なら空。
+    /// </summary>
+    /// <param name="held">手持ちの数（品、HQ だけ数えるか）。</param>
+    public static List<QuestItemReq> StillNeeded(IReadOnlyList<QuestItemReq> items, Stage stage, Func<uint, bool, int> held)
+        => stage switch
+        {
+            Stage.None => [],
+            Stage.HeldOnly => items
+                .Select(r => r with { Count = Math.Min(r.Count, held(r.ItemId, r.Hq)) })
+                .Where(r => r.Count > 0)
+                .ToList(),
+            _ => items.ToList(),
+        };
+}
+
+/// <summary>
+/// こちらの会話ではない会話の窓（Talk）の扱い（表示されている会話の窓は、状況を確かめてから原則として閉じる）。
+/// 以前は送らずに待ち、消えなければ止まっていた。
+/// </summary>
+public static class ForeignTalkPolicy
+{
+    public enum Verdict
+    {
+        /// <summary>Questionable が動いている（その会話は Questionable の進行の一部）。触らない。</summary>
+        LeaveToQuestionable,
+
+        /// <summary>出てすぐ。ほかの操作が送って消えるかを少し見る。</summary>
+        Watch,
+
+        /// <summary>TextAdvance をほかのプラグインが動かしている（そちらが送るはず）。少し待つ。</summary>
+        WaitOthers,
+
+        /// <summary>閉じる（会話を送る）。</summary>
+        Close,
+
+        /// <summary>送り続けても消えない。止める。</summary>
+        GiveUp,
+    }
+
+    /// <summary>ほかの操作が送って消えるかを見る時間。</summary>
+    public static readonly TimeSpan WatchTime = TimeSpan.FromSeconds(2);
+
+    /// <summary>TextAdvance をほかのプラグインが動かしているとき、そちらに任せて待つ上限。過ぎたらこちらで閉じる。</summary>
+    public static readonly TimeSpan OthersLimit = TimeSpan.FromSeconds(10);
+
+    /// <summary>閉じ始めてから消えるまでの上限。</summary>
+    public static readonly TimeSpan CloseLimit = TimeSpan.FromSeconds(30);
+
+    /// <param name="questionableRunning">Questionable が動いているか。</param>
+    /// <param name="othersDriveTextAdvance">TextAdvance をこちら以外が外部制御しているか。</param>
+    /// <param name="seen">会話の窓を最初に見てからの時間。</param>
+    /// <param name="closing">閉じ始めてからの時間（まだなら null）。</param>
+    public static Verdict Decide(bool questionableRunning, bool othersDriveTextAdvance, TimeSpan seen, TimeSpan? closing)
+    {
+        if (questionableRunning)
+            return Verdict.LeaveToQuestionable;
+        if (closing is { } c)
+            return c > CloseLimit ? Verdict.GiveUp : Verdict.Close;
+        if (seen < WatchTime)
+            return Verdict.Watch;
+        if (othersDriveTextAdvance && seen < OthersLimit)
+            return Verdict.WaitOthers;
+        return Verdict.Close;
+    }
+}
+
+/// <summary>
+/// 攻撃されたときの反撃の決まり（RSR は、使い終わったときに途中で Off になっていたら戻さないのが基本。
+/// ただし敵に攻撃されていることを検知したら、一時的に ON にする）。
+/// </summary>
+public static class DefensePolicy
+{
+    public enum Verdict
+    {
+        /// <summary>攻撃されていない・ほかが戦っている（戦闘の作業・Questionable）。何もしない（反撃中なら終える）。</summary>
+        None,
+
+        /// <summary>攻撃されているが、今のジョブ（製作職・採集職）では戦えない、または RSR が無い。戦闘が解けるのを待つ。</summary>
+        CannotFight,
+
+        /// <summary>攻撃されている。RSR を一時的に Henched にして、その敵を狙う。</summary>
+        Defend,
+    }
+
+    /// <param name="inCombat">戦闘状態か。</param>
+    /// <param name="combatTaskActive">戦闘の作業（CombatTask）の最中か（そちらが敵視リストの敵も倒す）。</param>
+    /// <param name="questionableRunning">Questionable が動いているか（Questionable が自分で戦う）。</param>
+    /// <param name="attacker">自分と戦闘状態の敵がいるか（敵視リスト・自分を狙っている敵）。</param>
+    /// <param name="combatJob">今のジョブが戦闘ジョブか。</param>
+    /// <param name="rsrLoaded">RSR が読み込まれているか。</param>
+    public static Verdict Decide(bool inCombat, bool combatTaskActive, bool questionableRunning, bool attacker, bool combatJob, bool rsrLoaded)
+    {
+        if (!inCombat || combatTaskActive || questionableRunning || !attacker)
+            return Verdict.None;
+        return combatJob && rsrLoaded ? Verdict.Defend : Verdict.CannotFight;
+    }
+}
+
 /// <summary>マーケットで送る直前の確認。</summary>
 public static class PurchaseGuard
 {

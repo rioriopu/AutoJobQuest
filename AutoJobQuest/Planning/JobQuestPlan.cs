@@ -81,6 +81,15 @@ public sealed class JobQuestPlan
     public List<JobQuest> RemainingQuests { get; } = [];
 
     /// <summary>
+    /// 作る・そろえる納品物（残りのクエストの納品物から、クエストの今の段でもう要らない分を除いたもの：<see cref="Automation.QuestItemStage"/>）。
+    /// 製作の計画・素材集めは、これを基にする（RemainingQuests の Items をそのまま使わない）。
+    /// </summary>
+    public List<QuestItemReq> Targets { get; } = [];
+
+    /// <summary>クエストの今の段（納品物がもう要らない・手持ちで進めるものだけ。画面・記録用）。</summary>
+    public Dictionary<uint, Automation.QuestItemStage.Stage> ItemStages { get; } = [];
+
+    /// <summary>
     /// 残りのジョブクエのうち、前提のクエスト（メインクエスト等）が未完了で進められないもの。
     /// 計画（素材・製作・装着）には入れない（進められないクエストの素材を集めない）。
     /// 開始時に「どのクエストが未達なので動作保証しない」と注意を出す。
@@ -169,9 +178,18 @@ public static class PlanBuilder
 
         var inv = Inventory.Snapshot();
 
+        // 0) 途中の段で納品物を渡すクエスト（120本中47本）は、今の段によっては納品物がもう要らない・手持ちで足りる
+        //    （以前は、渡した後に止めて再開すると、同じ品をもう一度作っていた）
+        foreach (var q in plan.RemainingQuests)
+        {
+            var stage = Automation.QuestItemStage.Decide(QuestManager.GetQuestSequence(q.RowId), q.FirstItemSeq, q.LastItemSeq);
+            if (stage != Automation.QuestItemStage.Stage.All)
+                plan.ItemStages[q.RowId] = stage;
+            plan.Targets.AddRange(Automation.QuestItemStage.StillNeeded(q.Items, stage, (item, hq) => hq ? inv.CountHq(item) : inv.CountAll(item)));
+        }
+
         // 1) 製作計画（納品物 → 中間素材 → 末端素材）
-        var targets = plan.RemainingQuests.SelectMany(q => q.Items).ToList();
-        plan.Craft = data.Planner!.Build(targets, inv, IsBookUnlocked);
+        plan.Craft = data.Planner!.Build(plan.Targets, inv, IsBookUnlocked);
         plan.Warnings.AddRange(plan.Craft.Problems);
 
         // 2) 末端素材の入手手段
@@ -200,6 +218,12 @@ public static class PlanBuilder
                 continue;
 
             var hq = q.Items.FirstOrDefault(x => x.ItemId == m.TargetItemId)?.Hq ?? false;
+
+            // 納品物を渡し終えたクエストは装着も要らない。途中まで渡したクエストは、付ける品が手元にあるときだけ
+            var stage = plan.ItemStages.GetValueOrDefault(q.RowId, Automation.QuestItemStage.Stage.All);
+            if (stage == Automation.QuestItemStage.Stage.None
+                || (stage == Automation.QuestItemStage.Stage.HeldOnly && (hq ? inv.CountHq(m.TargetItemId) : inv.CountAll(m.TargetItemId)) == 0))
+                continue;
             plan.Materia.Add(new MateriaNeed
             {
                 Quest = q,

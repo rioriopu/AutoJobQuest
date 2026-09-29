@@ -108,6 +108,16 @@ public sealed class Configuration : IPluginConfiguration
     /// </summary>
     public DateTime? PendingArtisanWatchUtc { get; set; }
 
+    /// <summary>
+    /// こちらが RSR を Henched にしたまま、まだ使う前のモードへ戻していない（控え。戻したら false）。
+    /// プラグインの読み込み直しなどで覚えていたことが消えても、残った Henched を「利用者の使う前のモード」と取り違えないため
+    /// （戻し損ねると、次の戦闘の後も Henched のまま残る）。
+    /// </summary>
+    public bool RsrHenchedPending { get; set; }
+
+    /// <summary><see cref="RsrHenchedPending"/> のときの、使う前のモード（読めなかったなら null＝Off に戻す）。</summary>
+    public byte? RsrOriginalMode { get; set; }
+
     [NonSerialized]
     private Dalamud.Plugin.IDalamudPluginInterface? pluginInterface;
 

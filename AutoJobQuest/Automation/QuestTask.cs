@@ -75,9 +75,19 @@ public sealed unsafe class QuestTask : AutoTask
         if (this.IsComplete)
             return TaskResult.Done;
 
-        // 納品物がそろっているか
+        // 納品物がそろっているか。途中の段で渡すクエストは、今の段によってはもう要らない・手持ちで進める
+        // （渡した後に止めて再開したとき、無い品を理由に止まらないように）
         var inv = Inventory.Snapshot();
-        foreach (var r in this.quest.Items)
+        var seq = QuestManager.GetQuestSequence(this.quest.RowId);
+        var stage = QuestItemStage.Decide(seq, this.quest.FirstItemSeq, this.quest.LastItemSeq);
+        if (stage != QuestItemStage.Stage.All)
+        {
+            ctx.Log.Write("クエスト", stage == QuestItemStage.Stage.None
+                ? $"{this.quest} は納品物を渡し終えています（今の段 {seq}・品を使う最後の段 {this.quest.LastItemSeq}）。残りの手順を進めます"
+                : $"{this.quest} は納品物を途中まで渡しています（今の段 {seq}）。手持ちの品で続けます（作り足しません）");
+        }
+
+        foreach (var r in stage == QuestItemStage.Stage.All ? this.quest.Items : [])
         {
             var have = r.Hq ? inv.CountHq(r.ItemId) : inv.CountAll(r.ItemId);
             if (have < r.Count)
@@ -87,7 +97,7 @@ public sealed unsafe class QuestTask : AutoTask
                 ctx.Log.Debug("クエスト", $"{CraftPlanner.ItemName(r.ItemId)} を NQ でも持っています（納品窓ではこちらが HQ を選んで入れます）");
         }
 
-        if (this.quest.Materia is { } m)
+        if (stage == QuestItemStage.Stage.All && this.quest.Materia is { } m)
         {
             var hq = this.quest.Items.FirstOrDefault(x => x.ItemId == m.TargetItemId)?.Hq ?? false;
             if (!Inventory.HasMelded(m.TargetItemId, hq, m.MateriaItemId))

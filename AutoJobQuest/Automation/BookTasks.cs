@@ -429,12 +429,13 @@ public sealed unsafe class TalkToNpcTask : AutoTask
             return TaskResult.Running;
         }
 
-        // 自分が話しかける前から会話が出ている（利用者・他のプラグインの会話）。送らずに待ち、消えなければ止める
+        // 自分が話しかける前から出ている会話（利用者・他のプラグインの会話）は、ここでは送らない。
+        // 流れ全体の「こちらの会話ではない会話の窓を閉じる」（ForeignTalk）が、状況を確かめてから閉じる
         if (this.firstInteractAt == DateTime.MinValue && GameUi.IsVisible("Talk"))
         {
-            this.Status = "話しかける前から会話が出ています（自分のものではないので送りません）";
+            this.Status = "話しかける前から会話が出ています（閉じられるのを待っています）";
             return DateTime.UtcNow > this.stepDeadline
-                ? this.Fail($"{this.label} に話しかける前から会話が出ていて、消えませんでした（自分のものではないので送りません）")
+                ? this.Fail($"{this.label} に話しかける前から会話が出ていて、消えませんでした")
                 : TaskResult.Running;
         }
 
@@ -500,6 +501,7 @@ public sealed unsafe class TalkToNpcTask : AutoTask
             this.lastInteract = DateTime.UtcNow;
             if (this.firstInteractAt == DateTime.MinValue)
                 this.firstInteractAt = this.lastInteract;
+            ctx.InOwnConversation = true; // ここからの会話の窓はこちらのもの（ForeignTalk が触らない）
             GameUi.Interact(npc);
             this.Status = $"{npc.Name} に話しかけています";
         }
@@ -638,6 +640,7 @@ public sealed unsafe class TalkToNpcTask : AutoTask
     public override void Cleanup(TaskContext ctx)
     {
         this.StopSub(ctx);
+        ctx.InOwnConversation = false;
 
         // 失敗して止まったとき、自分の操作で開いた選択肢が残っていれば閉じる（
         // 残ると次の実行のテレポが「ショップ等の画面が開いている」で待ち続ける）。
