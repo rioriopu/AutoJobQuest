@@ -28,6 +28,27 @@ public sealed class Configuration : IPluginConfiguration
     public int ConfirmPurchaseAboveGil { get; set; } = 500_000;
 
     /// <summary>
+    /// マーケットの購入で、出品の単価が「最近の取引（マーケットの取引履歴）の単価の中央値」の何倍を超えたら確認窓を出すか。
+    /// 0 なら確かめない。誤ってギルを大量に使ってしまわないための安全策。
+    /// 出品が少ない品で、相場から外れた高値の出品しか残っていないときに気づくため（1回の額が基準以下でも確かめる）。
+    /// 取引履歴が届かない品では確かめられない（そのときは記録に残す）。
+    /// </summary>
+    public double ConfirmUnitPriceRatio { get; set; } = 3.0;
+
+    /// <summary>
+    /// この実行でマーケットに払った合計が、これを超えそうになったら確認窓を出す（ギル）。0 なら確かめない（既定）。
+    /// 1回ごとの確認（<see cref="ConfirmPurchaseAboveGil"/>）とは別の、任意の上限。
+    /// 「はい」で続けると、次はさらにこの額を払ったところで、また確かめる。
+    /// </summary>
+    public long ConfirmRunTotalAboveGil { get; set; }
+
+    /// <summary>
+    /// 結果が確かめられていないマーケットの購入（送る前に保存し、買えた・断られたと分かったら消す）。
+    /// 残っていれば、次に始めるとき事前点検で利用者に確かめてもらう（二重に買わないため、自動では買い直さない）。
+    /// </summary>
+    public PendingPurchaseRecord? PendingPurchase { get; set; }
+
+    /// <summary>
     /// 納品物のHQが要るのにNQしかできなかったとき、何回まで作り直すか。
     /// 無限に作り直すと素材を食い潰すので上限を持つ。
     /// </summary>
@@ -87,6 +108,15 @@ public sealed class Configuration : IPluginConfiguration
     /// <summary>こちらが一時的に書き換えた GBR の自動採集設定（名前 → 元の値）。</summary>
     public Dictionary<string, bool> GbrConfigOriginals { get; set; } = [];
 
+    /// <summary>
+    /// GBR の設定を元の値に戻したが、GBR の保存ファイルに書かれたとまだ確かめていないもの（名前 → 書かれているはずの値）。
+    /// GBR の Save は旗を立てるだけで後から書くので、書かれたと確かめるまで控えを残す。
+    /// </summary>
+    public Dictionary<string, bool> GbrConfigAwaitingSave { get; set; } = [];
+
+    /// <summary><see cref="GbrConfigAwaitingSave"/> を待ち始めた時刻（UTC）。</summary>
+    public DateTime? GbrConfigAwaitingSince { get; set; }
+
     /// <summary>こちらの GBR リスト「AutoJobQuest」を有効にしたままか。</summary>
     public bool GbrOwnListActive { get; set; }
 
@@ -118,6 +148,17 @@ public sealed class Configuration : IPluginConfiguration
     /// <summary><see cref="RsrHenchedPending"/> のときの、使う前のモード（読めなかったなら null＝Off に戻す）。</summary>
     public byte? RsrOriginalMode { get; set; }
 
+    /// <summary>
+    /// こちらが RSR の範囲攻撃（AoEType）を Off にしたまま、まだ使う前の値へ戻していない（控え。戻ったと確かめたら false）。
+    /// 戦闘の間だけ Off にする（対象モンスター以外は攻撃しないため。Henched でも範囲攻撃は指定外の敵を
+    /// 巻き込み、自分中心の範囲攻撃はハードターゲットが無くても近くの敵に撃つ：RSR の ActionTargetInfo.cs で確認）。
+    /// RSR は設定画面を閉じたときと終了時に設定を保存するので、戻し損ねると Off のまま利用者の設定に残る。そのため控えを残す。
+    /// </summary>
+    public bool RsrAoePending { get; set; }
+
+    /// <summary><see cref="RsrAoePending"/> のときの、使う前の範囲攻撃の設定（RSR の AoEType：Off=0, Cleave=1, Full=2）。</summary>
+    public byte? RsrAoeOriginal { get; set; }
+
     [NonSerialized]
     private Dalamud.Plugin.IDalamudPluginInterface? pluginInterface;
 
@@ -146,6 +187,28 @@ public sealed class Configuration : IPluginConfiguration
 
     public void Save()
         => this.pluginInterface?.SavePluginConfig(this);
+}
+
+/// <summary>
+/// 結果を確かめられていないマーケットの購入の控え。
+/// State は "Sent"（送った。結果待ち）か "Unknown"（結果が分からないまま止めた）。
+/// </summary>
+[Serializable]
+public sealed record PendingPurchaseRecord(
+    ulong ContentId,
+    uint ItemId,
+    string ItemName,
+    ulong ListingId,
+    int Quantity,
+    long Total,
+    long GilBefore,
+    int CountBefore,
+    DateTime SentUtc,
+    string State)
+{
+    /// <summary>利用者に見せる説明。</summary>
+    public string Describe()
+        => $"{ItemName}×{Quantity}（{Total:N0}ギル、{SentUtc.ToLocalTime():M/d HH:mm:ss} に送信。送る前のギル {GilBefore:N0}・所持 {CountBefore}）";
 }
 
 /// <summary>GBR の自動採集リストを指す控え（名前とフォルダの組）。</summary>

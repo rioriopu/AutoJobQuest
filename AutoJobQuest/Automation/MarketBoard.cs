@@ -177,9 +177,21 @@ public sealed unsafe class MarketBoardWatcher : IDisposable
     private readonly bool purchaseSubscribed;
 
     // 「買えた」の通知（Dalamud の IMarketBoard.ItemPurchased。サーバーの応答から出る）の通し番号と、最後に買えた品。
-    // 通知がどのスレッドで来るかは確かめていないので、読み書きは Interlocked / volatile で行う
+    // 通知がどのスレッドで来るかは確かめていないので、読み書きは Interlocked / volatile / lock で行う
     private int purchaseSerial;
     private volatile uint lastPurchasedItem;
+    private bool historySubscribed;
+
+    // 購入の応答（InfoProxyItemSearch.ProcessPurchaseResponse）。「断った」を見分けるため
+    private readonly Hook<InfoProxyItemSearch.Delegates.ProcessPurchaseResponse>? responseHook;
+    private int rejectSerial;
+    private volatile uint lastRejectItem;
+    private volatile uint lastRejectMessage;
+
+    // 最後に届いた取引履歴（品と、1個あたりの売値。Dalamud の IMarketBoard.HistoryReceived：SalePrice は単価）
+    private readonly object historyLock = new();
+    private uint historyItem;
+    private List<uint> historyUnitPrices = [];
 
     public int Serial { get; private set; }
 
@@ -188,6 +200,19 @@ public sealed unsafe class MarketBoardWatcher : IDisposable
 
     /// <summary>最後に「買えた」の通知が来た品（アイテム ID）。</summary>
     public uint LastPurchasedItem => this.lastPurchasedItem;
+
+    /// <summary>購入の応答で「断った」（errorMessageId が 0 でない）が返ってきた回数の通し番号。</summary>
+    public int RejectSerial => Volatile.Read(ref this.rejectSerial);
+
+    /// <summary>最後に断られた品と、そのときの errorMessageId（LogMessage の行番号と思われる。記録に使う）。</summary>
+    public (uint Item, uint Message) LastReject => (this.lastRejectItem, this.lastRejectMessage);
+
+    /// <summary>その品の最近の取引の単価（最大20件。届いていなければ空）。</summary>
+    public List<uint> HistoryUnitPrices(uint itemId)
+    {
+        lock (this.historyLock)
+            return this.historyItem == itemId ? [.. this.historyUnitPrices] : [];
+    }
 
     public int LastCount { get; private set; }
 
@@ -213,8 +238,75 @@ public sealed unsafe class MarketBoardWatcher : IDisposable
         }
         catch (Exception ex)
         {
-            // 通知が取れなくても買えるが、反映が遅いときに買い直しうる（記録に残す）
+            // 通知が取れなくても、結果が分からないときは買い直さずに止めるので二重には買わない（記録に残す）
             Svc.Log.Error(ex, "[AutoJobQuest] マーケットの購入の通知を受け取れませんでした");
+        }
+
+        try
+        {
+            Svc.MarketBoard.HistoryReceived += this.OnHistory;
+            this.historySubscribed = true;
+        }
+        catch (Exception ex)
+        {
+            // 取引履歴が取れないと、相場から外れた高値の確認ができない（1回の額の確認は働く）
+            Svc.Log.Error(ex, "[AutoJobQuest] マーケットの取引履歴の通知を受け取れませんでした");
+        }
+
+        try
+        {
+            this.responseHook = interop.HookFromAddress<InfoProxyItemSearch.Delegates.ProcessPurchaseResponse>(
+                (nint)InfoProxyItemSearch.Addresses.ProcessPurchaseResponse.Value, this.ResponseDetour);
+            this.responseHook.Enable();
+        }
+        catch (Exception ex)
+        {
+            // 断られたことが分からないと、何も変わらない購入は「分からない」で止まる（二重には買わない）
+            Svc.Log.Error(ex, "[AutoJobQuest] マーケットの購入の応答のフックを作れませんでした");
+        }
+    }
+
+    private void ResponseDetour(InfoProxyItemSearch* thisPtr, uint itemId, uint errorMessageId)
+    {
+        this.responseHook!.Original(thisPtr, itemId, errorMessageId);
+        try
+        {
+            // errorMessageId の意味は実機で確かめていない（ClientStructs の名前から「0＝成功、それ以外＝断られた理由の文言」と読む）。
+            // 判断に使うのは「ギルも所持も変わらないまま」のときだけなので、読み違えても二重には買わない。値は記録に残して確かめる
+            Core.DebugLog.Current?.Line("マーケット", $"購入の応答：品 {itemId}・errorMessageId {errorMessageId}{MessageText(errorMessageId)}");
+            if (errorMessageId != 0)
+            {
+                this.lastRejectItem = itemId;
+                this.lastRejectMessage = errorMessageId;
+                Interlocked.Increment(ref this.rejectSerial);
+            }
+        }
+        catch
+        {
+            // フックの中では例外を外へ出さない
+        }
+    }
+
+    /// <summary>LogMessage の文言（無ければ空）。記録用。</summary>
+    public static string MessageText(uint id)
+        => id != 0 && Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.LogMessage>().TryGetRow(id, out var row)
+            ? $"（LogMessage#{id}「{row.Text.ExtractText()}」）"
+            : string.Empty;
+
+    private void OnHistory(Dalamud.Game.Network.Structures.IMarketBoardHistory history)
+    {
+        try
+        {
+            var prices = history.HistoryListings.Where(h => h.SalePrice > 0).Select(h => h.SalePrice).ToList();
+            lock (this.historyLock)
+            {
+                this.historyItem = history.ItemId;
+                this.historyUnitPrices = prices;
+            }
+        }
+        catch
+        {
+            // 通知の中では例外を外へ出さない
         }
     }
 
@@ -251,11 +343,24 @@ public sealed unsafe class MarketBoardWatcher : IDisposable
     public void Dispose()
     {
         this.hook?.Dispose();
+        this.responseHook?.Dispose();
         if (this.purchaseSubscribed)
         {
             try
             {
                 Svc.MarketBoard.ItemPurchased -= this.OnItemPurchased;
+            }
+            catch
+            {
+                // アンロード中なので握り潰す
+            }
+        }
+
+        if (this.historySubscribed)
+        {
+            try
+            {
+                Svc.MarketBoard.HistoryReceived -= this.OnHistory;
             }
             catch
             {
@@ -275,6 +380,9 @@ public sealed unsafe class MarketBoardWatcher : IDisposable
 /// 必ずカバンの所持数を確かめ、不足分だけを買う（呼び出し側が不足数を渡し、ここでも買う直前に数え直す）。
 /// 1回の購入額が設定値（既定 500,000 ギル）を超えるときは確認窓を出す（
 /// 合計ではなく1回ごとで判定）。「いいえ」で自動動作を止める。
+/// さらに、単価が最近の取引の中央値の3倍（設定）を超えるとき、この実行の合計が任意の上限（設定。既定は使わない）を超えるときも
+/// 確認窓を出す（誤ってギルを大量に使わないため。PurchaseGuard.ConfirmReasons）。
+/// 購入の要求を送る前に取引の控えを設定ファイルに保存し、結果が分からないまま止まったら次の開始時に利用者に確かめてもらう。
 ///
 /// 購入そのものは関数経路（SetLastPurchasedItem → SendPurchaseRequestPacket）で行う。
 /// 画面経路の「行を選ぶ」操作は、どの実装にも撃って動いた記録が無く未確認のため使わない。
@@ -361,6 +469,15 @@ public sealed unsafe class MarketBoardTask : AutoTask
     /// <summary>この実行で MB に払った合計（ギル）。</summary>
     public static long SpentThisRun { get; set; }
 
+    /// <summary>この実行の合計を、いくらまで了承済みか（任意の上限を使わないなら 0。実行の始めに設定の値にする）。</summary>
+    public static long RunApprovedUpTo { get; set; }
+
+    // 確認を出した理由に「この実行の合計」が入っていたか（了承されたら、了承済みの額を上げる）
+    private bool confirmIncludesRunTotal;
+
+    // 購入の要求を送る前の「断られた」の通し番号
+    private int rejectSerialBefore;
+
     /// <summary>買えなかったもの（記録用）。</summary>
     public List<string> Unfinished { get; } = [];
 
@@ -381,6 +498,10 @@ public sealed unsafe class MarketBoardTask : AutoTask
             return TaskResult.Done;
         if (!this.watcher.Available)
             return this.Fail("マーケットの検索結果を受け取る仕組みを用意できませんでした");
+
+        // 結果の分からない購入が残っているうちは買わない（二重に買わないため。事前点検で利用者が確かめると消える）
+        if (ctx.Config.PendingPurchase is { } pending)
+            return this.Fail($"前回のマーケット購入の結果が確かめられていません：{pending.Describe()}。マーケットの取引履歴で確かめてから、もう一度始めてください（事前点検の確認で「はい」を押すと控えを消します）");
 
         var town = MarketBoardLocator.ChooseTown();
         if (town == null)
@@ -756,20 +877,31 @@ public sealed unsafe class MarketBoardTask : AutoTask
         this.needAtDecide = need;
         ctx.Log.Debug("マーケット", $"選んだ出品：{CraftPlanner.ItemName(this.buyingItem)} {pick.Quantity}個×{pick.UnitPrice:N0}＝合計{pick.Total:N0}（出品{pick.ListingId}）");
 
-        var limit = ctx.Config.ConfirmPurchaseAboveGil;
         var gil = Inventory.Gil();
         if (pick.Total > gil)
             return this.GiveUpCurrent(ctx, $"ギルが足りません（必要 {pick.Total:N0} / 所持 {gil:N0}）");
 
-        // 1回の購入額が基準（既定 500,000 ギル）を超えるときだけ確認する。
-        // 確認をもらった後に取り直した一覧で、同じ出品が同じ額以下のままなら、確認はやり直さない
+        // 確かめる理由（PurchaseGuard.ConfirmReasons）：
+        //  ・1回の購入額が基準（既定 500,000 ギル）を超える
+        //  ・単価が最近の取引の中央値の何倍か（設定）を超える／この実行の合計が任意の上限を超える
+        // 確認をもらった後に取り直した一覧で、同じ出品が同じ額以下のままなら、出品ごとの確認はやり直さない
         var approved = PurchaseGuard.IsApproved(pick.ListingId, pick.Total, this.approvedListingId, this.approvedTotal);
-        if (limit > 0 && pick.Total > limit && !approved)
+        var history = this.watcher.HistoryUnitPrices(this.buyingItem);
+        var market = PurchaseGuard.MedianUnitPrice(history);
+        if (market == null && ctx.Config.ConfirmUnitPriceRatio > 0)
+            ctx.Log.Debug("マーケット", $"{CraftPlanner.ItemName(this.buyingItem)} の取引履歴が届いていないので、相場から外れた高値かは確かめられません");
+        var reasons = PurchaseGuard.ConfirmReasons(pick.Total, pick.UnitPrice, ctx.Config.ConfirmPurchaseAboveGil, approved,
+            market, ctx.Config.ConfirmUnitPriceRatio, SpentThisRun, RunApprovedUpTo);
+        if (reasons.Count > 0)
         {
+            this.confirmIncludesRunTotal = RunApprovedUpTo > 0 && SpentThisRun + pick.Total > RunApprovedUpTo;
+            ctx.Log.Warn("マーケット", $"買う前に確認を出します：{string.Join(" / ", reasons)}");
             this.confirmTicket = ctx.Confirm.Ask(
-                "マーケットでの購入額の確認",
-                $"{CraftPlanner.ItemName(this.buyingItem)} ×{pick.Quantity} を {pick.Total:N0} ギル（手数料込み）で買おうとしています。\n"
-                + $"1回の購入額が {limit:N0} ギルを超えています（参考：この実行でマーケットに払った額 {SpentThisRun:N0} ギル）。\n\n"
+                "マーケットでの購入の確認",
+                $"{CraftPlanner.ItemName(this.buyingItem)} ×{pick.Quantity} を {pick.Total:N0} ギル（単価 {pick.UnitPrice:N0}、手数料込み）で買おうとしています。\n"
+                + string.Join("\n", reasons.Select(r => "・" + r)) + "\n"
+                + (market is { } med ? $"（参考：最近の取引の単価の中央値 {med:N0} ギル・{history.Count} 件）\n" : string.Empty)
+                + $"（参考：この実行でマーケットに払った額 {SpentThisRun:N0} ギル）\n\n"
                 + "本当に購入してよいですか？「はい」で購入して自動動作を続けます。「いいえ」で自動動作を止めます。");
             this.Go(Phase.WaitConfirm, "購入の確認を待っています");
             return TaskResult.Running;
@@ -791,6 +923,14 @@ public sealed unsafe class MarketBoardTask : AutoTask
         // （手元の一覧は確認を出した時点のもの。取り直した一覧で同じ出品が同じ額以下なら、そのまま買う）
         this.approvedListingId = this.buyingListingId;
         this.approvedTotal = this.buyingTotal;
+
+        // この実行の合計の確認だったなら、了承済みの額を上げる（今回の分＋上限の額。次はさらにその額を払ったところで確かめる）
+        if (this.confirmIncludesRunTotal)
+        {
+            RunApprovedUpTo = SpentThisRun + this.buyingTotal + Math.Max(0, ctx.Config.ConfirmRunTotalAboveGil);
+            this.confirmIncludesRunTotal = false;
+        }
+
         ctx.Log.Write("マーケット", "購入の確認がとれました。出品一覧を取り直してから買います");
         this.StartSearch(this.buyingItem);
         return TaskResult.Running;
@@ -843,9 +983,31 @@ public sealed unsafe class MarketBoardTask : AutoTask
         this.gilBefore = Inventory.Gil();
         this.countBefore = Inventory.CountNow(this.buyingItem);
         this.purchaseSerialBefore = this.watcher.PurchaseSerial;
+        this.rejectSerialBefore = this.watcher.RejectSerial;
 
-        if (!proxy->SetLastPurchasedItem(target) || !proxy->SendPurchaseRequestPacket())
+        if (!proxy->SetLastPurchasedItem(target))
+            return this.Retry(ctx, "購入する出品を用意できませんでした（まだ送っていません）");
+
+        // 送る前に取引の控えを保存する。保存できなければ送らない（結果が分からないまま読み込み直しても、控えから照合できるように）
+        try
+        {
+            ctx.Config.PendingPurchase = new PendingPurchaseRecord(
+                Svc.PlayerState.ContentId, this.buyingItem, CraftPlanner.ItemName(this.buyingItem), this.buyingListingId,
+                this.buyingQuantity, this.buyingTotal, this.gilBefore, this.countBefore, DateTime.UtcNow, "Sent");
+            ctx.Config.Save();
+        }
+        catch (Exception ex)
+        {
+            ctx.Config.PendingPurchase = null;
+            return this.Fail($"購入の控えを保存できないので、買いませんでした（{ex.GetType().Name}: {ex.Message}）");
+        }
+
+        if (!proxy->SendPurchaseRequestPacket())
+        {
+            // 送る関数が失敗を返した＝送っていない。控えを消してやり直す
+            this.ClearPending(ctx);
             return this.Retry(ctx, "購入の要求を送れませんでした");
+        }
 
         this.Go(Phase.WaitBought, $"{CraftPlanner.ItemName(this.buyingItem)} ×{this.buyingQuantity} を購入中");
         return TaskResult.Running;
@@ -856,11 +1018,14 @@ public sealed unsafe class MarketBoardTask : AutoTask
         var gil = Inventory.Gil();
         var count = Inventory.CountNow(this.buyingItem);
         var confirmed = this.watcher.PurchaseSerial != this.purchaseSerialBefore && this.watcher.LastPurchasedItem == this.buyingItem;
-        var verdict = PurchaseOutcome.Decide(this.gilBefore, gil, this.countBefore, count, confirmed, this.PhaseElapsed);
+        var rejected = this.watcher.RejectSerial != this.rejectSerialBefore && this.watcher.LastReject.Item == this.buyingItem;
+        // 送った購入の応答待ちは、流れが中断しても止めない（実際の時間で測る）
+        var verdict = PurchaseOutcome.Decide(this.gilBefore, gil, this.countBefore, count, confirmed, rejected, this.PhaseWallElapsed);
 
         // 減った AND 増えた
         if (verdict == PurchaseOutcome.Verdict.Bought)
         {
+            this.ClearPending(ctx);
             var paid = this.gilBefore - gil;
             SpentThisRun += paid;
             this.boughtForCurrent += count - this.countBefore;
@@ -880,18 +1045,45 @@ public sealed unsafe class MarketBoardTask : AutoTask
         switch (verdict)
         {
             case PurchaseOutcome.Verdict.Unknown:
-                // 片方だけ変わった、または「買えた」の通知が来たのに所持が変わらない＝買えたかどうか分からない。
-                // もう一度買うと二重購入になりうるので止める
+            {
+                // 片方だけ変わった、または上限まで待っても何も変わらない＝買えたかどうか分からない。
+                // もう一度買うと二重購入になりうるので止める。控えは「分からない」として残す
+                if (ctx.Config.PendingPurchase is { } p)
+                {
+                    ctx.Config.PendingPurchase = p with { State = "Unknown" };
+                    ctx.Config.Save();
+                }
+
                 return this.Fail($"購入の結果を確かめられません（ギル {this.gilBefore:N0}→{gil:N0}、{CraftPlanner.ItemName(this.buyingItem)} {this.countBefore}→{count}"
-                                 + $"{(confirmed ? "、買えた通知あり" : string.Empty)}）。二重に買わないよう止めました");
+                                 + $"{(confirmed ? "、買えた通知あり" : "、買えた通知なし")}）。二重に買わないよう止めました。"
+                                 + "マーケットの取引履歴で買えたか確かめてから、もう一度始めてください");
+            }
+
             case PurchaseOutcome.Verdict.Retry:
-                return this.Retry(ctx, "購入が確認できませんでした（売り切れ・混雑・カバンがいっぱい等）");
-            case PurchaseOutcome.Verdict.Wait when confirmed && this.PhaseElapsed >= PurchaseOutcome.RetryAfter:
-                this.Status = "買えた通知は届きました。所持に反映されるのを待っています";
+            {
+                // はっきり断られた（売り切れ等）。控えを消し、必要数を数え直してから選び直す
+                var (_, msg) = this.watcher.LastReject;
+                this.ClearPending(ctx);
+                return this.Retry(ctx, $"購入が断られました{MarketBoardWatcher.MessageText(msg)}");
+            }
+
+            case PurchaseOutcome.Verdict.Wait when this.PhaseWallElapsed >= PurchaseOutcome.RetryAfter:
+                this.Status = confirmed
+                    ? "買えた通知は届きました。所持に反映されるのを待っています"
+                    : $"購入の結果を待っています（{this.PhaseWallElapsed.TotalSeconds:0}/{PurchaseOutcome.ConfirmedLimit.TotalSeconds:0}秒。分からなければ買い直さずに止めます）";
                 break;
         }
 
         return TaskResult.Running;
+    }
+
+    /// <summary>取引の控えを消す（買えた・断られた・送らなかったと分かったとき）。</summary>
+    private void ClearPending(TaskContext ctx)
+    {
+        if (ctx.Config.PendingPurchase == null)
+            return;
+        ctx.Config.PendingPurchase = null;
+        ctx.Config.Save();
     }
 
     private int RemainingNeed()

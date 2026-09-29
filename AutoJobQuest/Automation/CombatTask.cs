@@ -26,10 +26,16 @@ public sealed record CombatNeed(uint ItemId, int TargetOwned, List<uint> Mobs);
 ///  ・ドロップはロットなしでカバンに入る（所持数だけで進み具合を見る）。
 /// 判定基準は「倒した数」ではなく「アイテムの所持数」。
 ///
-/// 攻撃のさせ方:
-///  RSR を Henched（5）にすると、敵への行動は「いまのハードターゲット」だけが対象になり、
+/// 攻撃のさせ方（RSR のソースで確かめた）:
+///  RSR を Henched（5）にすると、敵への単体の行動は「いまのハードターゲット」だけが対象になり、
 ///  こちらを狙っていない敵（ノンアクティブ）も攻撃してよい扱いになる。
-///  → こちらがターゲットしたモンスターだけを RSR が殴る。優先リストにもその名前 ID を入れる。
+///  → こちらがターゲットしたモンスターだけを RSR が殴る。ただし範囲攻撃は指定外の敵も巻き込み、自分中心の範囲攻撃は
+///  ハードターゲットが無くても撃つので、Henched の間は RSR の範囲攻撃を Off にする（RotationSolverIpc の RsrAoe）。
+///  優先リストにもその名前 ID を入れる（Henched では効かないが、上の仕様どおり足して消す）。
+///
+/// 近づき方：狙った敵にこちらから近寄り、攻撃が届いたら止まって RSR に任せる
+///  （キャスター・レンジは射程に入った所で止まる）。敵と戦う処理は反撃（DefenseWatch）と共通の <see cref="Engagement"/>。
+///  攻撃してくる敵（敵視リスト）がいれば、まだ殴っていない指定の敵より先に倒す（棒立ちで殴られ続けない）。
 ///
 /// 出現位置は LuminaSupplemental の MobSpawn（地図座標）。高さは vnavmesh に床の点を問い合わせて補う。
 /// </summary>
@@ -43,8 +49,6 @@ public sealed class CombatTask : AutoTask
     private int spotIndex;
     private MoveToTask? moving;
     private DateTime spotArrivedAt = DateTime.MinValue;
-    private DateTime lastApproach = DateTime.MinValue;
-    private DateTime dismountAt = DateTime.MinValue;
 
     // 狙っている敵。オブジェクトの参照はフレームをまたいで持たず、GameObjectId で毎回引き直して
     // 名前 ID・BaseId が同じかを確かめる（Dalamud の ObjectTable は枠ごとの入れ物を使い回し、
@@ -58,15 +62,12 @@ public sealed class CombatTask : AutoTask
 
     // 同じ敵に長くダメージが入らない（届かない場所・他人の獲物など）ときは諦める。
     // 「最後に HP が減った時刻」から数える（以前は狙い始めた時の HP と比べていたので、
-    // 1回でも減った後に届かなくなると、制限時間の 25 分まで気づけなかった）
+    // 1回でも減った後に届かなくなると、制限時間の 25 分まで気づけなかった）。数えるのは Engagement の中の StallWatch
     private readonly HashSet<ulong> giveUp = [];
-    private readonly StallWatch stall = new();
 
-    // 自分が頼んだ近づく移動（画面が開いたときに止めてよいのはこれと出現点への移動だけ）
-    private bool approachIssued;
-
-    // 近づく移動を頼んだ行き先（止めた後、計算中だった経路の見張りに使う）
-    private Vector3? approachDestination;
+    // 敵と戦う処理（近づく・届いたら止まる・降りる・RSR・HP の停滞）。反撃と共通
+    private readonly Engagement engage = new();
+    private readonly ICombatWorld world = GameCombatWorld.Instance;
     private bool pausedByUi;
     private DateTime uiOpenSince = DateTime.MinValue;
 
@@ -151,7 +152,7 @@ public sealed class CombatTask : AutoTask
 
         // 画面が閉じた。待っていた間は「HP が減らない時間」に数えない
         if (this.uiOpenSince != DateTime.MinValue)
-            this.stall.Resume(DateTime.UtcNow);
+            this.engage.Resume(this.world);
         this.pausedByUi = false;
         this.uiOpenSince = DateTime.MinValue;
 
@@ -188,21 +189,25 @@ public sealed class CombatTask : AutoTask
         if (Me.Territory != this.territory)
             return this.Fail("エリアが変わりました");
 
-        // 1) いまの相手がまだ生きていれば、近づいて RSR に任せる
-        if (this.CurrentTarget() is { } t)
-            return this.Engage(ctx, t);
-
-        this.targetId = 0;
-
-        // 2) こちらを狙っている敵がいれば先に片づける（Henched はハードターゲットしか殴らないため）。
-        //    諦めた敵は選び直さない（以前は敵視リスト経由で同じ敵をすぐ選び直していた）
+        // 1) こちらを攻撃してくる敵（敵視リスト）がいて、いま狙っている相手がまだこちらと戦っていない（指定の敵へ近づいている途中など）
+        //    なら、攻撃してくる敵を先に倒す（対象外に攻撃されたら棒立ちにならず反撃する。
+        //    Henched はハードターゲットしか殴らないので、狙いを変えないと殴られ続ける）。諦めた敵は選び直さない
         var hater = FindHater(this.giveUp, out var onlyGivenUp);
-        if (hater != null)
+        var aimed = this.CurrentTarget();
+        if (hater != null && (aimed == null || (aimed.GameObjectId != hater.GameObjectId && !IsHater(aimed))))
         {
+            if (aimed != null)
+                ctx.Log.Write("戦闘", $"{hater.Name} に攻撃されているので、先に倒します（{aimed.Name} は後で狙います）");
             this.stuckSince = DateTime.MinValue;
             this.SetTarget(ctx, hater);
             return TaskResult.Running;
         }
+
+        // 2) いまの相手がまだ生きていれば、近づいて RSR に任せる
+        if (aimed != null)
+            return this.Engage(ctx, aimed);
+
+        this.targetId = 0;
 
         // 諦めた敵にしか狙われていないまま戦闘状態が続く＝攻撃の入らない敵に追われている。
         // マウントにもテレポにも移れないので、上限（2分）を過ぎたら理由を出して止める
@@ -233,67 +238,32 @@ public sealed class CombatTask : AutoTask
 
     private TaskResult Engage(TaskContext ctx, IBattleNpc t)
     {
-        var dist = Vector3.Distance(Me.Position, t.Position);
-        this.Status = $"{t.Name} と戦闘中（{dist:0.0}m）";
-
-        // 最後に HP が減ってから 45 秒たったら、その敵は諦める（届かない・他人が先に攻撃した等。StallWatch）。
-        // 回復・無敵で HP が増えたときは進展にしない。ハードターゲットも外す（諦めた敵を RSR が殴り続けないように）
-        var hp = t.CurrentHp;
-        if (this.stall.Observe(hp, DateTime.UtcNow))
+        var foe = new NpcFoe(t);
+        switch (this.engage.Tick(this.world, ctx.Rotation, ctx.Navmesh, foe, out var status))
         {
-            ctx.Log.Warn("戦闘", $"{t.Name} の HP が 45 秒減っていないので、この個体は諦めて別の個体を探します（HP {hp}）");
-            this.giveUp.Add(t.GameObjectId);
-            this.targetId = 0;
-            if (Svc.Targets.Target?.GameObjectId == t.GameObjectId)
-                Svc.Targets.Target = null;
-            if (this.approachIssued && ctx.Navmesh.IsMoving())
-                ctx.Navmesh.Stop();
-            this.approachIssued = false;
-            return TaskResult.Running;
+            case Engagement.Result.Stalled:
+                // 最後に HP が減ってから 45 秒たった（届かない・他人が先に攻撃した等）。この個体は諦める。
+                // ハードターゲットも外す（諦めた敵を RSR が殴り続けないように）
+                ctx.Log.Warn("戦闘", $"{t.Name} の HP が 45 秒減っていないので、この個体は諦めて別の個体を探します（HP {t.CurrentHp}）");
+                this.giveUp.Add(t.GameObjectId);
+                this.engage.Forget(this.world);
+                this.targetId = 0;
+                return TaskResult.Running;
+
+            case Engagement.Result.RsrFailed:
+                return this.Fail(this.engage.Problem);
         }
 
-        // 近くまで来たらマウントから降りる（乗ったままでは攻撃できない）
-        if (GameUi.Mounted && dist < 20 && DateTime.UtcNow - this.dismountAt > TimeSpan.FromSeconds(2))
-        {
-            this.dismountAt = DateTime.UtcNow;
-            GameUi.UseGeneralAction(23); // 降りる（GeneralAction 23：ゲームデータで確認）
-            return TaskResult.Running;
-        }
-
-        // Henched を入れる（こちらが入れていれば送り直さない。RSR が自分で OFF になったときだけ入れ直す）
-        if (!ctx.Rotation.EnsureHenched())
-            return this.Fail("RSR を Henched モードにできませんでした");
-        if (ctx.Rotation.HenchedUnresponsive)
-            return this.Fail($"{ctx.Rotation.HenchedProblem}。記録の IPC 欄を見てください");
-
-        // ハードターゲットが外れていたら付け直す
-        if (Svc.Targets.Target?.GameObjectId != t.GameObjectId)
-            Svc.Targets.Target = t;
-
-        // 攻撃が届く距離まで寄る（近接でも届くように 3m。遠隔ジョブでも近づいて困ることはない）
-        if (dist > 3.5f)
-        {
-            if (!ctx.Navmesh.IsMoving() && DateTime.UtcNow - this.lastApproach > TimeSpan.FromSeconds(1))
-            {
-                this.lastApproach = DateTime.UtcNow;
-                if (ctx.Navmesh.MoveCloseTo(t.Position, false, 2.5f))
-                {
-                    this.approachIssued = true;
-                    this.approachDestination = t.Position;
-                }
-            }
-        }
-        else if (this.approachIssued && ctx.Navmesh.IsMoving())
-        {
-            ctx.Navmesh.Stop();
-            this.approachIssued = false;
-        }
-
+        this.Status = status;
         return TaskResult.Running;
     }
 
     private void SetTarget(TaskContext ctx, IBattleNpc mob)
     {
+        // 出現点へ向かう移動は止める（止めないと、狙った敵をよそに出現点へ走り続け、キャスターは詠唱できない：
+        // RSR の調査で分かった不具合。以前は指定の敵を見つけたときだけ止め、攻撃してくる敵に切り替えたときは止めていなかった）
+        this.CancelMove(ctx);
+
         // 次のモンスターに移るとき、前に指定した優先設定を消す
         if (this.targetNameId != mob.NameId)
         {
@@ -305,7 +275,7 @@ public sealed class CombatTask : AutoTask
         this.targetId = mob.GameObjectId;
         this.targetMobNameId = mob.NameId;
         this.targetBaseId = mob.BaseId;
-        this.stall.Start(mob.CurrentHp, DateTime.UtcNow);
+        this.engage.Start(this.world, new NpcFoe(mob));
         Svc.Targets.Target = mob;
         this.Status = $"{mob.Name} を狙います";
     }
@@ -330,11 +300,11 @@ public sealed class CombatTask : AutoTask
     /// </summary>
     private void PauseOwnMovement(TaskContext ctx)
     {
-        if (this.moving != null || this.approachIssued)
+        if (this.moving != null || this.engage.ApproachIssued)
             this.pausedByUi = true;
 
         this.CancelMove(ctx);
-        this.approachIssued = false;
+        this.engage.StopApproach(ctx.Navmesh);
         if (this.pausedByUi && ctx.Navmesh.IsFollowingPath())
             ctx.Navmesh.Stop();
     }
@@ -405,11 +375,12 @@ public sealed class CombatTask : AutoTask
     {
         ctx.CombatInProgress = false;
         this.CancelMove(ctx);
-        if ((this.approachIssued || this.pausedByUi) && ctx.Navmesh.IsMoving())
+        var approachDest = this.engage.ApproachIssued ? this.engage.ApproachDestination : null;
+        if ((this.engage.ApproachIssued || this.pausedByUi) && ctx.Navmesh.IsMoving())
             ctx.Navmesh.Stop();
-        if (this.approachIssued && this.approachDestination is { } dest)
+        if (approachDest is { } dest)
             MoveToTask.WatchPendingPath(ctx, dest, 2.5f);
-        this.approachIssued = false;
+        this.engage.StopApproach(ctx.Navmesh);
         this.pausedByUi = false;
 
         // 止めたら優先指定を消し、RSR を止める（動作停止後は設定を消す）
@@ -430,10 +401,18 @@ public sealed class CombatTask : AutoTask
         return Vector2.Distance(new Vector2(w.X, w.Z), new Vector2(Me.Position.X, Me.Position.Z));
     }
 
-    private static bool IsAlive(IBattleNpc npc)
+    internal static bool IsAlive(IBattleNpc npc)
         => npc.IsValid() && !npc.IsDead && npc.CurrentHp > 0 && npc.IsTargetable;
 
-    /// <summary>近くの指定モンスター（生きている・ターゲットできる・他人と戦っていない）。</summary>
+    /// <summary>
+    /// FATE の敵か（GameObject.FateId が 0 でない。ClientStructs の GameObject.cs で確認）。
+    /// RSR は既定の設定（IgnoreNonFateInFate）で、自分が入っていない FATE の敵を殴らないので、狙っても HP が減らず 45 秒むだになる
+    /// （RSR の ObjectHelper.cs）。FATE の敵は素材集めでは狙わない（攻撃してくる敵なら反撃はする）。
+    /// </summary>
+    private static unsafe bool IsFateMob(IBattleNpc npc)
+        => ((FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)npc.Address)->FateId != 0;
+
+    /// <summary>近くの指定モンスター（生きている・ターゲットできる・他人と戦っていない・FATE の敵でない）。</summary>
     private static IBattleNpc? FindMob(HashSet<uint> wanted, HashSet<ulong> giveUp)
     {
         var meId = Svc.Objects.LocalPlayer?.GameObjectId ?? 0;
@@ -441,6 +420,7 @@ public sealed class CombatTask : AutoTask
             .OfType<IBattleNpc>()
             .Where(o => o.BattleNpcKind == BattleNpcSubKind.Combatant && wanted.Contains(o.NameId) && IsAlive(o) && !giveUp.Contains(o.GameObjectId))
             .Where(o => !o.StatusFlags.HasFlag(StatusFlags.InCombat) || o.TargetObjectId == meId)
+            .Where(o => !IsFateMob(o))
             .Where(o => Vector3.Distance(o.Position, Me.Position) < 60f)
             .OrderBy(o => Vector3.Distance(o.Position, Me.Position))
             .FirstOrDefault();
@@ -460,16 +440,7 @@ public sealed class CombatTask : AutoTask
         if (meId == 0 || !GameUi.InCombat)
             return null;
 
-        var haters = new HashSet<uint>();
-        var ui = FFXIVClientStructs.FFXIV.Client.Game.UI.UIState.Instance();
-        if (ui != null)
-        {
-            ref var hater = ref ui->Hater;
-            for (var i = 0; i < hater.HaterCount && i < hater.Haters.Length; i++)
-                if (hater.Haters[i].EntityId != 0)
-                    haters.Add(hater.Haters[i].EntityId);
-        }
-
+        var haters = HaterIds();
         var all = Svc.Objects
             .OfType<IBattleNpc>()
             .Where(o => o.BattleNpcKind == BattleNpcSubKind.Combatant && IsAlive(o)
@@ -480,6 +451,29 @@ public sealed class CombatTask : AutoTask
             .FirstOrDefault();
         onlyGivenUp = pick == null && all.Count > 0;
         return pick;
+    }
+
+    /// <summary>その敵がこちらと戦っているか（敵視リストに載っているか、自分を狙っている）。</summary>
+    internal static bool IsHater(IBattleNpc npc)
+    {
+        var meId = Svc.Objects.LocalPlayer?.GameObjectId ?? 0;
+        return GameUi.InCombat && (npc.TargetObjectId == meId || HaterIds().Contains(npc.EntityId));
+    }
+
+    /// <summary>敵視リスト（UIState.Hater）に載っている敵の EntityId。</summary>
+    private static unsafe HashSet<uint> HaterIds()
+    {
+        var haters = new HashSet<uint>();
+        var ui = FFXIVClientStructs.FFXIV.Client.Game.UI.UIState.Instance();
+        if (ui != null)
+        {
+            ref var hater = ref ui->Hater;
+            for (var i = 0; i < hater.HaterCount && i < hater.Haters.Length; i++)
+                if (hater.Haters[i].EntityId != 0)
+                    haters.Add(hater.Haters[i].EntityId);
+        }
+
+        return haters;
     }
 }
 

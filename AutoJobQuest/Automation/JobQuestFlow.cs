@@ -85,6 +85,10 @@ public sealed class JobQuestFlow : AutoTask
     // 戦闘に使えるジョブが無いことを記録に出したか（1回だけ出す）
     private bool noCombatJobLogged;
 
+    // 今の製作の列で頼んだ製作（終わったら HQ 失敗を品目ごとに数える）
+    private readonly List<CraftOneTask> craftTasks = [];
+    private HqFailureTally hqFailures = new(3);
+
     // 攻撃されたときの反撃と、こちらの会話ではない会話の窓を閉じる
     private readonly DefenseWatch defense = new();
     private readonly ForeignTalk foreignTalk = new();
@@ -99,8 +103,10 @@ public sealed class JobQuestFlow : AutoTask
     protected override TaskResult OnStart(TaskContext ctx)
     {
         MarketBoardTask.SpentThisRun = 0;
+        MarketBoardTask.RunApprovedUpTo = Math.Max(0, ctx.Config.ConfirmRunTotalAboveGil);
         Unlocks.GaveUp.Clear();
         this.rounds = new RoundPolicy(ctx.Config.MaxRetryRounds + 2, ctx.Config.MaxRetryRounds + 4);
+        this.hqFailures = new HqFailureTally(ctx.Config.MaxRetryRounds);
         Unlocks.UnlockStagePassed = false;
         ctx.Data.EnsureBuilding();
         return TaskResult.Running;
@@ -108,11 +114,23 @@ public sealed class JobQuestFlow : AutoTask
 
     protected override TaskResult Tick(TaskContext ctx)
     {
-        // 攻撃されていれば反撃する（その間は次の作業を進めない）
-        if (this.defense.Tick(ctx, out var defenseStatus))
+        // 全体の終わりの条件は、反撃や会話の窓の処理より前に見る（以前は反撃の間に早く戻るため、
+        // 倒された・ログアウトしたことに流れが気づけなかった）
+        if (!Svc.ClientState.IsLoggedIn)
+            return this.Fail("ログアウトしました。自動動作を止めます");
+        if (Svc.Objects.LocalPlayer is { } me && me.IsDead)
+            return this.Fail("倒されました。自動動作を止めます");
+
+        // 攻撃されていれば反撃する（その間は次の作業を進めない。反撃を続けられなければ全体を止める）
+        switch (this.defense.Tick(ctx, out var defenseStatus))
         {
-            this.Status = defenseStatus;
-            return TaskResult.Running;
+            case DefenseWatch.Result.Failed:
+                return this.Fail($"反撃を続けられません：{defenseStatus}");
+            case DefenseWatch.Result.Defending:
+                // 子の作業を進めない間は、作業の上限の時間を止める（反撃そのものには別の上限がある）
+                WorkClock.Pause(defenseStatus);
+                this.Status = defenseStatus;
+                return TaskResult.Running;
         }
 
         // こちらの会話ではない会話の窓は、状況を確かめてから閉じる（その間は次の作業を進めない）。
@@ -124,6 +142,7 @@ public sealed class JobQuestFlow : AutoTask
                 case ForeignTalk.Result.Failed:
                     return this.Fail(talkStatus);
                 case ForeignTalk.Result.Busy:
+                    WorkClock.Pause(talkStatus);
                     this.Status = talkStatus;
                     return TaskResult.Running;
             }
@@ -132,6 +151,9 @@ public sealed class JobQuestFlow : AutoTask
         {
             this.foreignTalk.Reset();
         }
+
+        // 中断が終わった（子の作業を進める）
+        WorkClock.Resume();
 
         // 子の作業が動いていればそれを進める
         if (this.child != null)
@@ -177,6 +199,15 @@ public sealed class JobQuestFlow : AutoTask
                     return TaskResult.Running;
                 if (ans == false)
                     return this.Fail("事前点検の確認で「いいえ」が選ばれました");
+
+                // 結果の分からない購入の控えは、利用者が確かめたので消す（確かめる文言は事前点検の項目に出している）
+                if (ctx.Config.PendingPurchase is { } pending)
+                {
+                    ctx.Log.Warn("マーケット", $"前回の購入（{pending.Describe()}）は利用者が確かめたので、控えを消しました");
+                    ctx.Config.PendingPurchase = null;
+                    ctx.Config.Save();
+                }
+
                 this.stage = Stage.Unlock;
                 return TaskResult.Running;
             }
@@ -461,22 +492,20 @@ public sealed class JobQuestFlow : AutoTask
 
         var marketMateria = MateriaMarketNeeds(ctx.Config, plan);
 
-        // 採集・戦闘・NPC 購入で集めきれず、次の手段がマーケットになった品目は、買う前に利用者に確かめる
-        // （時間切れや拒否で、聞かずにギルを使う手段へ切り替えない）
-        // 精選で集めるはずだった品（霊砂など）が、精選を使えずマーケットに回る場合も同じく確かめる（霊砂は精選で得る）
+        // 本来の最初の手段がマーケットでない品目が、マーケットに回ったときは、買う前に利用者に確かめる
+        // （時間切れや拒否で、聞かずにギルを使う手段へ切り替えない。精選で集めるはずだった霊砂も同じ）。
+        // 誤ってギルを大量に使わないよう、前提が未達で採集・NPC 購入などが使えず
+        // マーケットに回る品（眼力が未解放の隠し採集物など）も、聞かずに買わない。以前は「前の周回で失敗した」か「精選の品」のときだけだった
         var sourcesIdx = ctx.Data.Sources!;
         var switched = raw
             .Where(r => r.Routes.Count > 0 && r.Routes[0] == Route.MarketBoard
-                        && ((this.excluded.TryGetValue(r.Item, out var bad) && bad.Count > 0) || sourcesIdx.Get(r.Item).CanReduce)
+                        && PlanBuilder.ChooseRoutes(sourcesIdx, r.Item).FirstOrDefault() != Route.MarketBoard
                         && !this.marketSwitchApproved.Contains(r.Item))
             .ToList();
         if (switched.Count > 0)
         {
             this.pendingSwitch = switched.Select(r => r.Item).ToList();
-            var lines = switched.Select(r =>
-                this.excluded.TryGetValue(r.Item, out var bad) && bad.Count > 0
-                    ? $"・{CraftPlanner.ItemName(r.Item)}×{r.Need}（{string.Join("・", bad.Select(Ui.MainWindow.RouteName))} で集めきれませんでした）"
-                    : $"・{CraftPlanner.ItemName(r.Item)}×{r.Need}（精選が使えません：{(Unlocks.IsUnlocked(Unlocks.Reduction) ? "元の収集品を採れる採集職のレベルが足りない" : "精選が未解放")}）");
+            var lines = switched.Select(r => $"・{CraftPlanner.ItemName(r.Item)}×{r.Need}（{this.WhyMarket(ctx, r.Item)}）");
             this.confirmTicket = ctx.Confirm.Ask(
                 "マーケット購入への切り替えの確認",
                 "次の素材は、予定の手段では集めきれませんでした。\n\n" + string.Join("\n", lines)
@@ -581,18 +610,16 @@ public sealed class JobQuestFlow : AutoTask
             steps.Add(_ => this.Track(new ReduceTask(reduceNeed)));
         }
 
-        // 5) 釣り（GBR に一任）。GBR が釣れない設定なら、別の手段に黙って切り替えずに止める
+        // 5) 釣り（GBR に一任）。GBR が釣れない設定なら、別の手段に黙って切り替えずに止める。
+        //    周回を始める前に、同意・AutoHook・GBR の UseAutoHook をそろって確かめる（作業の始めでももう一度確かめる）
         var fish = raw.Where(r => r.Routes[0] == Route.Fish).ToList();
         if (fish.Count > 0)
         {
-            var optIn = ctx.Gbr.ReadAutoGatherBool("FishDataCollection");
-            if (optIn != true)
+            var missing = RequiredCapabilities.Fishing(ctx.Gbr.ReadAutoGatherBool("FishDataCollection"), ctx.AutoHook.IsLoaded, ctx.Gbr.ReadAutoGatherBool("UseAutoHook"));
+            if (missing.Count > 0)
             {
                 return this.Fail(
-                    $"釣りで集める素材（{string.Join("、", fish.Select(f => $"{CraftPlanner.ItemName(f.Item)}×{f.Need}"))}）がありますが、"
-                    + (optIn == false
-                        ? "GBR の「Opt-in to fishing data collection」が OFF のため GBR は釣りをしません（こちらからは変えません）"
-                        : "GBR の「Opt-in to fishing data collection」の設定を読めませんでした（GBR の版が変わった可能性。記録の IPC 欄を見てください）"));
+                    $"釣りで集める素材（{string.Join("、", fish.Select(f => $"{CraftPlanner.ItemName(f.Item)}×{f.Need}"))}）がありますが、釣りを始められません：{string.Join(" / ", missing)}");
             }
 
             steps.Add(_ => this.Track(new GatherTask(
@@ -601,6 +628,22 @@ public sealed class JobQuestFlow : AutoTask
 
         this.child = new SequenceTask($"素材集め {this.rounds.AcquireRounds}周目", steps);
         return TaskResult.Running;
+    }
+
+    /// <summary>本来の手段ではなくマーケットに回った理由（確認窓の文言用）。</summary>
+    private string WhyMarket(TaskContext ctx, uint item)
+    {
+        if (this.excluded.TryGetValue(item, out var bad) && bad.Count > 0)
+            return $"{string.Join("・", bad.Select(Ui.MainWindow.RouteName))} で集めきれませんでした";
+
+        var sources = ctx.Data.Sources!;
+        var natural = PlanBuilder.ChooseRoutes(sources, item);
+        var blockers = PlanBuilder.RouteBlockers(sources.Get(item), natural, FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete, AreaAccess.UnlockedNow(), GatherAbilities.Usable);
+        if (blockers.Count > 0)
+            return string.Join(" / ", blockers.Select(b => $"{Ui.MainWindow.RouteName(b.Route)}は使えません：{b.Reason}"));
+        if (sources.Get(item).CanReduce)
+            return $"精選が使えません：{(Unlocks.IsUnlocked(Unlocks.Reduction) ? "元の収集品を採れる採集職のレベルが足りないか、収集品採集が使えない" : "精選が未解放")}";
+        return $"ほかの手段（{string.Join("・", natural.Where(r => r != Route.MarketBoard).Select(Ui.MainWindow.RouteName))}）が使えません";
     }
 
     // 使える入手手段（計画の表示と同じ判定：PlanBuilder.AvailableRoutes）。
@@ -880,7 +923,41 @@ public sealed class JobQuestFlow : AutoTask
             return null;
         }
 
-        return new CraftOneTask(c);
+        var task = new CraftOneTask(c);
+        this.craftTasks.Add(task);
+        return task;
+    }
+
+    /// <summary>
+    /// 製作の列が終わったら、HQ 指定の品が HQ にならなかった回数を品目ごとに数える。
+    /// 上限に届いた品があれば、何を見直せばよいか（必要な品・レシピ・装備の数値・Artisan の設定・NQ になった回数）を出して止める。
+    /// </summary>
+    private string? TallyHqFailures(TaskContext ctx)
+    {
+        string? stop = null;
+        foreach (var t in this.craftTasks.Where(t => t.Finished))
+        {
+            if (!this.hqFailures.Record(t.Craft.ItemId, t.Craft.WantHq, t.Expected, t.MadeHq))
+            {
+                if (t.Craft.WantHq && t.MadeHq < t.Expected)
+                    ctx.Log.Warn("製作", $"{CraftPlanner.ItemName(t.Craft.ItemId)} の HQ が足りません（{t.Made}個中 HQ {t.MadeHq}個。この品の HQ 失敗 {this.hqFailures.Count(t.Craft.ItemId)}/{this.hqFailures.Limit} 回）");
+                continue;
+            }
+
+            var job = t.Craft.ClassJobId;
+            var gear = GearCheck.ReadGearset(job);
+            var baseline = ctx.Data.GearBaselines?.GetValueOrDefault(job) ?? (0, 0);
+            var recipe = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Recipe>().TryGetRow(t.Craft.RecipeId, out var r) ? r : default;
+            stop ??= $"{CraftPlanner.ItemName(t.Craft.ItemId)}（HQ 指定）を {this.hqFailures.Count(t.Craft.ItemId)} 回作っても HQ が足りません"
+                     + $"（最後の回：{t.Made}個中 HQ {t.MadeHq}個、HQ が要る数 {t.Expected}個）。"
+                     + $"レシピ {t.Craft.RecipeId}（{Jobs.Name(job)}・レシピLv {recipe.RecipeLevelTable.RowId}）、"
+                     + $"{Jobs.Name(job)} の装備：作業精度 {gear.Craftsmanship}（基準 {baseline.Item1}）・加工精度 {gear.Control}（基準 {baseline.Item2}）、"
+                     + $"Artisan の簡易製作={Planning.Preflight.ReadArtisanBool("QuickSynthMode")?.ToString() ?? "読めない"}。"
+                     + "装備・食事・Artisan のソルバーの設定を見直してから、もう一度始めてください";
+        }
+
+        this.craftTasks.Clear();
+        return stop;
     }
 
     // ------------------------------------------------------------------
@@ -1009,6 +1086,12 @@ public sealed class JobQuestFlow : AutoTask
                 this.stage = Stage.Quests;
                 break;
 
+            case Stage.Craft:
+                // 同じ段で立て直す（足りない品があれば作り直し、残りが無ければ次へ）。その前に、HQ の失敗を品目ごとに数える
+                if (this.TallyHqFailures(ctx) is { } hqStop)
+                    return this.Fail(hqStop);
+                break;
+
             // Craft・Quests は同じ段で立て直す（足りない品があれば作り直し、残りが無ければ次へ）
         }
 
@@ -1017,6 +1100,9 @@ public sealed class JobQuestFlow : AutoTask
 
     public override void Cleanup(TaskContext ctx)
     {
+        // 中断の時計を止めたままにしない（次の実行の作業時間を狂わせない）
+        WorkClock.Resume();
+
         // 1つが例外で落ちても残りの後始末を必ず行う（以前は子の後始末が落ちると、
         // RSR・GBR・TextAdvance が頼んだままになった）。子は先に外しておく（2回後始末しない）
         var c = this.child;

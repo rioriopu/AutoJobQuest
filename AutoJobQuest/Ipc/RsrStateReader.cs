@@ -65,6 +65,52 @@ public static class RsrStateReader
     }
 
     /// <summary>
+    /// 今の範囲攻撃の設定（RSR の AoEType：Off=0, Cleave=1, Full=2）。読めなければ null。
+    /// RSR の設定は RotationSolver.Basic.Service.Config（Service は internal、Config は public static）の AoEType
+    /// （RSR の Basic/Service.cs・Configuration/Configs.cs・ConfigTypes.cs で確認）。読むだけで、書き換えは IPC で行う。
+    /// </summary>
+    public static byte? ReadAoeType()
+    {
+        try
+        {
+            var plugin = FindPluginInstance(InternalName);
+            if (plugin == null)
+            {
+                LastError = "RSR が読み込まれていません";
+                return null;
+            }
+
+            var alc = AssemblyLoadContext.GetLoadContext(plugin.GetType().Assembly);
+            var basic = alc?.Assemblies.FirstOrDefault(a => a.GetName().Name == "RotationSolver.Basic");
+            var service = basic?.GetType("RotationSolver.Basic.Service", throwOnError: false);
+            var config = service?.GetProperty("Config", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null);
+            var value = config?.GetType().GetProperty("AoEType", BindingFlags.Public | BindingFlags.Instance)?.GetValue(config);
+            if (value == null || !value.GetType().IsEnum)
+            {
+                LastError = "RSR の範囲攻撃の設定（Service.Config.AoEType）が見つかりません（RSR の版が変わった可能性）";
+                return null;
+            }
+
+            return Convert.ToByte(value, System.Globalization.CultureInfo.InvariantCulture);
+        }
+        catch (Exception ex)
+        {
+            LastError = $"RSR の範囲攻撃の設定を読めません: {ex.GetType().Name}: {ex.Message}";
+            Core.DebugLog.Current?.Line("IPC", LastError);
+            return null;
+        }
+    }
+
+    /// <summary>範囲攻撃の設定の名前（RSR の AoEType の名前。IPC の設定コマンドにもこの名前で渡す）。</summary>
+    public static string AoeName(byte value) => value switch
+    {
+        0 => "Off",
+        1 => "Cleave",
+        2 => "Full",
+        _ => $"不明({value})",
+    };
+
+    /// <summary>
     /// 6つの旗からモードを決める（RSR の UpdateState の裏返し）。Henched は IsManual も立つので、Manual より先に見る。
     /// </summary>
     public static byte ModeFromFlags(bool state, bool manual, bool targetOnly, bool autoDuty, bool henched, bool pvp)

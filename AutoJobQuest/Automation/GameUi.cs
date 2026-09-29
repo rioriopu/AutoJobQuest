@@ -46,13 +46,32 @@ public static unsafe class GameUi
     public static bool IsVisible(string name) => Addon(name) != null;
 
     /// <summary>ショップ・マーケットボード・会話の選択肢など、介入してはいけない画面が開いているか。</summary>
-    public static bool IsShopOrMarketOpen()
+    public static bool IsShopOrMarketOpen() => OpenBlockingAddon() != null;
+
+    /// <summary>開いている「介入してはいけない画面」の名前（最初の1つ。無ければ null）。</summary>
+    public static string? OpenBlockingAddon()
     {
         foreach (var n in ShopAddons)
             if (IsVisible(n))
-                return true;
-        return false;
+                return n;
+        return null;
     }
+
+    /// <summary>画面の名前を、利用者に分かる言葉にする（案内用）。</summary>
+    public static string WindowLabel(string addon) => addon switch
+    {
+        "SelectYesno" => "確認（はい／いいえ）",
+        "SelectString" or "SelectIconString" => "選択肢",
+        "InputNumeric" => "数の入力",
+        "Request" => "クエストの納品窓",
+        "ItemSearch" or "ItemSearchResult" or "ItemHistory" => "マーケットボード",
+        "RetainerSell" or "RetainerSellList" => "リテイナーの出品",
+        "Shop" or "FreeShop" => "ショップ",
+        "InclusionShop" or "ShopExchangeItem" or "ShopExchangeItemDialog" or "ShopExchangeCurrency" or "ShopExchangeCurrencyDialog" => "アイテム交換",
+        "GrandCompanyExchange" => "軍票の交換",
+        "CollectablesShop" => "収集品の納品",
+        _ => addon,
+    } + $"（{addon}）";
 
     /// <summary>
     /// アドオンのコールバックを撃つ（ECommons の Callback.Fire と同じ中身：AtkValue を並べて FireCallback）。
@@ -277,6 +296,76 @@ public static unsafe class GameUi
 
     /// <summary>空白（半角・全角）を除いて比べるための正規化。</summary>
     public static string Normalize(string s) => s.Replace(" ", string.Empty).Replace("　", string.Empty).Trim();
+
+    /// <summary>
+    /// 画面に出ている文字を全部集める（AtkValues の文字列と、文字のノード。部品の中も4段までたどる）。
+    /// 置き場所（番号）を決め打ちせずに「この画面にこの名前が出ているか」を確かめるのに使う。
+    /// 読めない値は飛ばす（ここは裏付け用で、読めなくても例外は出さない）。
+    /// </summary>
+    public static List<string> AllTexts(AtkUnitBase* addon)
+    {
+        var result = new List<string>();
+        if (addon == null)
+            return result;
+
+        try
+        {
+            for (var i = 0; i < addon->AtkValuesCount; i++)
+            {
+                var v = addon->AtkValues[i];
+                if ((v.Type & AtkValueType.TypeMask) is not (AtkValueType.String or AtkValueType.ConstString) || v.String.Value == null)
+                    continue;
+                var text = Dalamud.Memory.MemoryHelper.ReadSeStringNullTerminated((nint)v.String.Value).TextValue;
+                if (!string.IsNullOrEmpty(text))
+                    result.Add(text);
+            }
+        }
+        catch
+        {
+            // 読めない値は飛ばす
+        }
+
+        try
+        {
+            CollectNodeTexts(addon->UldManager.NodeList, addon->UldManager.NodeListCount, result, 0);
+        }
+        catch
+        {
+            // 同上
+        }
+
+        return result;
+    }
+
+    private static void CollectNodeTexts(AtkResNode** nodes, int count, List<string> result, int depth)
+    {
+        if (nodes == null || depth > 4)
+            return;
+
+        for (var i = 0; i < count; i++)
+        {
+            var node = nodes[i];
+            if (node == null)
+                continue;
+
+            if (node->Type == NodeType.Text)
+            {
+                var textNode = (AtkTextNode*)node;
+                var text = Dalamud.Game.Text.SeStringHandling.SeString.Parse(textNode->NodeText.AsSpan().ToArray()).TextValue;
+                if (!string.IsNullOrEmpty(text))
+                    result.Add(text);
+                continue;
+            }
+
+            // 部品（コンポーネント）のノードの中にも文字がある
+            if ((ushort)node->Type >= 1000)
+            {
+                var component = ((AtkComponentNode*)node)->Component;
+                if (component != null)
+                    CollectNodeTexts(component->UldManager.NodeList, component->UldManager.NodeListCount, result, depth + 1);
+            }
+        }
+    }
 
     /// <summary>
     /// SelectYesno の本文（表示される文字だけ）。開いていなければ null。

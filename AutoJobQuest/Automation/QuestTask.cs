@@ -166,6 +166,17 @@ public sealed unsafe class QuestTask : AutoTask
             if (!GameUi.PlayerFree())
                 return TaskResult.Running;
 
+            // 納品窓の入力はこちら（RequestFiller）が行う。TextAdvance が同じ窓に一覧の先頭を入れないよう、クエストの間は
+            // こちらが TextAdvance の外部制御を取り、納品窓の入力だけ切る（Questionable は他者が外部制御を
+            // 持っていれば取りに行かない。会話送り・受注・完了・報酬選びは Questionable と同じ設定で任せる）
+            if (!ctx.TextAdvance.TakeControlForTurnIn() && !this.textAdvanceWarned)
+            {
+                this.textAdvanceWarned = true;
+                ctx.Log.Warn("クエスト", ctx.TextAdvance.IsInExternalControl() == true
+                    ? "TextAdvance はほかのプラグインが外部制御しています（納品窓に TextAdvance が品を入れ、こちらの入力と取り合う可能性）"
+                    : "TextAdvance の外部制御を取れませんでした（納品窓の入力が取り合いになる可能性）");
+            }
+
             if (!ctx.Questionable.StartSingleQuest(this.quest.RowId))
                 return this.Fail("Questionable がこのクエストを始められませんでした（経路データが無い・受注条件を満たしていない等）");
 
@@ -174,6 +185,9 @@ public sealed unsafe class QuestTask : AutoTask
             this.NextPhase("Questionable が進めています");
             return TaskResult.Running;
         }
+
+        // 取った TextAdvance の外部制御がまだこちらのものか確かめる（外れていれば取り直す。3秒に1回）
+        ctx.TextAdvance.KeepControl();
 
         // マテリア装着待ちの手順に来たら、報告だけこちらで行う
         var stepData = ctx.Questionable.GetCurrentStepData();
@@ -200,7 +214,9 @@ public sealed unsafe class QuestTask : AutoTask
             if (++this.notRunningFrames >= 3)
             {
                 if (this.restarts++ >= 3)
-                    return this.Fail("Questionable が途中で止まりました（3回やり直しても進みません）");
+                    return this.Fail("Questionable が途中で止まりました（3回やり直しても進みません）。"
+                                     + "Questionable の優先リスト（Priority）や追跡中のクエストに、受注できる・受注中の別のクエストがあると、"
+                                     + "単体の進行がそちらへ移って止まることがあります。Questionable の画面で確かめてください");
 
                 ctx.Log.Warn("クエスト", "Questionable が止まったので、もう一度始めます");
                 this.started = false;
@@ -244,9 +260,11 @@ public sealed unsafe class QuestTask : AutoTask
 
         if (!GameUi.IsReady("Request", out var request))
         {
-            // 窓が閉じた。次に開く窓は新しい窓として扱う
+            // 窓が閉じた。次に開く窓は新しい窓として扱う。TextAdvance に任せていた納品窓の入力は、こちらへ戻す
             this.filler.Reset();
             this.foreignRequestLogged = false;
+            if (ctx.TextAdvance.RequestAllowed)
+                ctx.TextAdvance.AllowRequestFill(false);
             return null;
         }
 
@@ -279,7 +297,11 @@ public sealed unsafe class QuestTask : AutoTask
                 ctx.Log.Write("納品", detail);
                 break;
             case RequestFiller.Outcome.NotOurs:
+                // このクエストの間に開いた窓だが、こちらの納品物ではない品（クエスト専用アイテム等）を求めている。
+                // こちらは入れないので、この窓の間だけ TextAdvance に入力を任せる（任せないと誰も入れずに詰まる）
                 ctx.Log.Warn("納品", detail);
+                if (ctx.TextAdvance.OwnsControl && ctx.TextAdvance.AllowRequestFill(true))
+                    ctx.Log.Write("納品", "この納品窓はこちらで扱わない品なので、窓が閉じるまで TextAdvance に入力を任せます");
                 break;
             case RequestFiller.Outcome.Failed:
                 return detail;

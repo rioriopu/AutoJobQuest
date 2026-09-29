@@ -1,0 +1,117 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+
+namespace AutoJobQuest.Data;
+
+/// <summary>Questionable の経路の「Craft」手順1件。</summary>
+/// <param name="Sequence">クエストの段。</param>
+/// <param name="ItemId">作る品（無ければ null：在庫に関係なく Artisan の既製リストが動く）。</param>
+/// <param name="ItemCount">持っていれば飛ばす数。</param>
+/// <param name="Hq">HQ で数えるか（ItemQuality が HQ）。</param>
+/// <param name="SkipIfHeld">「持っていれば飛ばす」条件（StepIf.Item）が付いているか。</param>
+public sealed record QuestionableCraftStep(int Sequence, uint? ItemId, int ItemCount, bool Hq, bool SkipIfHeld);
+
+/// <summary>
+/// Questionable の経路データ（pluginConfigs\Questionable\PathData\bundle.zip）から、ジョブクエの「Craft」手順を読む
+/// （120本の Craft 手順は計174）。読むだけで、Questionable には何も頼まない。
+///
+/// Questionable の Craft 手順は、手順の最初に「持っていれば飛ばす」（StepIf.Item）を見て、所持数（所持品＋アーマリー、装備中は数えない）が
+/// ItemCount 以上なら Artisan を呼ばずに飛ばす。足りなければ Artisan の既製リスト（クエスト番号のリスト。在庫を見ない）を動かす
+/// （Questionable の SkipCondition.cs・Craft.cs）。そのため：
+///  ・納品物の Craft 手順は、こちらが先に作っておけば飛ばされる。
+///  ・中間素材の Craft 手順（調理 Lv5〜50 の食塩・小麦粉・重曹など）は、納品物を作るのに使い切ると残らず、既製リストが動いて
+///    追加製作（材料が無ければ Questionable が NPC から買い足す）になる。→ 計画で、その数も手元に残す。
+///  ・ItemId の無い Craft 手順（木工 Lv1〜25 の6本・調理 Lv53〜60 の4本）は、在庫に関係なく既製リストが動く。防げないので、
+///    始める前に名前を出して確かめてもらう（防げるとは言わない）。
+/// 経路データが読めないときは null（点検はせず、記録に残す）。
+/// </summary>
+public static class QuestionablePaths
+{
+    private static readonly object Gate = new();
+    private static string? loadedPath;
+    private static DateTime loadedStamp;
+    private static Dictionary<ushort, List<QuestionableCraftStep>> cache = [];
+    private static Dictionary<ushort, string> entries = [];
+
+    /// <summary>経路データの場所。</summary>
+    public static string BundlePath
+        => Path.Combine(Svc.PluginInterface.ConfigDirectory.Parent?.FullName ?? string.Empty, "Questionable", "PathData", "bundle.zip");
+
+    /// <summary>そのクエスト（Questionable の番号＝行 ID − 65536）の Craft 手順。経路データが読めない・経路が無ければ null。</summary>
+    public static IReadOnlyList<QuestionableCraftStep>? CraftSteps(ushort shortId) => CraftSteps(BundlePath, shortId);
+
+    /// <summary>上と同じ。経路データの場所を渡す（試験用）。</summary>
+    public static IReadOnlyList<QuestionableCraftStep>? CraftSteps(string bundlePath, ushort shortId)
+    {
+        lock (Gate)
+        {
+            try
+            {
+                if (!File.Exists(bundlePath))
+                    return null;
+
+                var stamp = File.GetLastWriteTimeUtc(bundlePath);
+                if (loadedPath != bundlePath || stamp != loadedStamp)
+                {
+                    using var zip = ZipFile.OpenRead(bundlePath);
+                    var map = new Dictionary<ushort, string>();
+                    foreach (var e in zip.Entries)
+                    {
+                        var m = Regex.Match(e.FullName, @"^QuestPaths/.*/(\d+)_[^/]*\.json$");
+                        if (m.Success && ushort.TryParse(m.Groups[1].Value, out var id) && !map.ContainsKey(id))
+                            map[id] = e.FullName;
+                    }
+
+                    entries = map;
+                    cache = [];
+                    loadedPath = bundlePath;
+                    loadedStamp = stamp;
+                }
+
+                if (cache.TryGetValue(shortId, out var cached))
+                    return cached;
+                if (!entries.TryGetValue(shortId, out var name))
+                    return null;
+
+                using var z = ZipFile.OpenRead(bundlePath);
+                using var stream = z.GetEntry(name)!.Open();
+                using var doc = JsonDocument.Parse(stream);
+                var list = new List<QuestionableCraftStep>();
+                if (doc.RootElement.TryGetProperty("QuestSequence", out var seqs))
+                {
+                    foreach (var seq in seqs.EnumerateArray())
+                    {
+                        var sequence = seq.TryGetProperty("Sequence", out var sv) && sv.ValueKind == JsonValueKind.Number ? sv.GetInt32() : -1;
+                        if (!seq.TryGetProperty("Steps", out var steps))
+                            continue;
+                        foreach (var st in steps.EnumerateArray())
+                        {
+                            if (!st.TryGetProperty("InteractionType", out var it) || it.GetString() != "Craft")
+                                continue;
+                            uint? item = st.TryGetProperty("ItemId", out var iv) && iv.ValueKind == JsonValueKind.Number ? iv.GetUInt32() : null;
+                            var count = st.TryGetProperty("ItemCount", out var cv) && cv.ValueKind == JsonValueKind.Number ? cv.GetInt32() : 0;
+                            var hq = st.TryGetProperty("ItemQuality", out var qv) && qv.ValueKind == JsonValueKind.String && qv.GetString() == "HQ";
+                            var skip = st.TryGetProperty("SkipConditions", out var sc) && sc.ValueKind == JsonValueKind.Object
+                                       && sc.TryGetProperty("StepIf", out var si) && si.ValueKind == JsonValueKind.Object
+                                       && si.TryGetProperty("Item", out var sitem) && sitem.ValueKind == JsonValueKind.Object;
+                            list.Add(new QuestionableCraftStep(sequence, item, count, hq, skip));
+                        }
+                    }
+                }
+
+                cache[shortId] = list;
+                return list;
+            }
+            catch (Exception ex)
+            {
+                Core.DebugLog.Current?.Line("データ", $"Questionable の経路データを読めませんでした（{ex.GetType().Name}: {ex.Message}）");
+                return null;
+            }
+        }
+    }
+}

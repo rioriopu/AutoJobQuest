@@ -13,7 +13,13 @@ namespace AutoJobQuest.Data;
 /// <param name="GatheringLevel">採集点のレベル。</param>
 /// <param name="Timed">時間限定の採集点にしか無いか。</param>
 /// <param name="Mining">採掘（true）か園芸（false）か。</param>
-public sealed record GatherSpot(uint Territory, int GatheringLevel, bool Timed, bool Mining);
+/// <param name="Hidden">隠し（HIDDEN）の品か（採集職の「眼力」が要る）。</param>
+public sealed record GatherSpot(uint Territory, int GatheringLevel, bool Timed, bool Mining, bool Hidden = false);
+
+/// <summary>その品を売るギルショップの1件（店の条件）。</summary>
+/// <param name="Quests">買うのに要るクエスト（店の GilShop.Quest と品の GilShopItem.QuestRequired。空なら条件なし）。</param>
+/// <param name="Unknown">確かめられない条件（アチーブメント）が付いているか（付いていれば、その店では買えないとみなす）。</param>
+public sealed record VendorOffer(uint[] Quests, bool Unknown);
 
 /// <summary>モンスターの出現位置1件。</summary>
 /// <param name="BNpcNameId">モンスターの名前 ID（BNpcName の行）。</param>
@@ -40,6 +46,12 @@ public sealed class ItemSources
 
     /// <summary>ギルショップで売っているか。</summary>
     public bool Vendor { get; set; }
+
+    /// <summary>
+    /// 売っているギルショップごとの条件（ゲームデータの調査：サンレモン・硬銀砂など11種は、売っている店すべてに
+    /// 友好部族クエストの条件が付いている。GBR は確かめないので、未完了なら NPC 購入の手段から外す）。
+    /// </summary>
+    public List<VendorOffer> VendorOffers { get; } = [];
 
     /// <summary>そのギルショップの値段（最安）。0 なら不明。</summary>
     public uint VendorPrice { get; set; }
@@ -125,6 +137,11 @@ public sealed class SourceIndex
                 var src = this.Get(r.SourceItemId);
                 if (!src.CanGather)
                     continue;
+
+                // GBR が精選するのは収集品だけ（収集品でない品はデータに載っていても精選の元にしない。
+                // 例：暁光の霊砂の元の候補に、収集品でないスペアミントが入っていた）
+                if (!Svc.Data.GetExcelSheet<Item>().TryGetRow(r.SourceItemId, out var srcItem) || !srcItem.IsCollectable)
+                    continue;
                 var dst = this.Get(r.ItemId);
                 if (!dst.ReducedFrom.Contains(r.SourceItemId))
                     dst.ReducedFrom.Add(r.SourceItemId);
@@ -182,65 +199,86 @@ public sealed class SourceIndex
         }
     }
 
+    /// <summary>
+    /// 採掘・園芸で採れる場所。
+    ///  ・採集点（GatheringPoint）ごとに、その点の種類（GatheringPointBase.Item）の品と、点ごとに追加される品
+    ///    （GatheringItemPoint：行＝採集品、子行＝採集点）の両方を拾う。以前は前者だけで、チタン鉱などの本当の採集点
+    ///    （低地ドラヴァニア・Lv55・隠し）が見えず、実体の無いエリアの点で「採れる」と数えていた。
+    ///  ・実在する野外のエリア（TerritoryType.TerritoryIntendedUse＝1）だけを使う。エリア 1 などの実体の無い採集点や、
+    ///    ディアデムなどの特別なエリアは除く（GBR もこれらを除いている）。
+    ///  ・隠し（GatheringItem.IsHidden）の品は、採集職の「眼力」が要る（AvailableRoutes で確かめる）。
+    ///  ・時間限定は採集点ごと（GatheringPointTransient）。
+    /// </summary>
     private void BuildGathering()
     {
         var transient = Svc.Data.GetExcelSheet<GatheringPointTransient>();
         var points = Svc.Data.GetExcelSheet<GatheringPoint>();
+        var bases = Svc.Data.GetExcelSheet<GatheringPointBase>();
         var gitems = Svc.Data.GetExcelSheet<GatheringItem>();
+        var terrs = Svc.Data.GetExcelSheet<TerritoryType>();
 
-        // GatheringPointBase ごとに「どのエリアにあるか」「全部の採集点が時間限定か」
-        var baseTerritories = new Dictionary<uint, HashSet<uint>>();
-        var baseTimed = new Dictionary<uint, bool>();
-        foreach (var p in points)
+        bool Timed(uint point)
+            => transient.TryGetRow(point, out var t)
+               && (t.GatheringRarePopTimeTable.RowId != 0 || (t.EphemeralStartTime != 65535 && t.EphemeralStartTime != t.EphemeralEndTime));
+
+        bool RealField(uint terr)
+            => terr > 1 && terrs.TryGetRow(terr, out var t) && t.TerritoryIntendedUse.RowId == 1;
+
+        // 点ごとに追加される品（GatheringItemPoint：行の番号＝GatheringItem、子行の GatheringPoint＝採集点）
+        var extra = new Dictionary<uint, List<uint>>();
+        foreach (var row in Svc.Data.GetSubrowExcelSheet<GatheringItemPoint>())
         {
-            var b = p.GatheringPointBase.RowId;
-            if (b == 0)
-                continue;
-
-            var timed = false;
-            if (transient.TryGetRow(p.RowId, out var t))
+            foreach (var sub in row)
             {
-                timed = t.GatheringRarePopTimeTable.RowId != 0
-                        || (t.EphemeralStartTime != 65535 && t.EphemeralStartTime != t.EphemeralEndTime);
-            }
-
-            baseTimed[b] = baseTimed.TryGetValue(b, out var prev) ? prev && timed : timed;
-
-            if (p.TerritoryType.RowId != 0)
-            {
-                if (!baseTerritories.TryGetValue(b, out var set))
-                    baseTerritories[b] = set = [];
-                set.Add(p.TerritoryType.RowId);
+                var point = sub.GatheringPoint.RowId;
+                if (point == 0)
+                    continue;
+                if (!extra.TryGetValue(point, out var list))
+                    extra[point] = list = [];
+                list.Add(sub.RowId);
             }
         }
 
-        foreach (var gb in Svc.Data.GetExcelSheet<GatheringPointBase>())
+        var skipped = 0;
+        foreach (var p in points)
         {
+            var baseId = p.GatheringPointBase.RowId;
+            if (baseId == 0 || !bases.TryGetRow(baseId, out var gb))
+                continue;
+
             // 0 採掘 / 1 砕岩 / 2 伐採 / 3 草刈り。それ以外（銛など）はここでは扱わない
             var type = gb.GatheringType.RowId;
             if (type > 3)
                 continue;
 
-            var mining = type <= 1;
-            var timed = baseTimed.GetValueOrDefault(gb.RowId, true);
-            var terrs = baseTerritories.GetValueOrDefault(gb.RowId);
-            if (terrs == null || terrs.Count == 0)
-                continue;
-
-            foreach (var gi in gb.Item)
+            var terr = p.TerritoryType.RowId;
+            if (!RealField(terr))
             {
-                if (gi.RowId == 0 || !gitems.TryGetRow(gi.RowId, out var g))
+                skipped++;
+                continue;
+            }
+
+            var mining = type <= 1;
+            var timed = Timed(p.RowId);
+            var gis = gb.Item.Select(x => x.RowId).Where(x => x != 0).Concat(extra.GetValueOrDefault(p.RowId) ?? []).Distinct();
+            foreach (var gi in gis)
+            {
+                if (!gitems.TryGetRow(gi, out var g))
                     continue;
 
                 var item = g.Item.RowId;
                 if (item == 0 || item >= 1_000_000)
                     continue;
 
+                var spot = new GatherSpot(terr, gb.GatheringLevel, timed, mining, g.IsHidden);
                 var s = this.Get(item);
-                foreach (var terr in terrs)
-                    s.Gather.Add(new GatherSpot(terr, gb.GatheringLevel, timed, mining));
+                if (!s.Gather.Contains(spot))
+                    s.Gather.Add(spot);
             }
         }
+
+        if (skipped > 0)
+            Core.DebugLog.Current?.Line("データ", $"採集点のうち、実在する野外のエリアでないもの {skipped} 件を除きました");
     }
 
     private void BuildFishing()
@@ -257,8 +295,10 @@ public sealed class SourceIndex
     private void BuildVendors()
     {
         var items = Svc.Data.GetExcelSheet<Item>();
+        var shops = Svc.Data.GetExcelSheet<GilShop>();
         foreach (var shop in Svc.Data.GetSubrowExcelSheet<GilShopItem>())
         {
+            var shopQuest = shops.TryGetRow(shop.RowId, out var gs) ? gs.Quest.RowId : 0;
             foreach (var row in shop)
             {
                 var id = row.Item.RowId;
@@ -267,6 +307,9 @@ public sealed class SourceIndex
 
                 var s = this.Get(id);
                 s.Vendor = true;
+                var quests = row.QuestRequired.Select(q => q.RowId).Append(shopQuest).Where(q => q != 0).Distinct().ToArray();
+                // StateRequired は普通の店の品の大半にも 100 が入っていて条件ではない（ゲームデータで数えた：12,617件）ので見ない
+                s.VendorOffers.Add(new VendorOffer(quests, row.AchievementRequired.RowId != 0));
                 if (items.TryGetRow(id, out var it) && it.PriceMid > 0 && (s.VendorPrice == 0 || it.PriceMid < s.VendorPrice))
                     s.VendorPrice = it.PriceMid;
             }

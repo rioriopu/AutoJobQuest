@@ -351,8 +351,9 @@ public sealed unsafe class MeldTask : AutoTask
         => FindInBags(itemId, hq, null, out _, out _);
 
     /// <summary>
-    /// カバンの中で対象の品を探す。<paramref name="slotCount"/> を渡したら、穴がまだ空いているものだけ
-    /// （穴が無い品には付けられない。禁断は扱わない）。
+    /// カバンの中で対象の品を探す。<paramref name="slotCount"/> を渡したら（付ける対象を選ぶとき）、**マテリアがまだ1つも付いていない**
+    /// 品だけ（穴が無い品には付けられない。禁断は扱わない）。以前は「穴がまだ空いている」だけを見ていたので、利用者のマテリア付きの品に
+    /// 足して付けうった（こちらが作った品にはマテリアが付いていない）。
     /// </summary>
     private static bool FindInBags(uint itemId, bool hq, byte? slotCount, out InventoryType type, out int slot)
     {
@@ -373,7 +374,7 @@ public sealed unsafe class MeldTask : AutoTask
                     continue;
                 if (hq && (s->Flags & InventoryItem.ItemFlags.HighQuality) == 0)
                     continue;
-                if (slotCount is { } n && (n == 0 || s->GetMateriaCount() >= n))
+                if (slotCount is { } n && (n == 0 || s->GetMateriaCount() != 0))
                     continue;
 
                 type = t;

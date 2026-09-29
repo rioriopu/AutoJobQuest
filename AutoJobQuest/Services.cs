@@ -106,6 +106,9 @@ public sealed class Services : IDisposable
 
     public void Tick()
     {
+        // 経路探索を「頼んだのと同じフレームで取り消さない」ためのフレームの番号（OwnPath）
+        Automation.OwnPath.Frame++;
+
         // GBR の一時変更（リスト・設定）が残っていれば、こちらが止まっていて GBR も止まっている間に戻す。
         // 戻せなかったとき（GBR が動いていた・読めなかった・例外）は10秒ごとにやり直す（控えが消えるまで）
         if (!this.Runner.IsRunning && DateTime.UtcNow >= this.nextLeftoverTry && Me.Available && this.Ctx.Gbr.HasLeftovers)
@@ -114,8 +117,9 @@ public sealed class Services : IDisposable
             this.Ctx.Gbr.RestoreIfIdle(this.Ctx.GatherBuddy.IsAutoGatherEnabled(), this.Ctx.Gbr.VendorIsBusy());
         }
 
-        // 前に RSR を Henched にしたまま戻せていなければ（読み込み直しなど）、実行していない間に戻す（10秒おきに試す）
-        if (!this.Runner.IsRunning && this.Config.RsrHenchedPending && DateTime.UtcNow >= this.nextRsrLeftoverTry && this.Ctx.Rotation.IsLoaded)
+        // 前に RSR を Henched にした・範囲攻撃を Off にしたまま、戻ったと確かめられていなければ（読み込み直し・戻す命令の失敗・
+        // 戻した直後）、実行していない間に確かめて、戻っていなければ戻す（10秒おきに試す）
+        if (!this.Runner.IsRunning && this.Ctx.Rotation.RestorePending && DateTime.UtcNow >= this.nextRsrLeftoverTry && this.Ctx.Rotation.IsLoaded)
         {
             this.nextRsrLeftoverTry = DateTime.UtcNow.AddSeconds(10);
             try

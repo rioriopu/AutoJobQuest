@@ -83,7 +83,12 @@ public static class TextMatch
 /// 確認窓（SelectYesno）に「はい」と答えてよいか（交換・秘伝書で同じ決まりを1か所にまとめた）。
 ///  ・撃った（使った）後に自分の操作で開いた確認であること
 ///  ・危ない語（捨て・売却・ログアウト等）を含まないこと
-///  ・そのうえで、本文に「この操作の確認」と言える語（と値段）があるか、撃ってから <see cref="FreshWindow"/> 以内のときだけ
+///  ・本文に「この操作の確認」と言える語（交換なら通貨名と値段、秘伝書なら本の名前）があること
+/// 以前は本文が想定と違っても、撃ってから10秒以内なら押していた（PressFresh）。
+/// 「操作の後に開いた」は時刻の前後にすぎず、その操作が開かせた証明にならない（交換・本の使用の直後に別の確認窓が開くと、
+/// 危ない語を含まないだけで押しえた）。いまは本文で分かるときだけ押し、分からない確認は押さずに止める（未知の文章は許可しない）。
+/// 交換の確認の文面はゲームデータの Addon#8894「〈品〉×〈数〉を／〈品〉×〈数〉と／交換しますか？」（通貨名と値段が入る）。
+/// 秘伝書を使うときの確認の文面は、ゲームデータの Addon・LogMessage に見当たらない（ふつうは出ないと見込む。実機で確かめる項目）。
 /// </summary>
 public static class ConfirmPolicy
 {
@@ -92,32 +97,28 @@ public static class ConfirmPolicy
         /// <summary>本文で、この操作の確認と分かった。「はい」と答える。</summary>
         PressByText,
 
-        /// <summary>本文は想定と違うが、撃った直後に自分の操作で開いた確認なので答える（本文は記録に残す）。</summary>
-        PressFresh,
-
-        /// <summary>自分の操作で開いた確認ではない。押さない。</summary>
+        /// <summary>自分の操作で開いた確認ではない。押さない（触らない）。</summary>
         NotOurs,
 
         /// <summary>危ない語を含む。押さない。</summary>
         Dangerous,
 
-        /// <summary>この操作の確認と判断できない。押さない。</summary>
+        /// <summary>本文がまだ読めない（空）。押さずに待つ。</summary>
+        Unreadable,
+
+        /// <summary>この操作の確認と判断できない。押さない（止める）。</summary>
         Unrecognized,
     }
-
-    /// <summary>本文が想定と違っても答えてよい、撃ってからの時間。</summary>
-    public static readonly TimeSpan FreshWindow = TimeSpan.FromSeconds(10);
 
     /// <summary>本文にこれが出ていたら、交換・使用の確認ではないとみなして押さない。</summary>
     public static readonly string[] DangerousWords = ["捨て", "破棄", "削除", "分解", "精製", "売却", "ログアウト", "タイトル", "トレード"];
 
     /// <param name="ownedSinceAction">撃った（使った）後に自分の操作で開いた確認か。</param>
     /// <param name="body">確認の本文。</param>
-    /// <param name="expectedWords">本文にあれば「この操作の確認」と言える語（全部含むこと。空なら本文では判断しない）。</param>
+    /// <param name="expectedWords">本文にあれば「この操作の確認」と言える語（全部含むこと。空なら本文で判断できない＝押さない）。</param>
     /// <param name="price">本文にあるべき値段（無ければ null）。</param>
-    /// <param name="sinceAction">撃ってからの時間。</param>
     /// <param name="dangerous">危ない語（Dangerous のとき）。</param>
-    public static Verdict Decide(bool ownedSinceAction, string body, IReadOnlyList<string> expectedWords, uint? price, TimeSpan sinceAction, out string? dangerous)
+    public static Verdict Decide(bool ownedSinceAction, string body, IReadOnlyList<string> expectedWords, uint? price, out string? dangerous)
     {
         dangerous = null;
         if (!ownedSinceAction)
@@ -127,18 +128,52 @@ public static class ConfirmPolicy
         if (dangerous != null)
             return Verdict.Dangerous;
 
+        if (string.IsNullOrWhiteSpace(body))
+            return Verdict.Unreadable;
+
         var byText = expectedWords.Count > 0
                      && expectedWords.All(w => w.Length > 0 && body.Contains(w, StringComparison.Ordinal))
                      && (price is not { } p || TextMatch.ContainsNumber(body, p));
-        if (byText)
-            return Verdict.PressByText;
-
-        return sinceAction <= FreshWindow ? Verdict.PressFresh : Verdict.Unrecognized;
+        return byText ? Verdict.PressByText : Verdict.Unrecognized;
     }
 
     /// <summary>本文に押してはいけない語があればその語、無ければ null。</summary>
     public static string? DangerousWord(string body)
         => DangerousWords.FirstOrDefault(w => body.Contains(w, StringComparison.Ordinal));
+
+    /// <summary>
+    /// 専用の確認画面（交換の ShopExchangeItemDialog など）で、画面の文字に交換する品の名前が出ているか
+    /// （専用ボタンも、読める範囲で品目を突き合わせる）。別の候補の品の名前だけが出ているなら取り違え。
+    /// 空白（半角・全角）は除いて比べる。
+    /// </summary>
+    /// <param name="texts">画面の文字（GameUi.AllTexts）。</param>
+    /// <param name="expected">交換する品の名前。</param>
+    /// <param name="others">ほかの候補の品の名前（取り違えの見分けに使う）。</param>
+    public static DialogMatch MatchDialog(IReadOnlyList<string> texts, string expected, IEnumerable<string> others)
+    {
+        static string N(string s) => s.Replace(" ", string.Empty).Replace("　", string.Empty);
+        var joined = N(string.Join("\n", texts));
+        if (joined.Length == 0)
+            return DialogMatch.Unreadable;
+        if (expected.Length > 0 && joined.Contains(N(expected), StringComparison.Ordinal))
+            return DialogMatch.Match;
+        return others.Any(o => o.Length > 0 && joined.Contains(N(o), StringComparison.Ordinal)) ? DialogMatch.Mismatch : DialogMatch.NotFound;
+    }
+
+    public enum DialogMatch
+    {
+        /// <summary>画面に交換する品の名前がある。</summary>
+        Match,
+
+        /// <summary>画面の文字がまだ読めない。</summary>
+        Unreadable,
+
+        /// <summary>画面の文字は読めたが、交換する品の名前が無い。</summary>
+        NotFound,
+
+        /// <summary>別の候補の品の名前が出ている（取り違え）。</summary>
+        Mismatch,
+    }
 }
 
 /// <summary>秘伝書のための紫貨と収集品の計算。</summary>
@@ -452,6 +487,34 @@ public static class DefensePolicy
     }
 }
 
+/// <summary>
+/// 外部の処理を始める直前に、要るものがそろっているか（計画を立て直した後や、途中でプラグインを外した・設定を変えた
+/// 場合にも、始める直前にもう一度確かめる。以前は釣りの同意だけを見ていて、AutoHook と GBR の UseAutoHook は開始時にしか見なかった）。
+/// 同意や他のプラグインの設定は、こちらからは変えない。足りなければ理由を返す（空ならそろっている）。
+/// </summary>
+public static class RequiredCapabilities
+{
+    /// <summary>釣り（GBR ＋ AutoHook）。</summary>
+    /// <param name="optIn">GBR の「Opt-in to fishing data collection」（読めなければ null）。</param>
+    /// <param name="autoHookLoaded">AutoHook が読み込まれているか。</param>
+    /// <param name="useAutoHook">GBR の UseAutoHook（読めなければ null）。</param>
+    public static List<string> Fishing(bool? optIn, bool autoHookLoaded, bool? useAutoHook)
+    {
+        var list = new List<string>();
+        if (optIn != true)
+            list.Add(optIn == false
+                ? "GBR の「Opt-in to fishing data collection」が OFF のため GBR は釣りをしません（釣果を外部へ送る同意なので、こちらからは変えません。GBR の設定画面の検索欄に「fishing data」と入れると項目が出ます）"
+                : "GBR の「Opt-in to fishing data collection」の設定を読めませんでした（GBR の版が変わった可能性。記録の IPC 欄を見てください）");
+        if (!autoHookLoaded)
+            list.Add("AutoHook が読み込まれていません（釣りに使います）");
+        if (useAutoHook != true)
+            list.Add(useAutoHook == false
+                ? "GBR の UseAutoHook が OFF のため釣りが始まりません"
+                : "GBR の UseAutoHook の設定を読めませんでした");
+        return list;
+    }
+}
+
 /// <summary>マーケットで送る直前の確認。</summary>
 public static class PurchaseGuard
 {
@@ -486,12 +549,53 @@ public static class PurchaseGuard
     /// <summary>確認で「はい」をもらった出品と同じで、同じ額以下か（取り直した一覧で確認をやり直さない条件）。</summary>
     public static bool IsApproved(ulong listingId, long total, ulong approvedListingId, long approvedTotal)
         => approvedListingId != 0 && listingId == approvedListingId && total <= approvedTotal;
+
+    /// <summary>
+    /// 買う前に利用者へ確かめる理由（無ければ空）。誤ってギルを大量に使わないための確認。
+    ///  1) 1回の購入額が基準を超える（基準 0 なら確かめない）。
+    ///  2) 単価が、最近の取引の単価の中央値の ratio 倍を超える（相場から外れた高値。ratio 0 か取引履歴が無ければ確かめない）。
+    ///  3) この実行の合計が、了承済みの額を超える（任意の上限。上限 0 なら確かめない）。
+    /// 1)・2) は出品ごとの了承（同じ出品・同じ額以下）で通す。3) は実行の合計なので、出品の了承では通さない。
+    /// </summary>
+    /// <param name="total">この出品の合計（手数料込み）。</param>
+    /// <param name="unitPrice">この出品の単価。</param>
+    /// <param name="perPurchaseLimit">1回の購入額の基準（0 なら確かめない）。</param>
+    /// <param name="listingApproved">この出品に了承をもらっているか（<see cref="IsApproved"/>）。</param>
+    /// <param name="marketUnit">最近の取引の単価の中央値（取引履歴が無ければ null）。</param>
+    /// <param name="ratio">相場の何倍を超えたら確かめるか（0 なら確かめない）。</param>
+    /// <param name="spentThisRun">この実行でマーケットに払った合計。</param>
+    /// <param name="runApprovedUpTo">この実行の合計を、いくらまで了承済みか（任意の上限を使わないなら 0）。</param>
+    public static List<string> ConfirmReasons(long total, uint unitPrice, long perPurchaseLimit, bool listingApproved,
+        double? marketUnit, double ratio, long spentThisRun, long runApprovedUpTo)
+    {
+        var reasons = new List<string>();
+        if (!listingApproved && perPurchaseLimit > 0 && total > perPurchaseLimit)
+            reasons.Add($"1回の購入額が {perPurchaseLimit:N0} ギルを超えています");
+        if (!listingApproved && ratio > 0 && marketUnit is { } m && m > 0 && unitPrice > m * ratio)
+            reasons.Add($"単価 {unitPrice:N0} ギルが、最近の取引の単価の中央値 {m:N0} ギルの {ratio:0.#} 倍を超えています（相場から外れた高値の可能性）");
+        if (runApprovedUpTo > 0 && spentThisRun + total > runApprovedUpTo)
+            reasons.Add($"この実行でマーケットに払う合計が {runApprovedUpTo:N0} ギルを超えます（これまで {spentThisRun:N0} ギル＋今回 {total:N0} ギル）");
+        return reasons;
+    }
+
+    /// <summary>取引履歴の単価の中央値（履歴が無ければ null）。</summary>
+    public static double? MedianUnitPrice(IReadOnlyCollection<uint> unitPrices)
+    {
+        if (unitPrices.Count == 0)
+            return null;
+        var sorted = unitPrices.OrderBy(x => x).ToList();
+        var mid = sorted.Count / 2;
+        return sorted.Count % 2 == 1 ? sorted[mid] : (sorted[mid - 1] + (double)sorted[mid]) / 2;
+    }
 }
 
 /// <summary>
 /// マーケットで購入の要求を送った後の判断（二重購入を防ぐ）。
-/// 成功は「ギルが減った AND 品が増えた」。どちらも変わらないまま 15 秒たったら買い直すが、
-/// サーバーから「買えた」の通知（Dalamud の IMarketBoard.ItemPurchased）が来ていれば、反映が遅れているだけなので買い直さずに待つ。
+/// 成功は「ギルが減った AND 品が増えた」。
+/// 【買い直すのは、はっきり断られたときだけ】通知が来ないことは「買えなかった」の証明にならない（通知の取りこぼし・反映の遅れでも
+/// 同じに見える）。以前は「15秒たっても何も変わらず通知も無い」を買い直しにしていたので、反映が遅いと1出品ぶん多く買いえた。
+/// いまは、ゲームが購入の応答で「断った」と返し（InfoProxyItemSearch.ProcessPurchaseResponse の errorMessageId が 0 でない）、
+/// しかも少し待ってもギルも所持も変わらないときだけ買い直す。それ以外で何も変わらないまま上限まで待ったら「分からない」として止める。
 /// </summary>
 public static class PurchaseOutcome
 {
@@ -503,17 +607,20 @@ public static class PurchaseOutcome
         /// <summary>待つ。</summary>
         Wait,
 
-        /// <summary>買えなかった（売り切れ・混雑等）。買い直してよい。</summary>
+        /// <summary>はっきり断られた（売り切れ等）。必要数を数え直してから買い直してよい。</summary>
         Retry,
 
         /// <summary>買えたかどうか分からない。二重に買わないよう止める。</summary>
         Unknown,
     }
 
-    /// <summary>何も変わらないとき、買い直すまで待つ時間。</summary>
+    /// <summary>片方だけ変わったとき、もう片方の反映を待つ時間。</summary>
     public static readonly TimeSpan RetryAfter = TimeSpan.FromSeconds(15);
 
-    /// <summary>「買えた」の通知が来たのに所持が変わらないとき、待つ上限。</summary>
+    /// <summary>断られたと返ってきたあと、ギルも所持も変わらないことを確かめる時間（反映の途中で買い直さない）。</summary>
+    public static readonly TimeSpan RejectSettle = TimeSpan.FromSeconds(3);
+
+    /// <summary>何も変わらないとき、待つ上限（過ぎたら「分からない」として止める）。</summary>
     public static readonly TimeSpan ConfirmedLimit = TimeSpan.FromSeconds(60);
 
     /// <param name="gilBefore">送る前のギル。</param>
@@ -521,23 +628,56 @@ public static class PurchaseOutcome
     /// <param name="countBefore">送る前の所持数。</param>
     /// <param name="count">いまの所持数。</param>
     /// <param name="serverConfirmed">送った後に、その品の「買えた」の通知が来たか。</param>
+    /// <param name="rejected">送った後に、その品の購入の応答で「断った」と返ってきたか。</param>
     /// <param name="waited">送ってからの時間。</param>
-    public static Verdict Decide(long gilBefore, long gil, int countBefore, int count, bool serverConfirmed, TimeSpan waited)
+    public static Verdict Decide(long gilBefore, long gil, int countBefore, int count, bool serverConfirmed, bool rejected, TimeSpan waited)
     {
         if (gil < gilBefore && count > countBefore)
             return Verdict.Bought;
-        if (waited < RetryAfter)
-            return Verdict.Wait;
 
-        // 片方だけ変わった＝買えたかどうか分からない
+        // 片方だけ変わった＝もう片方の反映を少し待つ。それでもそろわなければ、買えたかどうか分からない
         if (gil != gilBefore || count != countBefore)
-            return Verdict.Unknown;
+            return waited < RetryAfter ? Verdict.Wait : Verdict.Unknown;
 
-        // 買えた通知が来ている＝反映が遅れているだけ。待つ（上限を過ぎたら、買い直さずに止める）
-        if (serverConfirmed)
-            return waited < ConfirmedLimit ? Verdict.Wait : Verdict.Unknown;
+        // 何も変わっていない。はっきり断られていて（「買えた」の通知とは食い違っていない）、少し待っても変わらなければ買い直してよい
+        if (rejected && !serverConfirmed)
+            return waited < RejectSettle ? Verdict.Wait : Verdict.Retry;
 
-        return Verdict.Retry;
+        // 断られたと分からない（通知の有無にかかわらず）。上限まで待って、変わらなければ買い直さずに止める
+        return waited < ConfirmedLimit ? Verdict.Wait : Verdict.Unknown;
+    }
+}
+
+/// <summary>
+/// HQ 指定の品が HQ にならなかった回数を、品目ごとに数える（以前は製作の残り回数の合計だけで
+/// 「進まない周回」を数えていたので、ほかの品が進んでいる間は、同じ品の HQ 失敗の繰り返しが見えなかった）。
+/// 上限は設定の「HQ ができなかったとき何回まで作り直すか」（MaxRetryRounds）。
+/// </summary>
+public sealed class HqFailureTally
+{
+    private readonly Dictionary<uint, int> counts = [];
+
+    public HqFailureTally(int limit)
+    {
+        this.Limit = Math.Max(1, limit);
+    }
+
+    public int Limit { get; }
+
+    /// <summary>その品の HQ 失敗の回数。</summary>
+    public int Count(uint item) => this.counts.GetValueOrDefault(item);
+
+    /// <summary>1回の製作の結果を記録する。HQ が足りなかった回数が上限に届いたら true。</summary>
+    /// <param name="item">品。</param>
+    /// <param name="wantHq">HQ 指定か。</param>
+    /// <param name="expected">作るはずだった数。</param>
+    /// <param name="madeHq">HQ でできた数。</param>
+    public bool Record(uint item, bool wantHq, int expected, int madeHq)
+    {
+        if (!wantHq || madeHq >= expected)
+            return false;
+        var n = this.counts[item] = this.counts.GetValueOrDefault(item) + 1;
+        return n >= this.Limit;
     }
 }
 

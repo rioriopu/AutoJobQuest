@@ -50,14 +50,14 @@ public sealed class GoToInnTask : AutoTask
         if (InGridaniaInn() && GameUi.PlayerFree())
             return TaskResult.Done;
 
-        if (this.Elapsed > TimeSpan.FromMinutes(4))
+        // 上限は実際に作業できた時間で測る（反撃・会話の窓の処理と、他者の画面を待った時間は数えない）
+        if (this.WorkElapsed > TimeSpan.FromMinutes(4))
             return this.Fail("4分以内にグリダニアの宿屋へ入れませんでした");
+        if (this.WallElapsed > TimeSpan.FromMinutes(12) + WindowWaitLimit)
+            return this.Fail($"グリダニアの宿屋へ向かう途中で中断が続き、{this.WallElapsed.TotalMinutes:0}分たっても入れませんでした");
 
-        if (GameUi.IsShopOrMarketOpen())
-        {
-            this.Status = "ショップ等の画面が開いているので待っています";
-            return TaskResult.Running;
-        }
+        if (this.WaitForWindows(out var windowFail))
+            return windowFail != null ? this.Fail(windowFail) : TaskResult.Running;
 
         var busy = ctx.Lifestream.IsBusy();
         if (this.requested)
@@ -146,6 +146,18 @@ public sealed class CraftOneTask : AutoTask
 
     /// <summary>作れた数（完成品の増えた数）。</summary>
     public int Made { get; private set; }
+
+    /// <summary>HQ でできた数（HQ 指定の品の HQ 失敗を品目ごとに数えるため）。</summary>
+    public int MadeHq { get; private set; }
+
+    /// <summary>作るはずだった数。</summary>
+    public int Expected => this.expected;
+
+    /// <summary>作った品の計画。</summary>
+    public PlannedCraft Craft => this.craft;
+
+    /// <summary>終わりまで進んだか（HQ の数を数えてよいか）。</summary>
+    public bool Finished { get; private set; }
 
     protected override TaskResult OnStart(TaskContext ctx)
     {
@@ -236,6 +248,7 @@ public sealed class CraftOneTask : AutoTask
         var inv = Inventory.Snapshot();
         this.Made = this.CountMade(inv) - this.beforeAll;
         var madeHq = inv.CountHq(this.craft.ItemId) - this.beforeHq;
+        this.MadeHq = madeHq;
 
         // 減った AND 増えた（完成品の数だけでは、手持ちの移動などを製作と取り違える）
         var used = this.ingredientsBefore.Where(kv => inv.CountAll(kv.Key) < kv.Value)
@@ -259,6 +272,7 @@ public sealed class CraftOneTask : AutoTask
         else
             ctx.Log.Write("製作", $"{CraftPlanner.ItemName(this.craft.ItemId)}: {this.Made}個");
 
+        this.Finished = true;
         return TaskResult.Done;
     }
 

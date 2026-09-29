@@ -57,6 +57,12 @@ public sealed class TaskContext
     /// </summary>
     public bool InOwnConversation { get; set; }
 
+    /// <summary>
+    /// 自分（AutoJobQuest）が頼んだ移動の控え（反撃を始めたとき、自分の移動だけを止めるため）。
+    /// 移動の作業（MoveToTask）が頼んだときに書き、終わったら消す。
+    /// </summary>
+    public Automation.OwnMovement OwnMove { get; } = new();
+
     /// <summary>マーケットの検索結果（件数）の通知。</summary>
     public required Automation.MarketBoardWatcher MarketWatcher { get; init; }
 

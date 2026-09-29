@@ -20,8 +20,19 @@ namespace AutoJobQuest.Ipc;
 /// 【優先リスト】メモリ上だけのリストで保存されない（RSR の再読み込みで消える）。Add は重複を確かめずに足し、
 /// Remove は1件だけ消す。→ こちらで足した ID を覚えておき、足した回数だけ消す（<see cref="ClearOwnPriorities"/>）。
 /// 動作停止後、または次のモンスターを殴った時、過去に指定したモンスターの設定は消す。
+/// なお Henched では優先リストは狙う相手に効かない（RSR の ObjectHelper.cs：「攻撃してよいか」の判定で、IsHenched なら
+/// どのみち真になる。狙う相手はハードターゲットだけ）。害は無いので、上のとおり足して消す。
+///
+/// 【範囲攻撃】Henched でも範囲攻撃は指定外の敵を巻き込み、自分中心の範囲攻撃はハードターゲットが無くても近くの敵に撃つ
+/// （RSR の ActionTargetInfo.cs。確実に止まるのは設定 AoEType=Off だけ）。対象モンスター以外は
+/// 攻撃しないため、Henched にしている間だけ AoEType を Off にし、使い終わったら元の値へ戻す（<see cref="RsrAoe"/>）。
+/// 変更は IPC の OtherCommand(Settings, "AoEType Off")（RSR の RSCommands_OtherCommand.cs の DoSettingCommand。メモリ上の値だけを変え、
+/// 保存は RSR の設定画面を閉じたときと終了時）。今の値を読む IPC は無いので、モードと同じく内部を読む（RsrStateReader.ReadAoeType）。
+///
+/// 【戻したかを確かめる】戻す命令が通っただけでは控えを消さない。実行していない間に実際の値を読み、
+/// 使う前の値になっていれば控えを消す（<see cref="RestoreLeftover"/>）。戻す命令が失敗したときも、控えを残して10秒おきにやり直す。
 /// </summary>
-public sealed class RotationSolverIpc : IpcGate
+public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
 {
     public override string InternalName => "RotationSolver";
 
@@ -47,6 +58,119 @@ public sealed class RotationSolverIpc : IpcGate
     public bool ChangeOperatingMode(byte mode)
         => this.TraceThen($"ChangeOperatingMode({mode})") && this.TryAction("ChangeOperatingMode",
             () => this.Func<byte, object>(Prefix + "ChangeOperatingMode").InvokeAction(mode));
+
+    /// <summary>
+    /// 範囲攻撃の設定を変える（RSR の OtherCommand(OtherCommandType.Settings=0, "AoEType 値")。
+    /// OtherCommandType は byte の列挙で、Settings が先頭＝0：RSR の Basic/Data/RSCommandType.cs で確認）。
+    /// </summary>
+    public bool SetAoeType(byte value)
+        => this.TraceThen($"OtherCommand(Settings, AoEType {RsrStateReader.AoeName(value)})") && this.TryAction("OtherCommand",
+            () => this.Func<byte, string, object>(Prefix + "OtherCommand").InvokeAction(0, $"AoEType {RsrStateReader.AoeName(value)}"));
+
+    // 範囲攻撃をこちらが Off にしているか・使う前の値・入れ直した回数・最後に確かめた時刻
+    private bool aoeTakenByMe;
+    private byte? aoeOriginal;
+    private int aoeResends;
+    private bool aoeWarned;
+    private DateTime lastAoeCheck = DateTime.MinValue;
+
+    /// <summary>範囲攻撃を Off にできなかったときの理由（記録・画面用。問題なければ null）。</summary>
+    public string? AoeProblem { get; private set; }
+
+    /// <summary>
+    /// Henched の間、範囲攻撃を Off にしておく（3秒に1回だけ確かめる。内部を読むのが重いため）。
+    /// 読めない・入れても Off にならないときは、止めずに記録と警告だけ出す（範囲攻撃で指定外の敵を巻き込む可能性が残る）。
+    /// </summary>
+    private void EnsureAoeOff()
+    {
+        if (DateTime.UtcNow - this.lastAoeCheck < HenchedTracker.ResendInterval)
+            return;
+        this.lastAoeCheck = DateTime.UtcNow;
+
+        var current = RsrStateReader.ReadAoeType();
+        var pending = this.store?.RsrAoePending == true;
+        var d = RsrAoe.Take(current, this.aoeTakenByMe, this.aoeResends, pending, this.store?.RsrAoeOriginal);
+        switch (d.Action)
+        {
+            case RsrAoe.TakeAction.Nothing:
+                return;
+
+            case RsrAoe.TakeAction.Adopt:
+                // 前回こちらが Off にしたまま残っている（読み込み直しなど）。控えの値を使う前の値として引き継ぐ
+                this.aoeTakenByMe = true;
+                this.aoeOriginal = d.Original;
+                Core.DebugLog.Current?.Line("IPC", $"前回こちらが Off にした範囲攻撃が残っています。使い終わったら {RsrStateReader.AoeName(d.Original ?? RsrAoe.Full)} に戻します");
+                return;
+
+            case RsrAoe.TakeAction.Warn:
+                this.AoeProblem = current == null
+                    ? $"RSR の範囲攻撃の設定を読めません（{RsrStateReader.LastError}）。範囲攻撃で指定外の敵を巻き込む可能性があります"
+                    : $"RSR の範囲攻撃を Off にしても {RsrStateReader.AoeName(current.Value)} に戻ります（利用者か RSR が変えた可能性）。範囲攻撃で指定外の敵を巻き込む可能性があります";
+                if (!this.aoeWarned)
+                {
+                    this.aoeWarned = true;
+                    Core.DebugLog.Current?.Line("IPC", $"⚠ {this.AoeProblem}");
+                    Svc.Chat.Print($"[AutoJobQuest] {this.AoeProblem}");
+                }
+
+                return;
+
+            case RsrAoe.TakeAction.SendOff:
+                if (!this.aoeTakenByMe)
+                {
+                    this.aoeOriginal = d.Original;
+                    this.aoeTakenByMe = true;
+                    this.SaveAoe(true, d.Original);
+                    Core.DebugLog.Current?.Line("IPC", $"RSR の範囲攻撃を戦闘の間だけ Off にします（使う前は {RsrStateReader.AoeName(d.Original ?? RsrAoe.Full)}。使い終わったら戻します）");
+                }
+                else
+                {
+                    this.aoeResends++;
+                }
+
+                if (!this.SetAoeType(RsrAoe.Off))
+                    Core.DebugLog.Current?.Line("IPC", "RSR の範囲攻撃を Off にする命令を送れませんでした（次に確かめるときにやり直します）");
+                return;
+        }
+    }
+
+    /// <summary>範囲攻撃を使う前の値へ戻す（こちらが Off にしていたときだけ。利用者が変えていたら戻さない）。</summary>
+    private void ReleaseAoe()
+    {
+        if (!this.aoeTakenByMe)
+            return;
+
+        var current = RsrStateReader.ReadAoeType();
+        var original = this.aoeOriginal;
+        this.aoeTakenByMe = false;
+        this.aoeOriginal = null;
+        this.aoeResends = 0;
+        this.aoeWarned = false;
+        this.AoeProblem = null;
+        this.lastAoeCheck = DateTime.MinValue;
+
+        if (RsrAoe.Restore(current, original) is not { } back)
+        {
+            Core.DebugLog.Current?.Line("IPC", $"RSR の範囲攻撃はもう {RsrStateReader.AoeName(current!.Value)} になっている（利用者が変えた）ので、戻しません");
+            this.SaveAoe(false, null);
+            return;
+        }
+
+        // 送れても、控えは戻ったと確かめるまで残す（RestoreLeftover が確かめる）
+        if (this.SetAoeType(back))
+            Core.DebugLog.Current?.Line("IPC", $"RSR の範囲攻撃を {RsrStateReader.AoeName(back)} に戻しました（戻ったかは後で確かめます）");
+        else
+            Core.DebugLog.Current?.Line("IPC", $"⚠ RSR の範囲攻撃を {RsrStateReader.AoeName(back)} に戻す命令を送れませんでした（控えを残し、実行していない間にやり直します）");
+    }
+
+    private void SaveAoe(bool pending, byte? original)
+    {
+        if (this.store == null || (this.store.RsrAoePending == pending && this.store.RsrAoeOriginal == original))
+            return;
+        this.store.RsrAoePending = pending;
+        this.store.RsrAoeOriginal = original;
+        this.store.Save();
+    }
 
     // Henched の応答の数え方（IPC を呼ばない部分。HenchedTracker）
     private readonly HenchedTracker tracker = new();
@@ -106,7 +230,11 @@ public sealed class RotationSolverIpc : IpcGate
         var firstTake = !this.tracker.HenchedByMe;
         var action = this.tracker.Decide(active, DateTime.UtcNow);
         if (action != HenchedTracker.Action.Send)
+        {
+            if (this.tracker.HenchedByMe)
+                this.EnsureAoeOff();
             return true; // 応答あり、または送った直後の反映待ち
+        }
 
         if (firstTake)
         {
@@ -130,67 +258,119 @@ public sealed class RotationSolverIpc : IpcGate
         this.tracker.Sent(DateTime.UtcNow);
         if (firstTake)
             this.SaveStore(true, this.originalMode);
+        this.EnsureAoeOff();
         return true;
     }
 
     /// <summary>
     /// こちらが Henched にしていたときだけ、使う前のモードに戻す（使う前が Off か、読めなかったなら Off）。
-    /// 利用者が使っていた RSR を勝手に止めない・勝手にモードを変えたままにしないため。
+    /// 利用者が使っていた RSR を勝手に止めない・勝手にモードを変えたままにしないため。範囲攻撃の設定も戻す。
+    /// 戻す命令が通っても、控え（設定ファイル）は戻ったと確かめるまで残す（確かめるのは <see cref="RestoreLeftover"/>）。
+    /// 命令が失敗しても「こちらが使っている」印は外す（同じ読み込みの中でも、実行していない間に控えからやり直せるように。
+    /// 以前は印が残ったため、RestoreLeftover が「使っている最中」とみなして何もしなかった）。
     /// </summary>
     public void ReleaseHenched()
     {
         if (!this.tracker.HenchedByMe)
+        {
+            this.ReleaseAoe();
             return;
+        }
 
         // 戻すのは、いまも Henched のときだけ（こちらが使っている間に利用者が別のモードにしたなら、そのままにする）。
         // いまのモードが読めなければ、今までどおり使う前のモードに戻す
         var current = RsrStateReader.ReadMode();
-        if (RsrRestore.Decide(current, this.originalMode) is not { } back)
+        var original = this.originalMode;
+        this.tracker.Released();
+        this.originalMode = null;
+        this.modeMismatch = false;
+
+        if (RsrRestore.Decide(current, original) is not { } back)
         {
             Core.DebugLog.Current?.Line("IPC", $"RSR はもう {RsrStateReader.ModeName(current!.Value)} になっている（利用者か RSR が切り替えた）ので、モードは戻しません");
-            this.tracker.Released();
-            this.originalMode = null;
-            this.modeMismatch = false;
             this.SaveStore(false, null);
+            this.ReleaseAoe();
             return;
         }
 
         if (this.ChangeOperatingMode(back))
-        {
-            Core.DebugLog.Current?.Line("IPC", $"RSR を {RsrStateReader.ModeName(back)} に戻しました{(this.originalMode == null ? "（使う前のモードが読めなかったため Off）" : string.Empty)}");
-            this.tracker.Released();
-            this.originalMode = null;
-            this.modeMismatch = false;
-            this.SaveStore(false, null);
-        }
+            Core.DebugLog.Current?.Line("IPC", $"RSR を {RsrStateReader.ModeName(back)} に戻しました{(original == null ? "（使う前のモードが読めなかったため Off）" : string.Empty)}。戻ったかは後で確かめます");
+        else
+            Core.DebugLog.Current?.Line("IPC", $"⚠ RSR を {RsrStateReader.ModeName(back)} に戻す命令を送れませんでした（控えを残し、実行していない間に10秒おきにやり直します）");
+
+        this.ReleaseAoe();
     }
 
     /// <summary>
-    /// 前に Henched にしたまま戻せていない控えがあれば戻す（実行していない間に、プラグインの側から呼ぶ）。
-    /// いまも Henched なら控えのモードへ戻し、もう別のモード（利用者か RSR が切り替えた）なら控えを消すだけ。
-    /// 戻したとき・控えを消したときは、その説明を返す。何もしなければ null。
+    /// 戻したかを確かめ、戻っていなければ戻す（実行していない間に、プラグインの側から10秒おきに呼ぶ）。
+    ///  ・モード：いまが使う前のモードなら控えを消す（戻ったと確かめた）。いまも Henched なら戻す命令を送り直す。
+    ///    それ以外のモード（利用者か RSR が切り替えた）なら、上書きせずに控えを消す。
+    ///  ・範囲攻撃：いまが使う前の値なら控えを消す。いまも Off なら戻す命令を送り直す。それ以外なら控えを消す。
+    /// 利用者に知らせることがあれば、その説明を返す（戻ったと確かめただけのときは記録にだけ残して null）。
     /// </summary>
     public string? RestoreLeftover()
     {
-        if (this.store?.RsrHenchedPending != true || this.tracker.HenchedByMe)
+        if (this.store == null || this.tracker.HenchedByMe || this.aoeTakenByMe)
             return null;
 
-        var current = RsrStateReader.ReadMode();
-        if (current == null)
-            return null; // 読めるようになってから決める（RSR の読み込み直後など）
-
-        if (RsrRestore.Decide(current, this.store.RsrOriginalMode) is not { } back)
+        var notes = new List<string>();
+        if (this.store.RsrHenchedPending)
         {
-            this.SaveStore(false, null);
-            return $"前回こちらが入れた RSR の Henched は、もう {RsrStateReader.ModeName(current.Value)} に変わっていたので、控えを消しました（モードは変えていません）";
+            var current = RsrStateReader.ReadMode();
+            var original = this.store.RsrOriginalMode;
+            switch (RsrRestore.Verify(current, original))
+            {
+                case RsrRestore.VerifyResult.Unknown:
+                    break; // 読めるようになってから決める（RSR の読み込み直後など）
+                case RsrRestore.VerifyResult.Restored:
+                    this.SaveStore(false, null);
+                    Core.DebugLog.Current?.Line("IPC", $"RSR が使う前のモード（{RsrStateReader.ModeName(current!.Value)}）に戻ったことを確かめました");
+                    break;
+                case RsrRestore.VerifyResult.UserChanged:
+                    this.SaveStore(false, null);
+                    notes.Add($"前回こちらが入れた RSR の Henched は、もう {RsrStateReader.ModeName(current!.Value)} に変わっていたので、控えを消しました（モードは変えていません）");
+                    break;
+                case RsrRestore.VerifyResult.Resend:
+                {
+                    var back = original ?? ModeOff;
+                    if (this.ChangeOperatingMode(back))
+                        notes.Add($"前回戻せなかった RSR のモードを {RsrStateReader.ModeName(back)} に戻しました（戻ったかは次に確かめます）");
+                    break;
+                }
+            }
         }
 
-        if (!this.ChangeOperatingMode(back))
-            return null; // 次の機会にやり直す
+        if (this.store.RsrAoePending)
+        {
+            var current = RsrStateReader.ReadAoeType();
+            var original = this.store.RsrAoeOriginal;
+            switch (RsrAoe.Verify(current, original))
+            {
+                case RsrRestore.VerifyResult.Unknown:
+                    break;
+                case RsrRestore.VerifyResult.Restored:
+                    this.SaveAoe(false, null);
+                    Core.DebugLog.Current?.Line("IPC", $"RSR の範囲攻撃が使う前の値（{RsrStateReader.AoeName(current!.Value)}）に戻ったことを確かめました");
+                    break;
+                case RsrRestore.VerifyResult.UserChanged:
+                    this.SaveAoe(false, null);
+                    notes.Add($"前回こちらが Off にした RSR の範囲攻撃は、もう {RsrStateReader.AoeName(current!.Value)} に変わっていたので、控えを消しました");
+                    break;
+                case RsrRestore.VerifyResult.Resend:
+                {
+                    var back = original ?? RsrAoe.Full;
+                    if (this.SetAoeType(back))
+                        notes.Add($"前回戻せなかった RSR の範囲攻撃を {RsrStateReader.AoeName(back)} に戻しました（戻ったかは次に確かめます）");
+                    break;
+                }
+            }
+        }
 
-        this.SaveStore(false, null);
-        return $"前回戻せなかった RSR のモードを {RsrStateReader.ModeName(back)} に戻しました";
+        return notes.Count > 0 ? string.Join(" / ", notes) : null;
     }
+
+    /// <summary>戻したかを確かめる控えが残っているか（画面・事前点検用）。</summary>
+    public bool RestorePending => this.store?.RsrHenchedPending == true || this.store?.RsrAoePending == true;
 
     private void SaveStore(bool pending, byte? original)
     {
@@ -262,6 +442,110 @@ public static class RsrRestore
     /// <param name="pendingOriginal">控えの、使う前のモード。</param>
     public static byte? OriginalForNewTake(byte? current, bool hasPending, byte? pendingOriginal)
         => hasPending && current is null or RotationSolverIpc.ModeHenched ? pendingOriginal : current;
+
+    /// <summary>戻したかを確かめた結果。</summary>
+    public enum VerifyResult
+    {
+        /// <summary>いまの値が読めない（決めずに次に回す）。</summary>
+        Unknown,
+
+        /// <summary>使う前の値に戻っている（控えを消す）。</summary>
+        Restored,
+
+        /// <summary>まだこちらの値のまま（戻す命令を送り直す）。</summary>
+        Resend,
+
+        /// <summary>別の値になっている＝利用者か相手が変えた（上書きせずに控えを消す）。</summary>
+        UserChanged,
+    }
+
+    /// <summary>
+    /// 戻したかを確かめる（命令が通っただけでは戻ったことにしない）。
+    /// 使う前が Henched だった（利用者が Henched で使っていた）ときは、Henched のままが「戻った」（必ず Off にはしない）。
+    /// </summary>
+    /// <param name="current">いまのモード（読めなければ null）。</param>
+    /// <param name="original">使う前のモード（読めなかったなら null＝Off に戻したはず）。</param>
+    public static VerifyResult Verify(byte? current, byte? original)
+    {
+        if (current is not { } c)
+            return VerifyResult.Unknown;
+        if (c == (original ?? RotationSolverIpc.ModeOff))
+            return VerifyResult.Restored;
+        return c == RotationSolverIpc.ModeHenched ? VerifyResult.Resend : VerifyResult.UserChanged;
+    }
+}
+
+/// <summary>
+/// RSR の範囲攻撃（AoEType）を戦闘の間だけ Off にする決まり（IPC を呼ばない部分。ゲームを起動せずに試せるように分けた）。
+/// 値は RSR の AoEType：Off=0, Cleave=1, Full=2（RSR の Configuration/ConfigTypes.cs で確認）。
+/// </summary>
+public static class RsrAoe
+{
+    public const byte Off = 0;
+    public const byte Full = 2;
+
+    /// <summary>何回入れ直しても Off にならなければ、入れ直しをやめて警告する。</summary>
+    public const int ResendLimit = 3;
+
+    public enum TakeAction
+    {
+        /// <summary>何もしない（もう Off・利用者が自分で Off にしている等）。</summary>
+        Nothing,
+
+        /// <summary>Off にする命令を送る（初めて・または入れ直し）。</summary>
+        SendOff,
+
+        /// <summary>前回こちらが Off にしたまま残っている。控えの値を使う前の値として引き継ぐ。</summary>
+        Adopt,
+
+        /// <summary>読めない・入れ直しても Off にならない。止めずに警告する。</summary>
+        Warn,
+    }
+
+    /// <summary>Off にするかの判断。</summary>
+    /// <param name="current">いまの値（読めなければ null）。</param>
+    /// <param name="takenByMe">こちらが Off にしているか。</param>
+    /// <param name="resends">入れ直した回数。</param>
+    /// <param name="hasPending">前回こちらが Off にしたままの控えがあるか。</param>
+    /// <param name="pendingOriginal">控えの、使う前の値。</param>
+    public static (TakeAction Action, byte? Original) Take(byte? current, bool takenByMe, int resends, bool hasPending, byte? pendingOriginal)
+    {
+        if (current is not { } c)
+            return (TakeAction.Warn, null);
+
+        if (c == Off)
+        {
+            // こちらが Off にしている／利用者が自分で Off にしている＝そのまま。前回の控えが残っていれば引き継ぐ
+            if (!takenByMe && hasPending)
+                return (TakeAction.Adopt, pendingOriginal);
+            return (TakeAction.Nothing, null);
+        }
+
+        // Off ではない。初めてなら今の値を使う前の値として覚えて Off にする（前回の控えがあっても、Off でないなら
+        // 利用者が戻したということなので、今の値が使う前の値）
+        if (!takenByMe)
+            return (TakeAction.SendOff, c);
+
+        // こちらが Off にしたのに Off でない：入れ直す（上限まで）
+        return resends < ResendLimit ? (TakeAction.SendOff, null) : (TakeAction.Warn, null);
+    }
+
+    /// <summary>
+    /// 戻す値。戻さないなら null。いまの値が読めて Off でない（利用者が変えた）なら戻さない。
+    /// いまも Off か読めないなら、使う前の値（分からなければ Full＝RSR の既定値）へ戻す。
+    /// </summary>
+    public static byte? Restore(byte? current, byte? original)
+        => current is { } c && c != Off ? null : original ?? Full;
+
+    /// <summary>戻したかを確かめる（使う前の値なら戻った。まだ Off なら送り直す。それ以外は利用者が変えた）。</summary>
+    public static RsrRestore.VerifyResult Verify(byte? current, byte? original)
+    {
+        if (current is not { } c)
+            return RsrRestore.VerifyResult.Unknown;
+        if (c == (original ?? Full))
+            return RsrRestore.VerifyResult.Restored;
+        return c == Off ? RsrRestore.VerifyResult.Resend : RsrRestore.VerifyResult.UserChanged;
+    }
 }
 
 /// <summary>

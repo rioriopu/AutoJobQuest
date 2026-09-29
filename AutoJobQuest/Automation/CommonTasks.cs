@@ -16,6 +16,8 @@ namespace AutoJobQuest.Automation;
 ///  ・ナビメッシュが読み込み中なら待つ。自動読み込みが OFF で構築が始まらないなら読み込みを頼む。
 ///  ・vnavmesh は経路が引けなくても例外を出さず止まるだけなので、距離で到着を確かめ、止まったら数回やり直す。
 ///  ・遠ければマウントに乗り、飛べるエリアなら飛ぶ。
+///  ・経路は取り消せる探索で求め、こちらが渡したときだけ歩く（<see cref="OwnPath"/>。止めた後に古い探索の結果で
+///    遅れて歩き出さない）。取り消せる探索の窓口が使えないときだけ、以前の SimpleMove で代える。
 /// </summary>
 public sealed class MoveToTask : AutoTask
 {
@@ -33,6 +35,13 @@ public sealed class MoveToTask : AutoTask
     // ショップ等の画面が開いたので、自分の移動を止めて待っている（閉じたら経路を引き直す）
     private bool pausedByUi;
 
+    // 頼んだときの「ほかの処理が自分の移動を止めた回数」（反撃で止められたら、経路が引けなかったとは数えずに頼み直す）
+    private int interruptionsAtIssue;
+
+    // 自分の経路探索と追従（取り消せる）。使えないときは SimpleMove で代える
+    private readonly OwnPath path = new();
+    private bool usingSimpleMove;
+
     public MoveToTask(Vector3 destination, float range, string label, TimeSpan? limit = null)
     {
         this.destination = destination;
@@ -49,28 +58,38 @@ public sealed class MoveToTask : AutoTask
     {
         if (this.Distance <= this.range && MathF.Abs(Me.Position.Y - this.destination.Y) < 8f)
         {
-            if (this.started && ctx.Navmesh.IsMoving())
+            // 着いた。自分の経路を止める（vnavmesh は止めない限り終点まで歩く）
+            this.path.Stop(ctx.Navmesh);
+            if (this.started && this.usingSimpleMove && ctx.Navmesh.IsMoving())
                 ctx.Navmesh.Stop();
+            this.ForgetOwnMove(ctx);
             return TaskResult.Done;
         }
 
-        if (this.Elapsed > this.limit)
+        // 上限は実際に移動できた時間で測る（反撃・会話の窓の処理と、他者の画面を待った時間は数えない）。
+        // ただし中断が続いても終わるよう、実際の時間にも上限を置く
+        if (this.WorkElapsed > this.limit)
             return this.Fail($"{this.label} へ {this.limit.TotalMinutes:0}分以内に着けませんでした（残り {this.Distance:0}m）");
+        if (this.WallElapsed > (this.limit * 3) + WindowWaitLimit)
+            return this.Fail($"{this.label} へ向かう途中で中断が続き、{this.WallElapsed.TotalMinutes:0}分たっても着けませんでした（残り {this.Distance:0}m）");
 
-        if (GameUi.IsShopOrMarketOpen())
+        if (this.WaitForWindows(out var windowFail))
         {
+            if (windowFail != null)
+                return this.Fail(windowFail);
+
             // 移動を始めた後に画面が開いたら、自分の移動を止める（以前は新しい移動を頼まないだけで、
             // 走っている移動はそのまま続いていた＝画面が開いている間は移動しない、という決まりを満たしていなかった）。
-            // 経路の計算中に止めても、計算が終わると遅れて動き出すので、開いている間は毎回見て止める
+            // 自分の探索は取り消す（結果は使わない）。SimpleMove で代えていたときは、計算が終わると遅れて動き出すので、開いている間は毎回見て止める
             if (this.started || this.pausedByUi)
             {
                 this.pausedByUi = true;
                 this.started = false;
-                if (ctx.Navmesh.IsFollowingPath())
+                this.path.Stop(ctx.Navmesh);
+                if (this.usingSimpleMove && ctx.Navmesh.IsFollowingPath())
                     ctx.Navmesh.Stop();
             }
 
-            this.Status = "ショップ等の画面が開いているので待っています";
             return TaskResult.Running;
         }
 
@@ -116,20 +135,57 @@ public sealed class MoveToTask : AutoTask
                 return TaskResult.Running;
 
             this.fly = GameUi.Mounted && CanFlyHere();
-            if (!ctx.Navmesh.MoveCloseTo(this.destination, this.fly, Math.Max(1f, this.range * 0.7f)))
+            if (this.path.Request(ctx.Navmesh, Me.Position, this.destination, this.fly))
+            {
+                this.usingSimpleMove = false;
+            }
+            else if (ctx.Navmesh.MoveCloseTo(this.destination, this.fly, Math.Max(1f, this.range * 0.7f)))
+            {
+                // 取り消せる探索の窓口が使えない（vnavmesh の版が古い等）。以前の SimpleMove で代える（記録に残す）
+                this.usingSimpleMove = true;
+                Core.DebugLog.Current?.Line("移動", "取り消せる経路探索（Nav.PathfindCancelable）が使えないので、SimpleMove で移動します");
+            }
+            else
             {
                 this.Status = "経路探索の順番待ち";
                 return TaskResult.Running;
             }
 
             this.started = true;
+            ctx.OwnMove.Issued(this.destination, Math.Max(1f, this.range * 0.7f));
+            this.interruptionsAtIssue = ctx.OwnMove.Interruptions;
             this.NextPhase($"{this.label} へ移動中（{this.Distance:0}m）");
             return TaskResult.Running;
         }
 
-        if (ctx.Navmesh.IsMoving())
+        if (!this.usingSimpleMove)
+        {
+            switch (this.path.Tick(ctx.Navmesh, Me.Position, allowedToMove: true))
+            {
+                case OwnPath.State.Searching:
+                    this.Status = $"{this.label} への経路を探しています（残り {this.Distance:0}m）";
+                    return TaskResult.Running;
+                case OwnPath.State.Following:
+                    this.Status = $"{this.label} へ移動中（残り {this.Distance:0}m）";
+                    return TaskResult.Running;
+                case OwnPath.State.Stale:
+                    // 探索の間に動いていた（反撃など）。古い出発点からの経路は使わず、数えずに引き直す
+                    this.started = false;
+                    this.Status = "動いた後なので経路を引き直します";
+                    return TaskResult.Running;
+            }
+        }
+        else if (ctx.Navmesh.IsMoving())
         {
             this.Status = $"{this.label} へ移動中（残り {this.Distance:0}m）";
+            return TaskResult.Running;
+        }
+
+        // 反撃などで自分の移動を止められた。経路が引けなかったとは数えずに頼み直す
+        if (ctx.OwnMove.Interruptions != this.interruptionsAtIssue)
+        {
+            this.started = false;
+            this.Status = "止められた移動を頼み直します";
             return TaskResult.Running;
         }
 
@@ -143,10 +199,22 @@ public sealed class MoveToTask : AutoTask
 
     public override void Cleanup(TaskContext ctx)
     {
-        if ((this.started || this.pausedByUi) && ctx.Navmesh.IsMoving())
+        // 自分の探索は取り消し（結果は使わない）、自分の経路なら止める
+        this.path.Stop(ctx.Navmesh);
+        if ((this.started || this.pausedByUi) && this.usingSimpleMove && ctx.Navmesh.IsMoving())
             ctx.Navmesh.Stop();
+
+        // SimpleMove の計算中だった経路（代えていたとき、または vnavmesh が詰まって自分で探し直したとき）が遅れて動き出さないか見張る
         if (this.started || this.pausedByUi)
             WatchPendingPath(ctx, this.destination, Math.Max(1f, this.range * 0.7f));
+        this.ForgetOwnMove(ctx);
+    }
+
+    /// <summary>自分の移動の控えを消す（控えがこの移動の行き先のときだけ。別の移動の控えは残す）。</summary>
+    private void ForgetOwnMove(TaskContext ctx)
+    {
+        if (ctx.OwnMove.Destination is { } d && Vector3.Distance(d, this.destination) < 0.01f)
+            ctx.OwnMove.Clear();
     }
 
     /// <summary>見張りの名前。</summary>
@@ -228,14 +296,14 @@ public sealed class TeleportTask : AutoTask
         if (Me.Territory == this.territory && GameUi.PlayerFree())
             return TaskResult.Done;
 
-        if (this.Elapsed > TimeSpan.FromMinutes(2))
+        // 上限は実際に作業できた時間で測る（反撃・会話の窓の処理と、他者の画面を待った時間は数えない）
+        if (this.WorkElapsed > TimeSpan.FromMinutes(2))
             return this.Fail($"{TerritoryName(this.territory)} へのテレポが2分以内に終わりませんでした");
+        if (this.WallElapsed > TimeSpan.FromMinutes(6) + WindowWaitLimit)
+            return this.Fail($"{TerritoryName(this.territory)} へのテレポの途中で中断が続き、{this.WallElapsed.TotalMinutes:0}分たっても終わりませんでした");
 
-        if (GameUi.IsShopOrMarketOpen())
-        {
-            this.Status = "ショップ等の画面が開いているので待っています";
-            return TaskResult.Running;
-        }
+        if (this.WaitForWindows(out var windowFail))
+            return windowFail != null ? this.Fail(windowFail) : TaskResult.Running;
 
         if (this.requested)
         {

@@ -19,11 +19,25 @@ public enum TaskResult
 ///    時間は「これ以上待っても無駄」と諦める上限にだけ使う（<see cref="TimedOut"/>）。
 ///  ・成功は「減った AND 増えた」のように両側で確かめる。
 ///  ・他プラグインに頼んだことは、終わったとき（成功・失敗・中止のどれでも）<see cref="Cleanup"/> で必ず戻す。
+///
+/// 【時間の測り方】<see cref="Elapsed"/>・<see cref="PhaseElapsed"/> は「実際に作業できた時間」
+/// （流れ全体が反撃・他者の会話の窓の処理で中断していた時間を引く：<see cref="WorkClock"/>）。
+/// 送った購入の応答待ちなど、中断しても止めない期限には <see cref="WallElapsed"/>・<see cref="PhaseWallElapsed"/>（実際の時間）を使う。
+/// どちらも単調に進む時計で測る（PC の時計を合わせ直しても逆行しない）。
 /// </summary>
 public abstract class AutoTask
 {
-    private DateTime startedAt;
-    private DateTime phaseAt;
+    private TimeSpan startedAt;
+    private TimeSpan phaseAt;
+    private TimeSpan pausedAtStart;
+    private TimeSpan pausedAtPhase;
+
+    // 他者の画面（ショップ・確認窓など）が閉じるのを待った時間（作業時間から引く。独立した上限を持つ）
+    private TimeSpan windowWaitTotal;
+    private TimeSpan? windowWaitSince;
+
+    /// <summary>他者の画面が開いたままのとき、続けて待つ上限。</summary>
+    public static readonly TimeSpan WindowWaitLimit = TimeSpan.FromMinutes(5);
 
     /// <summary>画面に出す作業名。</summary>
     public abstract string Name { get; }
@@ -36,11 +50,56 @@ public abstract class AutoTask
 
     public bool Started { get; private set; }
 
-    /// <summary>始まってからの経過時間。</summary>
-    public TimeSpan Elapsed => DateTime.UtcNow - this.startedAt;
+    /// <summary>始まってから、実際に作業できた時間（中断していた時間を引く）。</summary>
+    public TimeSpan Elapsed => WorkClock.Now - this.startedAt - (WorkClock.PausedTotal - this.pausedAtStart);
 
-    /// <summary>今の段に入ってからの経過時間。</summary>
-    protected TimeSpan PhaseElapsed => DateTime.UtcNow - this.phaseAt;
+    /// <summary>始まってからの実際の時間（中断も含む）。</summary>
+    public TimeSpan WallElapsed => WorkClock.Now - this.startedAt;
+
+    /// <summary>今の段に入ってから、実際に作業できた時間（中断していた時間を引く）。</summary>
+    protected TimeSpan PhaseElapsed => WorkClock.Now - this.phaseAt - (WorkClock.PausedTotal - this.pausedAtPhase);
+
+    /// <summary>今の段に入ってからの実際の時間（中断も含む。送った操作の応答待ちなど、中断しても止めない期限に使う）。</summary>
+    protected TimeSpan PhaseWallElapsed => WorkClock.Now - this.phaseAt;
+
+    /// <summary>作業時間から、他者の画面を待った時間も引いたもの（移動などの上限に使う）。</summary>
+    protected TimeSpan WorkElapsed
+    {
+        get
+        {
+            var w = this.Elapsed - this.windowWaitTotal - (this.windowWaitSince is { } s ? WorkClock.Now - s : TimeSpan.Zero);
+            return w < TimeSpan.Zero ? TimeSpan.Zero : w;
+        }
+    }
+
+    /// <summary>
+    /// ショップ・確認窓など、介入してはいけない画面が開いていれば待つ（true：待っている。呼び出し側は Running を返す）。
+    /// 待った時間は <see cref="WorkElapsed"/> に数えず、続けて <see cref="WindowWaitLimit"/> を超えたら failReason に理由を入れる
+    /// （具体的な画面の名前と解消の仕方を出す。他者の画面は閉じない）。
+    /// </summary>
+    protected bool WaitForWindows(out string? failReason)
+        => this.WaitForWindows(Automation.GameUi.OpenBlockingAddon(), out failReason);
+
+    /// <summary>上と同じ。開いている画面の名前を外から渡す（ゲームを起動せずに試すため）。</summary>
+    protected bool WaitForWindows(string? openWindow, out string? failReason)
+    {
+        failReason = null;
+        if (openWindow == null)
+        {
+            if (this.windowWaitSince is { } since)
+                this.windowWaitTotal += WorkClock.Now - since;
+            this.windowWaitSince = null;
+            return false;
+        }
+
+        this.windowWaitSince ??= WorkClock.Now;
+        var waited = WorkClock.Now - this.windowWaitSince.Value;
+        var label = Automation.GameUi.WindowLabel(openWindow);
+        this.Status = $"{label}の画面が開いているので待っています（閉じると続けます。{waited.TotalSeconds:0}/{WindowWaitLimit.TotalSeconds:0}秒）";
+        if (waited > WindowWaitLimit)
+            failReason = $"{label}の画面が {WindowWaitLimit.TotalMinutes:0} 分開いたままなので進めません。その画面を閉じてから、もう一度始めてください";
+        return true;
+    }
 
     /// <summary>実行係から呼ばれる。初回だけ <see cref="OnStart"/> を呼ぶ。</summary>
     public TaskResult Step(TaskContext ctx)
@@ -48,8 +107,10 @@ public abstract class AutoTask
         if (!this.Started)
         {
             this.Started = true;
-            this.startedAt = DateTime.UtcNow;
+            this.startedAt = WorkClock.Now;
             this.phaseAt = this.startedAt;
+            this.pausedAtStart = WorkClock.PausedTotal;
+            this.pausedAtPhase = this.pausedAtStart;
             var first = this.OnStart(ctx);
             if (first != TaskResult.Running)
                 return first;
@@ -75,7 +136,8 @@ public abstract class AutoTask
     /// <summary>段を切り替える（段ごとの経過時間を測り直す）。</summary>
     protected void NextPhase(string status)
     {
-        this.phaseAt = DateTime.UtcNow;
+        this.phaseAt = WorkClock.Now;
+        this.pausedAtPhase = WorkClock.PausedTotal;
         this.Status = status;
     }
 

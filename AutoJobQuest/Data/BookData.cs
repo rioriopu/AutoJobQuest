@@ -15,7 +15,11 @@ public sealed record NpcSpot(uint NpcId, uint Territory, Vector3 Position);
 /// <param name="ShopId">交換する SpecialShop。</param>
 /// <param name="Price">値段（特殊通貨の個数）。</param>
 /// <param name="SpecialCurrencyId">払う特殊通貨の番号（CostType=3 の ItemCost）。</param>
-public sealed record BookOffer(uint BookItemId, uint TomeId, uint ShopId, uint Price, byte SpecialCurrencyId);
+/// <param name="RequiredQuests">
+/// 交換に要るクエスト（店の SpecialShop.Quest と、品ごとの ItemStruct.Quest。0 は除く）。
+/// ゲームデータの調査：紫貨の秘伝書の店は「一流の道具」（Q66959）が未完了だと使えない。以前は確かめていなかった。
+/// </param>
+public sealed record BookOffer(uint BookItemId, uint TomeId, uint ShopId, uint Price, byte SpecialCurrencyId, IReadOnlyList<uint>? RequiredQuests = null);
 
 /// <summary>
 /// 秘伝書に要るゲームデータをまとめて引く。
@@ -122,7 +126,8 @@ public sealed class BookData
                     continue; // 特殊通貨で払う店だけ（紫貨）
 
                 var tome = tomes.FirstOrDefault(t => t.Item.RowId == got);
-                this.Offers[got] = new BookOffer(got, tome.RowId, shop.RowId, cost.CurrencyCost, (byte)cost.ItemCost.RowId);
+                var required = new[] { shop.Quest.RowId, entry.Quest.RowId }.Where(q => q != 0).Distinct().ToList();
+                this.Offers[got] = new BookOffer(got, tome.RowId, shop.RowId, cost.CurrencyCost, (byte)cost.ItemCost.RowId, required);
 
                 var cat = categories.FirstOrDefault(c => c.InclusionShopSeries.RowId == path.Series);
                 this.ShopPaths[shop.RowId] = (cat.RowId, path.Subrow);

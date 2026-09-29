@@ -74,6 +74,57 @@ public sealed class MateriaNeed
 /// <param name="Reason">理由（画面・記録用）。</param>
 public sealed record BlockedQuest(JobQuest Quest, uint BlockingQuest, string Reason);
 
+/// <summary>
+/// 前提の点検に使う材料（ゲームから読む。ゲームを起動せずに試すときは偽物を渡す）。
+/// null の項目は確かめない（前提のクエストだけを見る昔の点検と同じになる）。
+/// </summary>
+/// <param name="IsComplete">クエストが完了済みか。</param>
+/// <param name="AreaReachable">エリアへ行けるか（入口のエーテライトが無いエリアは null＝判断しない）。</param>
+/// <param name="JobLevel">職のレベル（0 なら未解放）。</param>
+/// <param name="BookShopBlocker">そのジョブクエが、交換できない秘伝書のせいで進められないなら、止めているクエストと理由。</param>
+public sealed record PrereqContext(
+    Func<uint, bool> IsComplete,
+    Func<uint, bool?>? AreaReachable = null,
+    Func<uint, int>? JobLevel = null,
+    Func<uint, (uint Quest, string Reason)?>? BookShopBlocker = null)
+{
+    /// <summary>前提のクエストだけを見る（昔の点検と同じ）。</summary>
+    public static PrereqContext ChainOnly(Func<uint, bool> isComplete) => new(isComplete);
+
+    /// <summary>ゲームから読む（フレームワークのスレッドから呼ぶ）。</summary>
+    public static PrereqContext FromGame(GameDataCache data)
+    {
+        var unlocked = AreaAccess.UnlockedNow();
+        return new PrereqContext(
+            QuestManager.IsQuestComplete,
+            terr => AreaAccess.Reachable(terr, unlocked),
+            j => Jobs.Level(j),
+            q => FindBookShopBlocker(data, q, QuestManager.IsQuestComplete, PlanBuilder.IsBookUnlocked));
+    }
+
+    /// <summary>
+    /// そのジョブクエに要る秘伝書のうち未読のものが、交換の店の解放クエストが未完了で手に入らないなら、そのクエストと理由
+    /// （ゲームデータ：紫貨の秘伝書の店は「一流の道具」が未完了だと使えない。以前は確かめず、紫貨を稼いだ後で止まりえた）。
+    /// </summary>
+    public static (uint Quest, string Reason)? FindBookShopBlocker(GameDataCache data, uint questId, Func<uint, bool> isComplete, Func<uint, bool> isBookUnlocked)
+    {
+        if (data.QuestBooks is not { } qb || data.Books is not { } books || !qb.TryGetValue(questId, out var tomes))
+            return null;
+
+        var sheet = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.SecretRecipeBook>();
+        foreach (var tome in tomes.Where(t => !isBookUnlocked(t)))
+        {
+            if (!sheet.TryGetRow(tome, out var row) || !books.Offers.TryGetValue(row.Item.RowId, out var offer) || offer.RequiredQuests is not { } req)
+                continue;
+            var missing = req.FirstOrDefault(r => !isComplete(r));
+            if (missing != 0)
+                return (missing, $"秘伝書「{CraftPlanner.ItemName(row.Item.RowId)}」を交換する店の解放クエスト「{Unlocks.QuestName(missing)}」が未完了です");
+        }
+
+        return null;
+    }
+}
+
 /// <summary>選んだジョブの、残りのジョブクエ全部についての計画。</summary>
 public sealed class JobQuestPlan
 {
@@ -172,7 +223,7 @@ public static class PlanBuilder
         // 残りのジョブクエ。前提のクエスト（メインクエスト等）が未完了で自動では進められないものは分けて、計画に入れない
         // （開始時に「未達なので動作保証しない」と注意を出し、進められる分だけ進める。
         //   進められないクエストの素材まで集めると、ギルと時間が無駄になるため）
-        var (runnable, blocked) = SplitQuests(data.Quests!.Quests, jobs, QuestManager.IsQuestComplete);
+        var (runnable, blocked) = SplitQuests(data.Quests!.Quests, jobs, PrereqContext.FromGame(data));
         plan.Blocked.AddRange(blocked);
         plan.RemainingQuests.AddRange(runnable);
 
@@ -186,6 +237,11 @@ public static class PlanBuilder
             if (stage != Automation.QuestItemStage.Stage.All)
                 plan.ItemStages[q.RowId] = stage;
             plan.Targets.AddRange(Automation.QuestItemStage.StillNeeded(q.Items, stage, (item, hq) => hq ? inv.CountHq(item) : inv.CountAll(item)));
+
+            // Questionable の「Craft」手順のうち、納品物ではない品（中間素材）の手順は、手元に無いと Artisan の既製リストが動いて
+            // 追加製作・材料の買い足しになる。その数も手元に残るよう作る（まだ手順の前のクエストだけ）
+            if (stage == Automation.QuestItemStage.Stage.All)
+                plan.Targets.AddRange(QuestionableHolds(q, QuestionablePaths.CraftSteps(q.ShortId)));
         }
 
         // 1) 製作計画（納品物 → 中間素材 → 末端素材）
@@ -193,6 +249,7 @@ public static class PlanBuilder
         plan.Warnings.AddRange(plan.Craft.Problems);
 
         // 2) 末端素材の入手手段
+        var unlockedAetherytes = AreaAccess.UnlockedNow();
         foreach (var (item, total) in plan.Craft.RawTotal.OrderBy(x => x.Key))
         {
             var shortfall = plan.Craft.RawShortfall.GetValueOrDefault(item);
@@ -209,6 +266,13 @@ public static class PlanBuilder
 
             if (shortfall > 0 && first == Route.Unknown)
                 plan.Warnings.Add($"{CraftPlanner.ItemName(item)} ×{shortfall} の入手手段が見つかりません");
+
+            // 前提が未達で使えない手段は、理由を出す（前提の未達で詰まらないよう確かめる）
+            if (shortfall > 0)
+            {
+                foreach (var (route, why) in RouteBlockers(data.Sources!.Get(item), ChooseRoutes(data.Sources!, item), QuestManager.IsQuestComplete, unlockedAetherytes, GatherAbilities.Usable))
+                    plan.Warnings.Add($"{CraftPlanner.ItemName(item)} ×{shortfall}：{Ui.MainWindow.RouteName(route)}は使えません（{why}）。{(first == Route.Unknown ? "ほかの手段もありません" : $"{Ui.MainWindow.RouteName(first)}で集めます")}");
+            }
         }
 
         // 3) マテリア装着
@@ -245,14 +309,31 @@ public static class PlanBuilder
     }
 
     /// <summary>
+    /// Questionable の Craft 手順のうち、納品物ではない品で「持っていれば飛ばす」条件が付いたもの（手元に残す数）。
+    /// 納品物の手順は、納品物をそろえる計画で満たされるので足さない。ItemId の無い手順は満たしようがないので足さない（事前点検で知らせる）。
+    /// </summary>
+    public static IEnumerable<QuestItemReq> QuestionableHolds(JobQuest q, IReadOnlyList<QuestionableCraftStep>? steps)
+    {
+        if (steps == null)
+            yield break;
+        var delivered = q.Items.Select(i => i.ItemId).ToHashSet();
+        foreach (var g in steps.Where(s => s.ItemId is { } id && s.SkipIfHeld && s.ItemCount > 0 && !delivered.Contains(id)).GroupBy(s => (s.ItemId!.Value, s.Hq)))
+            yield return new QuestItemReq(g.Key.Value, g.Max(s => s.ItemCount), g.Key.Hq, "Questionable の製作の手順（持っていれば飛ばす）");
+    }
+
+    /// <summary>
     /// 選んだ職の未完了のジョブクエを「進められる」と「前提が未達で進められない」に分ける（計画の最初の段。
     /// 完了済みかは外から渡す：ゲームを起動せずに、完了済みの組み合わせを仮定して試せるように）。
     /// 進められないクエストの納品物は計画（素材・製作・装着）に入れない。
     /// </summary>
     public static (List<JobQuest> Runnable, List<BlockedQuest> Blocked) SplitQuests(IEnumerable<JobQuest> all, IReadOnlySet<uint> jobs, Func<uint, bool> isComplete)
+        => SplitQuests(all, jobs, PrereqContext.ChainOnly(isComplete));
+
+    /// <summary>上と同じ。前提の点検の材料をまとめて渡す（エリア・秘伝書の店・職の解放も見る）。</summary>
+    public static (List<JobQuest> Runnable, List<BlockedQuest> Blocked) SplitQuests(IEnumerable<JobQuest> all, IReadOnlySet<uint> jobs, PrereqContext prereq)
     {
-        var candidates = all.Where(q => jobs.Contains(q.ClassJobId) && !isComplete(q.RowId)).ToList();
-        var blocked = FindBlocked(candidates, isComplete);
+        var candidates = all.Where(q => jobs.Contains(q.ClassJobId) && !prereq.IsComplete(q.RowId)).ToList();
+        var blocked = FindBlocked(candidates, prereq);
         var blockedIds = blocked.Select(b => b.Quest.RowId).ToHashSet();
         return (candidates.Where(q => !blockedIds.Contains(q.RowId)).ToList(), blocked);
     }
@@ -262,18 +343,67 @@ public static class PlanBuilder
     /// 「完了済みか」は外から渡す（ゲームを起動せずに試せるように）。
     /// </summary>
     public static List<BlockedQuest> FindBlocked(IEnumerable<JobQuest> quests, Func<uint, bool> isComplete)
+        => FindBlocked(quests, PrereqContext.ChainOnly(isComplete));
+
+    /// <summary>
+    /// 進められないジョブクエ（関連クエストの未達で進められない・詰まることがないよう、前提を必ず確かめる）。
+    /// 見る順（最初に当たった理由を出す）：
+    ///  1) その職が未解放（レベル 0＝ギルドに加入していない）。以前は前提のたどり方で、ジャーナルに出ない「〇〇師になるには？」の
+    ///     クエストに当たり、理由の文が分かりにくかった
+    ///  2) 前提のクエスト（区分の違う前提＝メインクエスト等が未完了）
+    ///  3) 受注・手順の場所のエリアへ行けない（入口のエーテライトが未解放。イシュガルドなど：AreaAccess）。
+    ///     ジョブクエ本体と、これから進める前提のクエストの両方を見る
+    ///  4) 納品物を作るのに要る秘伝書が未読で、その交換の店の解放クエストが未完了（「一流の道具」など）
+    /// </summary>
+    public static List<BlockedQuest> FindBlocked(IEnumerable<JobQuest> quests, PrereqContext prereq)
     {
         var list = new List<BlockedQuest>();
         foreach (var q in quests)
         {
-            if (isComplete(q.RowId))
+            if (prereq.IsComplete(q.RowId))
                 continue;
-            Unlocks.ChainCore(q.RowId, isComplete, out var blocked, out var blocker);
+
+            if (prereq.JobLevel?.Invoke(q.ClassJobId) is 0)
+            {
+                list.Add(new BlockedQuest(q, 0, $"{Jobs.Name(q.ClassJobId)}が未解放です（ギルドに加入していません）"));
+                continue;
+            }
+
+            var chain = Unlocks.ChainCore(q.RowId, prereq.IsComplete, out var blocked, out var blocker);
             if (blocked != null)
+            {
                 list.Add(new BlockedQuest(q, blocker, blocked));
+                continue;
+            }
+
+            if (prereq.AreaReachable != null && FirstUnreachable(chain, prereq.AreaReachable) is { } area)
+            {
+                list.Add(new BlockedQuest(q, 0,
+                    $"「{AreaAccess.Name(area.Territory)}」へ行けません（入口のエーテライト「{AreaAccess.GateNames(area.Territory)}」が未解放。"
+                    + $"{(area.Quest == q.RowId ? "このクエスト" : $"前提のクエスト「{Unlocks.QuestName(area.Quest)}」")}の場所です。メインクエスト等でその地域を解放してから進めてください）"));
+                continue;
+            }
+
+            if (prereq.BookShopBlocker?.Invoke(q.RowId) is { } book)
+                list.Add(new BlockedQuest(q, book.Quest, book.Reason));
         }
 
         return list;
+    }
+
+    /// <summary>進めるクエストの列のうち、行けないエリアを場所に持つ最初のもの（無ければ null）。</summary>
+    private static (uint Quest, uint Territory)? FirstUnreachable(IEnumerable<uint> questIds, Func<uint, bool?> reachable)
+    {
+        foreach (var id in questIds)
+        {
+            foreach (var terr in AreaAccess.QuestTerritories(id).OrderBy(t => t))
+            {
+                if (reachable(terr) == false)
+                    return (id, terr);
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -288,7 +418,7 @@ public static class PlanBuilder
         for (var i = 0; i < selected.Length && i < Jobs.Crafters.Length; i++)
             if (selected[i])
                 jobs.Add(Jobs.Crafters[i]);
-        return FindBlocked(data.Quests.Quests.Where(q => jobs.Contains(q.ClassJobId)), QuestManager.IsQuestComplete);
+        return FindBlocked(data.Quests.Quests.Where(q => jobs.Contains(q.ClassJobId)), PrereqContext.FromGame(data));
     }
 
     /// <summary>
@@ -318,7 +448,58 @@ public static class PlanBuilder
         // 精選：解放済みか、実行の最初に解放できる見込みがあり、元の収集品を採れる採集職のレベルがあるときだけ
         if (routes.Contains(Route.Reduce) && (!Automation.ReduceTask.Usable() || Automation.ReduceTask.UsableSources(sources, itemId).Count == 0))
             routes.Remove(Route.Reduce);
+
+        // 前提の解放（前提の未達で詰まらないよう、手段を使う前に確かめる。ゲームデータの調査で分かったもの）
+        foreach (var (route, _) in RouteBlockers(sources.Get(itemId), routes, QuestManager.IsQuestComplete, AreaAccess.UnlockedNow(), GatherAbilities.Usable))
+            routes.Remove(route);
         return routes;
+    }
+
+    /// <summary>
+    /// 前提が未達で使えない入手手段と、その理由（ゲームを起動せずに試せるように、状態は外から渡す）。
+    ///  ・NPC 購入：売っている店がすべて、未完了のクエスト（友好部族など）か確かめられない条件付き
+    ///  ・採掘・園芸：行ける採集点が無い（採集点のエリアの入口のエーテライトが未解放。GBR は解放済みのエーテライトから向かう）、
+    ///    または隠しの品しか無く「眼力」が使えない（未解放かレベル不足）
+    ///  ・釣り：竿では釣れず銛でしか取れない品で、刺突漁が使えない
+    ///  ・精選：元の収集品を採る「収集品採集」が使えない（クエスト「職人の新たなお仕事」が未完了など）
+    /// 能力が使えるかを確かめられない（null）ときは外さない（決め打ちの番号がゲームデータと合わない等。記録に残している）。
+    /// </summary>
+    public static List<(Route Route, string Reason)> RouteBlockers(ItemSources s, IReadOnlyCollection<Route> routes, Func<uint, bool> isComplete,
+        IReadOnlySet<uint> unlockedAetherytes, Func<uint, bool?> abilityUsable)
+    {
+        var list = new List<(Route, string)>();
+
+        if (routes.Contains(Route.Vendor) && s.VendorOffers.Count > 0 && !s.VendorOffers.Any(o => !o.Unknown && o.Quests.All(isComplete)))
+        {
+            var q = s.VendorOffers.SelectMany(o => o.Quests).FirstOrDefault(q => !isComplete(q));
+            list.Add((Route.Vendor, q != 0
+                ? $"売っている店に、クエスト「{Unlocks.QuestName(q)}」の完了が要ります"
+                : "売っている店に、確かめられない条件（アチーブメント等）が付いています"));
+        }
+
+        if (routes.Contains(Route.Gather) && s.Gather.Count > 0)
+        {
+            var reachable = s.Gather.Where(g => AreaAccess.Reachable(g.Territory, unlockedAetherytes) != false).ToList();
+            if (reachable.Count == 0)
+            {
+                list.Add((Route.Gather, $"採集点のあるエリア（{string.Join("・", s.Gather.Select(g => AreaAccess.Name(g.Territory)).Distinct())}）のエーテライトが未解放です"));
+            }
+            else if (reachable.All(g => g.Hidden))
+            {
+                // 隠しの品：採掘なら採掘師の、園芸なら園芸師の眼力が要る
+                var usable = reachable.Any(g => abilityUsable(g.Mining ? GatherAbilities.MinerLuck : GatherAbilities.BotanistLuck) != false);
+                if (!usable)
+                {
+                    var need = reachable.Select(g => g.Mining ? GatherAbilities.MinerLuck : GatherAbilities.BotanistLuck).Distinct().Select(GatherAbilities.Requirement);
+                    list.Add((Route.Gather, $"隠し（HIDDEN）の採集物で、{string.Join("か", need)}が要ります"));
+                }
+            }
+        }
+
+        if (routes.Contains(Route.Fish) && !s.Fish && s.Spearfish && abilityUsable(GatherAbilities.Gig) == false)
+            list.Add((Route.Fish, $"銛でしか取れない魚で、刺突漁{GatherAbilities.Requirement(GatherAbilities.Gig)}が要ります"));
+
+        return list;
     }
 
     public static List<Route> ChooseRoutes(SourceIndex sources, uint itemId)

@@ -166,10 +166,99 @@ public sealed class GbrOperations
         }
     }
 
-    /// <summary>元に戻すべき一時変更が残っているか。</summary>
+    /// <summary>元に戻すべき一時変更が残っているか（戻したが保存を確かめていないものも含む）。</summary>
     public bool HasLeftovers
         => this.config.GbrOwnListActive || this.config.GbrDisabledListRefs.Count > 0 || this.config.GbrConfigOriginals.Count > 0
-           || this.config.GbrVendorListPending;
+           || this.config.GbrVendorListPending || this.config.GbrConfigAwaitingSave.Count > 0;
+
+    /// <summary>GBR の保存ファイルを読む（試験では差し替える）。読めなければ null。</summary>
+    public Func<string, string?> ReadFile { get; set; } = path =>
+    {
+        try
+        {
+            using var fs = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite);
+            using var sr = new System.IO.StreamReader(fs);
+            return sr.ReadToEnd();
+        }
+        catch
+        {
+            return null;
+        }
+    };
+
+    /// <summary>GBR の設定ファイル（pluginConfigs\GatherBuddyReborn.json）。</summary>
+    public static string ConfigFilePath
+        => System.IO.Path.Combine(Svc.PluginInterface.ConfigDirectory.Parent?.FullName ?? string.Empty, GbrReflection.InternalName + ".json");
+
+    /// <summary>GBR の採集リストのファイル（pluginConfigs\GatherBuddyReborn\auto_gather_lists.json）。</summary>
+    public static string ListsFilePath
+        => System.IO.Path.Combine(Svc.PluginInterface.ConfigDirectory.Parent?.FullName ?? string.Empty, GbrReflection.InternalName, "auto_gather_lists.json");
+
+    /// <summary>設定の保存を確かめるまで待つ上限。過ぎたら保存を頼み直す。</summary>
+    public static readonly TimeSpan SaveRetryAfter = TimeSpan.FromSeconds(30);
+
+    /// <summary>設定の保存を確かめられない（ファイルが読めない）まま待つ上限。</summary>
+    public static readonly TimeSpan SaveGiveUpAfter = TimeSpan.FromMinutes(5);
+
+    // 採集リストの保存がファイルに反映されていなかった回数（上限で、確かめずに進む）
+    private int listSaveMismatches;
+
+    /// <summary>
+    /// 戻した設定が GBR の保存ファイルに書かれたか確かめる。書かれていれば控えを消す。
+    /// まだなら待ち、<see cref="SaveRetryAfter"/> を過ぎたら保存を頼み直す（メモリの値が戻したままのときだけ）。
+    /// ファイルが読めないまま <see cref="SaveGiveUpAfter"/> たったら、警告して控えを消す（読めない理由は利用者に確かめてもらう）。
+    /// GBR が動いていても確かめてよい（ファイルを読むだけ）。
+    /// </summary>
+    public void VerifyConfigSaved()
+    {
+        var awaiting = this.config.GbrConfigAwaitingSave;
+        if (awaiting.Count == 0)
+            return;
+
+        var since = this.config.GbrConfigAwaitingSince ?? DateTime.UtcNow;
+        switch (GbrDiskCheck.Config(this.ReadFile(ConfigFilePath), awaiting))
+        {
+            case GbrDiskCheck.Result.Saved:
+                Note($"GBR の設定が保存ファイルに書かれたことを確かめました（{string.Join("、", awaiting.Keys)}）");
+                this.ClearAwaiting();
+                return;
+
+            case GbrDiskCheck.Result.NotYet:
+                if (DateTime.UtcNow - since < SaveRetryAfter)
+                    return;
+                var h = this.reflection.Get();
+                if (h != null && awaiting.All(kv => h.GetAutoGatherBool(kv.Key) == kv.Value))
+                {
+                    Note("GBR の設定が保存ファイルにまだ書かれていないので、保存を頼み直します");
+                    h.SaveConfig();
+                }
+                else if (h != null)
+                {
+                    // メモリの値が変わっている＝利用者が変えた。上書きしない
+                    Note("GBR の設定は、戻した後に変わっていました（利用者の変更を尊重し、控えを消します）");
+                    this.ClearAwaiting();
+                    return;
+                }
+
+                this.config.GbrConfigAwaitingSince = DateTime.UtcNow;
+                this.config.Save();
+                return;
+
+            default:
+                if (DateTime.UtcNow - since < SaveGiveUpAfter)
+                    return;
+                Note($"⚠ GBR の設定ファイル（{ConfigFilePath}）を読めないので、保存されたかを確かめられませんでした。GBR の設定画面で {string.Join("、", awaiting.Keys)} を確かめてください");
+                this.ClearAwaiting();
+                return;
+        }
+    }
+
+    private void ClearAwaiting()
+    {
+        this.config.GbrConfigAwaitingSave.Clear();
+        this.config.GbrConfigAwaitingSince = null;
+        this.config.Save();
+    }
 
     // 直前に出した「まだ戻しません」の記録（同じ内容を10秒ごとに繰り返し書かない）
     private string? lastWaitNote;
@@ -190,6 +279,9 @@ public sealed class GbrOperations
     {
         if (!this.HasLeftovers)
             return true;
+
+        // 戻した設定がファイルに書かれたかは、GBR が動いていても確かめられる（ファイルを読むだけ）
+        this.VerifyConfigSaved();
 
         if (!CanRestore(gbrEnabled, vendorBusy))
         {
@@ -309,13 +401,19 @@ public sealed class GbrOperations
             return false; // 届くようになってから戻す
 
         // 控えは GBR の保存が通ってから消す（以前は1件ずつ控えを消してから最後に保存していたので、
-        // 保存で例外が出ると、控えだけ消えてやり直しの対象から外れていた）
+        // 保存で例外が出ると、控えだけ消えてやり直しの対象から外れていた）。
+        // さらに、実際に戻したものは「保存ファイルに書かれたか確かめる」控えへ移す（GBR の Save は旗を立てるだけ）
+        var restoring = this.config.GbrConfigOriginals.Where(kv => h.GetAutoGatherBool(kv.Key) == !kv.Value).ToDictionary(kv => kv.Key, kv => kv.Value);
         if (!RestoreConfigCore(this.config.GbrConfigOriginals, h.GetAutoGatherBool, h.SetAutoGatherBool, h.SaveConfig, Note, out var error))
         {
             this.SetError($"GBR の設定を戻せませんでした（控えは残し、止まっている間にやり直します）: {error}");
             return false;
         }
 
+        foreach (var (name, value) in restoring)
+            this.config.GbrConfigAwaitingSave[name] = value;
+        if (restoring.Count > 0)
+            this.config.GbrConfigAwaitingSince = DateTime.UtcNow;
         this.config.Save();
         return true;
     }
@@ -469,6 +567,23 @@ public sealed class GbrOperations
             this.SetError($"GBR の採集リストを戻せませんでした（控えは残し、止まっている間にやり直します）: {Unwrap(ex)}");
             return false;
         }
+
+        // 保存ファイルに書かれたか確かめる（GBR のリストの Save は、書き出しに失敗しても例外を外へ出さない）。
+        // まだ違えば控えを残してやり直す（3回まで。それでも合わなければ警告して進む：同じ名前のリストが複数ある等で照合が合わない場合）
+        switch (GbrDiskCheck.Lists(this.ReadFile(ListsFilePath), OwnListName, restored))
+        {
+            case GbrDiskCheck.Result.NotYet when ++this.listSaveMismatches < 3:
+                this.SetError("GBR の採集リストを戻しましたが、保存ファイルにまだ反映されていません（控えは残し、止まっている間にやり直します）");
+                return false;
+            case GbrDiskCheck.Result.NotYet:
+                Note("⚠ GBR の採集リストの保存ファイルが、3回やり直しても戻した状態と合いません。GBR の画面でリストの有効・無効を確かめてください");
+                break;
+            case GbrDiskCheck.Result.Unreadable:
+                Note($"⚠ GBR の採集リストのファイル（{ListsFilePath}）を読めないので、保存されたかを確かめられませんでした");
+                break;
+        }
+
+        this.listSaveMismatches = 0;
 
         // 保存が通った。戻せたものは控えから消し、戻せなかったものは別の控えへ移す（自動ではやり直さない：
         // 見つからない・同じ名前が複数は、時間がたっても変わらないため。利用者が確かめて消す）

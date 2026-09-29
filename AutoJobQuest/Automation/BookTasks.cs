@@ -704,7 +704,6 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
     private DateTime selectedAt;
     private DateTime verifyUntil;
     private bool dumped;
-    private bool retried;
     private int observedReward;
     private string lastButton = "未読";
     private string lastSelection = "未確認";
@@ -990,20 +989,17 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
             if (ownedAfter < this.ownedBefore || scrips != this.scripsBefore)
                 return this.Fail($"納品の結果が片方しか反映されていません（{CraftPlanner.ItemName(this.Item)} {this.ownedBefore}→{ownedAfter}、紫貨 {this.scripsBefore}→{scrips}）");
 
-            if (!this.retried)
-            {
-                this.retried = true;
-                ctx.Log.Warn("納品", $"{CraftPlanner.ItemName(this.Item)} が納品されなかったので、もう一度試します");
-                this.Go(DeliverStep.Select, "選び直します");
-                return TaskResult.Running;
-            }
-
+            // 撃ち直さない（品を渡す操作は「変化が見えない」だけでは渡していないと言い切れない。反映が遅れているだけなら、
+            // 撃ち直すと2個目を余分に渡す。以前は1回だけ選び直して撃ち直していた）。記録に画面の中身を残して止める
             var values = string.Join(" / ", Inventory.Collectabilities(this.Item));
-            return this.Fail($"{CraftPlanner.ItemName(this.Item)} を納品できませんでした（所持 {this.ownedBefore} のまま・紫貨の増加なし。収集価値 {values} / ボタン: {this.lastButton} / 選択: {this.lastSelection}）");
+            if (GameUi.Addon("CollectablesShop") is var shop && shop != null)
+                DebugLog.Current?.Block("納品", "納品の反映が見えない", AddonRecorder.Describe(shop));
+            return this.Fail($"{CraftPlanner.ItemName(this.Item)} の納品が {VerifyLimit.TotalSeconds:0} 秒たっても反映されません（所持 {this.ownedBefore} のまま・紫貨の増加なし。"
+                             + $"収集価値 {values} / ボタン: {this.lastButton} / 選択: {this.lastSelection}）。二重に渡さないよう、撃ち直さずに止めました。"
+                             + "所持品と紫貨を確かめてから、もう一度始めてください");
         }
 
         this.Delivered++;
-        this.retried = false;
         this.observedReward = scrips - this.scripsBefore;
         ctx.Log.Write("納品", $"{CraftPlanner.ItemName(this.Item)} を納品しました（{this.ownedBefore}→{ownedAfter}、紫貨 {this.scripsBefore}→{scrips} ＋{this.observedReward}）");
         this.Go(DeliverStep.Select, string.Empty);
@@ -1554,6 +1550,28 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
                     : TaskResult.Running;
             }
 
+            // 画面の文字に、交換する秘伝書の名前が出ているか（専用ボタンも品目を突き合わせる。置き場所は決め打ちせず、
+            // 画面の文字を全部集めて探す）。別の秘伝書の名前だけが出ていれば取り違えなので、押さずに止める
+            var bookName = CraftPlanner.ItemName(offer.BookItemId);
+            var others = this.queue.Select(o => CraftPlanner.ItemName(o.BookItemId)).Where(n => n != bookName);
+            var texts = GameUi.AllTexts(dialog);
+            var match = ConfirmPolicy.MatchDialog(texts, bookName, others);
+            if (match == ConfirmPolicy.DialogMatch.Mismatch)
+            {
+                DebugLog.Current?.Block("交換", "交換の確認に別の品の名前", AddonRecorder.Describe(dialog) + "\n画面の文字: " + string.Join(" / ", texts));
+                return this.Fail($"交換の確認に、交換しようとした {bookName} ではなく別の品の名前が出ています。押さずに止めました（記録に画面の中身を残しました）");
+            }
+
+            if (match != ConfirmPolicy.DialogMatch.Match)
+            {
+                // 文字がまだ入っていない・名前が見つからない。押さずに待ち、上限で止める（記録に画面の中身を残す）
+                this.Status = $"交換の確認に {bookName} の名前が出ているか確かめています";
+                if (DateTime.UtcNow - this.firedAt < OutcomeLimit)
+                    return TaskResult.Running;
+                DebugLog.Current?.Block("交換", "交換の確認に品の名前が見つからない", AddonRecorder.Describe(dialog) + "\n画面の文字: " + string.Join(" / ", texts));
+                return this.Fail($"交換の確認の画面に {bookName} の名前が見つからないので、押さずに止めました（記録に画面の中身を残しました）");
+            }
+
             if (DateTime.UtcNow - this.firedAt >= OutcomeLimit)
             {
                 DebugLog.Current?.Block("交換", "消えない交換の確認", AddonRecorder.Describe(dialog));
@@ -1570,21 +1588,37 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
             return TaskResult.Running;
         }
 
-        // 品によっては、さらに「はい／いいえ」が続く
-        if (this.TryFindConfirm(ctx, offer, out var yesno, out var body))
+        // 品によっては、さらに「はい／いいえ」が続く。本文で交換の確認と分かったときだけ「はい」。
+        // 危ない語を含む・何の確認か分からないものは押さずに止める（以前は撃ってから10秒以内なら押していた）
+        switch (this.CheckConfirm(ctx, offer, out var yesno, out var body, out var bad))
         {
-            if (DateTime.UtcNow - this.firedAt >= OutcomeLimit)
-                return this.Fail($"確認に「はい」と答えても進みませんでした：{body}");
+            case ConfirmPolicy.Verdict.PressByText:
+                if (DateTime.UtcNow - this.firedAt >= OutcomeLimit)
+                    return this.Fail($"確認に「はい」と答えても進みませんでした：{body}");
 
-            if (DateTime.UtcNow - this.lastClick >= TimeSpan.FromMilliseconds(500))
-            {
-                this.lastClick = DateTime.UtcNow;
-                ctx.Log.Write("交換", $"確認に「はい」と答えます：{body}");
-                if (!GameUi.ClickYes(yesno))
-                    return this.Fail($"確認の「はい」が押せる状態ではありません：{body}");
-            }
+                if (DateTime.UtcNow - this.lastClick >= TimeSpan.FromMilliseconds(500))
+                {
+                    this.lastClick = DateTime.UtcNow;
+                    ctx.Log.Write("交換", $"確認に「はい」と答えます（通貨名と値段が本文にある）：{body}");
+                    if (!GameUi.ClickYes(yesno))
+                        return this.Fail($"確認の「はい」が押せる状態ではありません：{body}");
+                }
 
-            return TaskResult.Running;
+                return TaskResult.Running;
+
+            case ConfirmPolicy.Verdict.Dangerous:
+                DebugLog.Current?.Block("交換", "危ない語を含む確認", AddonRecorder.Describe(yesno));
+                return this.Fail($"交換の後に出た確認に「{bad}」が含まれるので、押さずに止めました：{body}");
+
+            case ConfirmPolicy.Verdict.Unrecognized:
+                DebugLog.Current?.Block("交換", "何の確認か分からない", AddonRecorder.Describe(yesno));
+                return this.Fail($"交換の後に、交換の確認と判断できない確認が出たので、押さずに止めました（本文：{body}）。記録に画面の中身を残しました");
+
+            case ConfirmPolicy.Verdict.Unreadable:
+                this.Status = "確認の本文を読んでいます";
+                if (DateTime.UtcNow - this.firedAt >= OutcomeLimit)
+                    return this.Fail("交換の後に出た確認の本文が読めないので、押さずに止めました");
+                return TaskResult.Running;
         }
 
         // 画面が閉じた（話しかけられる距離から外れた等）なら、待っても結果は出ない
@@ -1615,51 +1649,36 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
     }
 
     /// <summary>
-    /// 押してよい SelectYesno を2段で探す（所有の確認も行う）。
-    /// どちらも「撃った後に自分の操作で開いた」確認であることが前提（以前は 1) に所有の確認が無く、
-    /// 同じ通貨・同じ値段を含む別の確認まで押しえた）。危ない語（捨てる・売る等）を含むものは押さない。
-    ///  1) 本文に通貨名と値段の両方がある（値段は前後が数字でないこと。「100」が「1000」の一部に当たらないように）。
-    ///  2) 撃ってから 10 秒以内（本文が想定と違っても答える。本文は記録に残す）。
+    /// 出ている SelectYesno を判定する（所有の確認も行う）。
+    /// 「撃った後に自分の操作で開いた」確認であることが前提。危ない語（捨てる・売る等）を含むものは押さない。
+    /// 押してよいのは、本文に通貨名と値段の両方があるときだけ（値段は前後が数字でないこと。「100」が「1000」の一部に当たらないように）。
+    /// 確認が出ていない、または自分のものでないときは NotOurs（触らない）。
     /// </summary>
-    private bool TryFindConfirm(TaskContext ctx, BookOffer offer, out AtkUnitBase* addon, out string body)
+    private ConfirmPolicy.Verdict CheckConfirm(TaskContext ctx, BookOffer offer, out AtkUnitBase* addon, out string body, out string? bad)
     {
         addon = null;
+        bad = null;
         body = GameUi.YesnoText(out var yesno) ?? string.Empty;
         if (yesno == null)
-            return false;
+            return ConfirmPolicy.Verdict.NotOurs;
 
         var owned = ctx.Ownership.TryGetOwnedSince("SelectYesno", this.firedAt, out var own) && (nint)own == (nint)yesno;
         var currencyName = CraftPlanner.ItemName(this.scripItemId);
-        var verdict = ConfirmPolicy.Decide(owned, body, [currencyName], offer.Price, DateTime.UtcNow - this.firedAt, out var bad);
-
-        // 記録は5秒に1回まで（毎フレーム呼ばれるため）
-        var logNow = DateTime.UtcNow - this.lastUnmatchedLog >= TimeSpan.FromSeconds(5);
-        if (logNow && verdict != ConfirmPolicy.Verdict.PressByText)
-            this.lastUnmatchedLog = DateTime.UtcNow;
-
-        switch (verdict)
+        var verdict = ConfirmPolicy.Decide(owned, body, [currencyName], offer.Price, out bad);
+        if (verdict == ConfirmPolicy.Verdict.NotOurs)
         {
-            case ConfirmPolicy.Verdict.PressByText:
-                addon = own;
-                return true;
-            case ConfirmPolicy.Verdict.PressFresh:
-                if (logNow)
-                    ctx.Log.Warn("交換", $"確認の本文が想定と違いますが、撃った直後に自分の操作で開いたものなので答えます：{body}（探した語：{currencyName}・{offer.Price}）");
-                addon = own;
-                return true;
-            case ConfirmPolicy.Verdict.NotOurs:
-                if (logNow)
-                    ctx.Log.Warn("交換", $"確認が出ていますが、撃った後に自分の操作で開いたものではないので押しません：{body}");
-                return false;
-            case ConfirmPolicy.Verdict.Dangerous:
-                if (logNow)
-                    ctx.Log.Warn("交換", $"確認に「{bad}」が含まれるので押しません：{body}");
-                return false;
-            default:
-                if (logNow)
-                    ctx.Log.Warn("交換", $"確認が出ていますが、交換のものと判断できないので押しません：{body}");
-                return false;
+            // 記録は5秒に1回まで（毎フレーム呼ばれるため）
+            if (DateTime.UtcNow - this.lastUnmatchedLog >= TimeSpan.FromSeconds(5))
+            {
+                this.lastUnmatchedLog = DateTime.UtcNow;
+                ctx.Log.Warn("交換", $"確認が出ていますが、撃った後に自分の操作で開いたものではないので押しません：{body}");
+            }
+
+            return verdict;
         }
+
+        addon = own;
+        return verdict;
     }
 
     // ---- 閉じる ----
@@ -1859,33 +1878,36 @@ public sealed unsafe class UseBooksTask : AutoTask
             return TaskResult.Running;
         }
 
-        // 確認（SelectYesno）に答えるのは、本を使った後に自分の操作で開いた確認だけ（以前は
-        // 本の名前が本文にあれば所有を確かめずに押していた）。そのうえで、危ない語を含まず、
-        //  1) 本文に本の名前がある、または 2) 使ってから10秒以内 のときだけ「はい」
-        // （本の名前だけでは、利用者が出した「〇〇秘伝書を捨てますか？」にも「はい」を押しうる）。
+        // 確認（SelectYesno）に答えるのは、本を使った後に自分の操作で開いた確認だけ。
+        // そのうえで、危ない語を含まず、本文に本の名前があるときだけ「はい」（以前は使ってから10秒以内なら
+        // 本文が違っても押していた）。危ない語を含む・何の確認か分からない自分の確認は、押さずに止める（記録に中身を残す）。
+        // なお、秘伝書を使うときの確認の文面はゲームデータに見当たらない（ふつうは確認が出ないと見込む。実機で確かめる項目）
         var text = GameUi.YesnoText(out var yesno);
         if (text != null && DateTime.UtcNow - this.lastClick > TimeSpan.FromMilliseconds(400))
         {
             var owned2 = ctx.Ownership.TryGetOwnedSince("SelectYesno", this.usedAt, out var own) && (nint)own == (nint)yesno;
-            var verdict = ConfirmPolicy.Decide(owned2, text, [name], null, DateTime.UtcNow - this.usedAt, out var bad);
-            if (verdict is ConfirmPolicy.Verdict.PressByText or ConfirmPolicy.Verdict.PressFresh)
+            var verdict = ConfirmPolicy.Decide(owned2, text, [name], null, out var bad);
+            switch (verdict)
             {
-                this.lastClick = DateTime.UtcNow;
-                ctx.Log.Write("秘伝書", $"確認に「はい」と答えます（{(verdict == ConfirmPolicy.Verdict.PressByText ? "本の名前が本文にある" : "使った直後に自分の操作で開いた確認")}）：{text}");
-                if (!GameUi.ClickYes(yesno))
-                    return this.Fail($"確認の「はい」が押せる状態ではありません：{text}");
-                return TaskResult.Running;
-            }
+                case ConfirmPolicy.Verdict.PressByText:
+                    this.lastClick = DateTime.UtcNow;
+                    ctx.Log.Write("秘伝書", $"確認に「はい」と答えます（本の名前が本文にある）：{text}");
+                    if (!GameUi.ClickYes(yesno))
+                        return this.Fail($"確認の「はい」が押せる状態ではありません：{text}");
+                    return TaskResult.Running;
 
-            if (DateTime.UtcNow - this.lastUnmatchedLog >= TimeSpan.FromSeconds(5))
-            {
-                this.lastUnmatchedLog = DateTime.UtcNow;
-                ctx.Log.Warn("秘伝書", verdict switch
-                {
-                    ConfirmPolicy.Verdict.Dangerous => $"確認に「{bad}」が含まれるので押しません：{text}",
-                    ConfirmPolicy.Verdict.NotOurs => $"確認が出ていますが、本を使った後に自分の操作で開いたものではないので押しません：{text}",
-                    _ => $"確認が出ていますが、秘伝書のものと判断できないので押しません：{text}",
-                });
+                case ConfirmPolicy.Verdict.Dangerous:
+                    DebugLog.Current?.Block("秘伝書", "危ない語を含む確認", AddonRecorder.Describe(yesno));
+                    return this.Fail($"秘伝書を使った後の確認に「{bad}」が含まれるので、押さずに止めました：{text}");
+
+                case ConfirmPolicy.Verdict.Unrecognized:
+                    DebugLog.Current?.Block("秘伝書", "何の確認か分からない", AddonRecorder.Describe(yesno));
+                    return this.Fail($"秘伝書を使った後に、秘伝書の確認と判断できない確認が出たので、押さずに止めました（本文：{text}）。記録に画面の中身を残しました");
+
+                case ConfirmPolicy.Verdict.NotOurs when DateTime.UtcNow - this.lastUnmatchedLog >= TimeSpan.FromSeconds(5):
+                    this.lastUnmatchedLog = DateTime.UtcNow;
+                    ctx.Log.Warn("秘伝書", $"確認が出ていますが、本を使った後に自分の操作で開いたものではないので押しません：{text}");
+                    break;
             }
         }
 

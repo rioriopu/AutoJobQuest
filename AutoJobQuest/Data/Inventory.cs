@@ -13,6 +13,7 @@ namespace AutoJobQuest.Data;
 ///  ・アーマリーチェスト … 製作した装備が入ることがある。納品（NPC への受け渡し）でも拾われる
 ///    （Questionable の所持判定も checkArmory: true で数えている：Craft.cs GetOwnedItemCount）。
 /// 装備中の品は数えない（納品で外されると困るため）。リテイナー・チョコボかばんも数えない。
+/// ギアセットに登録された品は、ギアセット1つが使う数（装備中の分を除く）だけ手持ちから引く（利用者の装備を納品物と数えない：GearsetGuard）。
 /// </summary>
 public sealed unsafe class Inventory : IInventoryView
 {
@@ -61,6 +62,23 @@ public sealed unsafe class Inventory : IInventoryView
 
                 var dict = (slot->Flags & InventoryItem.ItemFlags.HighQuality) != 0 ? inv.hq : inv.nq;
                 dict[slot->ItemId] = dict.GetValueOrDefault(slot->ItemId) + slot->Quantity;
+            }
+        }
+
+        // ギアセットの品を引く（以前はアーマリーにある利用者の装備・道具を納品物の手持ちと数えた）。
+        // 装備中の分はもともと数えていないので、引くのは「ギアセットが使う数 − 装備中の数」だけ
+        var pieces = GearsetGuard.Read();
+        if (pieces.Count > 0)
+        {
+            var equipped = GearsetGuard.EquippedCounts();
+            foreach (var ((item, isHq), n) in GearsetGuard.ProtectedCounts(pieces))
+            {
+                var keep = n - equipped.GetValueOrDefault((item, isHq));
+                if (keep <= 0)
+                    continue;
+                var dict = isHq ? inv.hq : inv.nq;
+                if (dict.TryGetValue(item, out var have))
+                    dict[item] = Math.Max(0, have - keep);
             }
         }
 
@@ -120,6 +138,9 @@ public sealed unsafe class Inventory : IInventoryView
         if (materiaItemId is { } mid)
             want = MateriaCatalog.Find(mid);
 
+        // 利用者のギアセットの品（付いたマテリアまで一致する品）は「装着済み」に数えない
+        var pieces = GearsetGuard.Read();
+
         foreach (var type in Containers)
         {
             var c = im->GetInventoryContainer(type);
@@ -132,6 +153,8 @@ public sealed unsafe class Inventory : IInventoryView
                 if (slot == null || slot->ItemId != itemId)
                     continue;
                 if (hqOnly && (slot->Flags & InventoryItem.ItemFlags.HighQuality) == 0)
+                    continue;
+                if (GearsetGuard.IsProtectedMelded(itemId, (slot->Flags & InventoryItem.ItemFlags.HighQuality) != 0, MateriaOf(slot), pieces))
                     continue;
 
                 for (byte m = 0; m < 5; m++)
@@ -148,6 +171,19 @@ public sealed unsafe class Inventory : IInventoryView
         }
 
         return false;
+    }
+
+    /// <summary>その枠の品に付いたマテリア（種類と等級）。</summary>
+    public static List<Automation.MateriaRef> MateriaOf(InventoryItem* slot)
+    {
+        var list = new List<Automation.MateriaRef>();
+        for (var m = 0; m < 5; m++)
+        {
+            if (slot->Materia[m] != 0)
+                list.Add(new Automation.MateriaRef(slot->Materia[m], slot->MateriaGrades[m]));
+        }
+
+        return list;
     }
 
     /// <summary>

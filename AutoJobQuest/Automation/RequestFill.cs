@@ -39,6 +39,12 @@ public interface IRequestWindow
     /// <summary>窓の情報（エージェント）が使える状態か。</summary>
     bool Ready { get; }
 
+    /// <summary>
+    /// その品が利用者のギアセットの品か（マテリアの種類と等級まで一致する品。渡さない）。
+    /// 偽物の窓では既定で false。
+    /// </summary>
+    bool IsProtected(TurnInItem item) => false;
+
     /// <summary>ゲーム自身の判定で、手持ちで窓の条件を満たせるか（NpcTrade.CanSatisfyRequests。読めなければ null）。</summary>
     bool? CanSatisfy { get; }
 
@@ -478,12 +484,14 @@ public sealed class RequestFiller
     ///  0) 後の欄を満たせなくなる候補を避ける（<paramref name="keepsRest"/>。後の欄が無ければ見ない）
     ///  1) 1つの山で求める数に届く（重ねられる品で、山が分かれているとき）
     ///  2) マテリアの種類が求めるものと合う（求める種類が読めたときだけ。合う候補が無ければ数だけで選ぶ）
-    ///  3) HQ 指定が無ければ NQ（HQ は後の HQ 指定のために残す）
+    ///  3) マテリアを求めない欄なら、マテリアの付いていない品（利用者がマテリアを付けた品を渡さない）
+    ///  4) HQ 指定が無ければ NQ（HQ は後の HQ 指定のために残す）
+    /// 利用者のギアセットの品（マテリアまで一致する品：<see cref="IRequestWindow.IsProtected"/>）は選ばない。それしか合わなければ -1。
     /// </summary>
     public static int Choose(RequestSlot req, IRequestWindow window, out string why, Func<TurnInItem, bool>? keepsRest = null)
     {
         var best = -1;
-        var bestScore = (Keeps: 0, Enough: 0, Type: 0, Nq: 0);
+        var bestScore = (Keeps: 0, Enough: 0, Type: 0, Plain: 0, Nq: 0);
         TurnInItem? chosen = null;
         var seen = new List<string>();
         var n = window.OptionCount;
@@ -497,11 +505,17 @@ public sealed class RequestFiller
 
             if (it.BaseItemId != req.ItemId || !Matches(req, it))
                 continue;
+            if (window.IsProtected(it))
+            {
+                seen[^1] += "（ギアセットの品なので渡さない）";
+                continue;
+            }
 
             var score = (
                 Keeps: keepsRest == null || keepsRest(it) ? 1 : 0,
                 Enough: it.Quantity >= Math.Max(1, req.Quantity) ? 1 : 0,
                 Type: MateriaTypesMatch(req, it) ? 1 : 0,
+                Plain: req.WantMateria > 0 || it.Materia == 0 ? 1 : 0,
                 Nq: !req.WantHq && !it.Hq ? 1 : 0);
             if (best < 0 || score.CompareTo(bestScore) > 0)
             {
@@ -524,6 +538,8 @@ public sealed class RequestFiller
             notes.Add($"1つの山では {req.Quantity} 個に届かない");
         if (req.WantMateriaTypes.Any(m => m.Id != 0))
             notes.Add(bestScore.Type == 1 ? "マテリアの種類が一致" : "マテリアの種類が一致する候補が無いので数だけで選んだ");
+        if (bestScore.Plain == 0)
+            notes.Add("マテリアの付いていない品が無いため、マテリア付きの品");
         if (!req.WantHq && chosen.Hq)
             notes.Add("NQ が無いため");
         why = $"{(chosen.Hq ? "HQ" : "NQ")}の品（{string.Join("・", notes)}）";
@@ -643,9 +659,15 @@ public sealed unsafe class GameRequestWindow : IRequestWindow
             window->Close(false);
     }
 
+    // 利用者のギアセットの品（その窓の間だけ読み直す。GearsetGuard）
+    private List<GearsetPiece> pieces = [];
+
+    public bool IsProtected(TurnInItem item) => GearsetGuard.IsProtectedMelded(item.BaseItemId, item.Hq, item.MateriaTypes, this.pieces);
+
     public IReadOnlyList<TurnInItem> OwnedItems()
     {
         var list = new List<TurnInItem>();
+        this.pieces = GearsetGuard.Read();
         var im = InventoryManager.Instance();
         if (im == null)
             return list;
@@ -657,8 +679,13 @@ public sealed unsafe class GameRequestWindow : IRequestWindow
             for (var i = 0; i < c->Size; i++)
             {
                 var s = c->GetInventorySlot(i);
-                if (s != null && s->ItemId != 0)
-                    list.Add(FromSlot(s));
+                if (s == null || s->ItemId == 0)
+                    continue;
+
+                // 利用者のギアセットの品（マテリアまで一致）は、手持ちとして数えない（渡さない）
+                var item = FromSlot(s);
+                if (!this.IsProtected(item))
+                    list.Add(item);
             }
         }
 

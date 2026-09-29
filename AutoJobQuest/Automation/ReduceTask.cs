@@ -103,10 +103,16 @@ public sealed unsafe class ReduceTask : AutoTask
         return blocked == null;
     }
 
-    /// <summary>精選の元のうち、いまの採掘師・園芸師のレベルで採れるもの（採れる見込みの高い順）。</summary>
+    /// <summary>
+    /// 精選の元のうち、いまの採掘師・園芸師で採れるもの（採れる見込みの高い順）：採集点のレベルが足りて、その職の「収集品採集」が
+    /// 使える（ゲームデータ：収集品採集はクエスト「職人の新たなお仕事」で解放。未完了だと GBR は収集品を見た時点で
+    /// 採集をやめる＝GBR の AutoGather.cs。以前は確かめず、精選の周回がむだになりえた）。使えるか確かめられないときは外さない。
+    /// </summary>
     public static List<uint> UsableSources(SourceIndex sources, uint itemId)
         => sources.Get(itemId).ReducedFrom
-            .Where(src => sources.Get(src).Gather.Any(g => Jobs.Level(g.Mining ? Jobs.Gatherers[0] : Jobs.Gatherers[1]) >= g.GatheringLevel))
+            .Where(src => sources.Get(src).Gather.Any(g =>
+                Jobs.Level(g.Mining ? Jobs.Gatherers[0] : Jobs.Gatherers[1]) >= g.GatheringLevel
+                && GatherAbilities.Usable(g.Mining ? GatherAbilities.MinerCollect : GatherAbilities.BotanistCollect) != false))
             .ToList();
 
     protected override TaskResult OnStart(TaskContext ctx)
@@ -120,11 +126,25 @@ public sealed unsafe class ReduceTask : AutoTask
 
         ctx.Log.Write("精選", $"{CraftPlanner.ItemName(this.need.ItemId)} を {this.need.TargetOwned} 個まで集めます（今 {this.Owned} 個）。元にする収集品：{string.Join("、", this.sources.Select(CraftPlanner.ItemName))}");
 
+        // 前から持っている元の収集品は精選しない（以前は利用者が別の目的で持っている収集品まで使っていた。
+        // GBR の自動精選を切った理由と同じ）。始めた時点の数を控え、それより増えた分（この作業で採った分）だけを精選する
+        var held = Inventory.HeldCollectables();
+        foreach (var src in this.need.Sources)
+        {
+            var n = held.GetValueOrDefault(src);
+            this.keepCollectables[src] = n;
+            if (n > 0)
+                ctx.Log.Write("精選", $"前から持っている {CraftPlanner.ItemName(src)}（収集品）{n} 個は精選しません");
+        }
+
         // 精選の結果の窓は、自分の精選で開いたものだけ閉じる（記録を始める）
         ctx.Ownership.Clear();
         ctx.Ownership.IsClaiming = true;
         return TaskResult.Running;
     }
+
+    // 始めた時点で持っていた元の収集品の数（元の品 → 数。これを超えた分だけ精選する）
+    private readonly Dictionary<uint, int> keepCollectables = [];
 
     protected override TaskResult Tick(TaskContext ctx)
     {
@@ -340,12 +360,18 @@ public sealed unsafe class ReduceTask : AutoTask
         return TaskResult.Running;
     }
 
-    /// <summary>カバンの中の、精選の元にする収集品の枠（最初の1つ）。</summary>
+    /// <summary>
+    /// カバンの中の、精選の元にする収集品の枠。始めた時点より増えた元の品だけを対象にし、収集価値の低い個体から使う
+    /// （前から持っていた分と見分けられないので数で守る。価値の高い個体を残す）。無ければ null。
+    /// </summary>
     private InventoryItem* FindSourceSlot()
     {
         var im = InventoryManager.Instance();
         if (im == null)
             return null;
+
+        var held = Inventory.HeldCollectables();
+        InventoryItem* best = null;
         foreach (var type in Inventory.Bags)
         {
             var c = im->GetInventoryContainer(type);
@@ -354,12 +380,17 @@ public sealed unsafe class ReduceTask : AutoTask
             for (var i = 0; i < c->Size; i++)
             {
                 var s = c->GetInventorySlot(i);
-                if (s != null && s->ItemId != 0 && s->IsCollectable() && this.need.Sources.Contains(s->GetBaseItemId()))
-                    return s;
+                if (s == null || s->ItemId == 0 || !s->IsCollectable())
+                    continue;
+                var src = s->GetBaseItemId();
+                if (!this.need.Sources.Contains(src) || held.GetValueOrDefault(src) <= this.keepCollectables.GetValueOrDefault(src))
+                    continue;
+                if (best == null || s->SpiritbondOrCollectability < best->SpiritbondOrCollectability)
+                    best = s;
             }
         }
 
-        return null;
+        return best;
     }
 
     private void Go(ReduceStep s, string status)

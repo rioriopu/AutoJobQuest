@@ -51,6 +51,12 @@ public sealed class GameDataCache
     /// <summary>上の秘伝書すべてについての交換店・収集品・窓口の情報。</summary>
     public BookData? Books => this.ready?.Books;
 
+    /// <summary>
+    /// ジョブクエごとに、納品物を作るのに要る秘伝書（SecretRecipeBook の行。中間素材の分も含む。所持数を 0 とみなして数える）。
+    /// 秘伝書の店が未解放のとき、そのクエストを「前提が未達」として外すのに使う。
+    /// </summary>
+    public Dictionary<uint, List<uint>>? QuestBooks => this.ready?.QuestBooks;
+
     // 作っている最中の例外。別のスレッドで書くので volatile
     private volatile string? buildError;
 
@@ -91,11 +97,21 @@ public sealed class GameDataCache
                     .ToList();
                 var books = BookData.Build(allBooks.Select(b => b.BookItemId).Where(x => x != 0), collectable);
 
+                // ジョブクエごとの秘伝書（秘伝書の店が未解放のとき、どのクエストを外すかに使う）
+                var questBooks = new Dictionary<uint, List<uint>>();
+                foreach (var q in quests.Quests)
+                {
+                    var tomes = planner.Build(q.Items, new EmptyInventory(), _ => false).Crafts
+                        .Where(c => c.SecretRecipeBookId != 0).Select(c => c.SecretRecipeBookId).Distinct().ToList();
+                    if (tomes.Count > 0)
+                        questBooks[q.RowId] = tomes;
+                }
+
                 // 全ジョブクエの素材のうち、精選で得られる品（霊砂など。キャラクタータブの表示用）
                 var reducible = all.RawTotal.Keys.Where(k => sources.Get(k).CanReduce).OrderBy(k => k).ToList();
 
                 // ここまで全部そろってから公開する
-                this.ready = new Snapshot(quests, sources, planner, baselines, allBooks, reducible, books);
+                this.ready = new Snapshot(quests, sources, planner, baselines, allBooks, reducible, books, questBooks);
 
                 var log = Core.DebugLog.Current;
                 log?.Line("データ", $"ゲームデータを読みました（{(DateTime.UtcNow - started).TotalSeconds:0.0}秒）：ジョブクエ {quests.Quests.Count} 本、秘伝書 {allBooks.Count} 冊");
@@ -122,7 +138,8 @@ public sealed class GameDataCache
         Dictionary<uint, (int Craftsmanship, int Control)> GearBaselines,
         List<BookNeed> AllBooks,
         List<uint> ReducibleMaterials,
-        BookData Books);
+        BookData Books,
+        Dictionary<uint, List<uint>> QuestBooks);
 
     /// <summary>何も持っていないとみなす所持数（全部作る場合の計算用）。</summary>
     private sealed class EmptyInventory : IInventoryView

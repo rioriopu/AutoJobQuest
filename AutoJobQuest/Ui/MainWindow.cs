@@ -85,6 +85,12 @@ public sealed class MainWindow : Window
                 this.DrawCharacterTab();
         }
 
+        using (var t = ImRaii.TabItem("設定"))
+        {
+            if (t)
+                this.DrawSettingsTab();
+        }
+
         using (var t = ImRaii.TabItem("記録"))
         {
             if (t)
@@ -119,6 +125,10 @@ public sealed class MainWindow : Window
         {
             ImGui.TextColored(Green, "動作中");
             ImGui.TextUnformatted(runner.Root?.Status ?? string.Empty);
+
+            // 流れが中断している（反撃・他者の会話の窓）間は、その理由を出す（作業の上限の時間は止めている）
+            if (WorkClock.PauseReason is { } paused)
+                ImGui.TextColored(Yellow, $"中断中：{paused}（この間は作業の上限の時間を数えていません）");
         }
         else
         {
@@ -136,6 +146,14 @@ public sealed class MainWindow : Window
         if (blocker != null)
             ImGui.TextColored(Yellow, blocker);
         ImGui.TextColored(Yellow, Preflight.Premise);
+
+        // 確かめ待ちの控え（復旧に使える形で出す）
+        if (this.config.PendingPurchase is { } pending)
+            ImGui.TextColored(Red, $"⚠ 前回のマーケット購入の結果が確かめられていません：{pending.Describe()}。マーケットボードの取引履歴で確かめてから始めてください（事前点検の確認で「はい」を押すと控えを消します）");
+        if (this.Ctx.Rotation.RestorePending && !runner.IsRunning)
+            ImGui.TextColored(Grey, "RSR のモード・範囲攻撃の設定を元に戻したかを確かめています（10秒おき。戻っていなければ戻します）");
+        if (this.config.GbrConfigAwaitingSave.Count > 0)
+            ImGui.TextColored(Grey, $"GBR の設定（{string.Join("、", this.config.GbrConfigAwaitingSave.Keys)}）を元に戻しました。保存ファイルに書かれたかを確かめています");
 
         // 戻せなかった GBR のリスト（見つからない・同じ名前が複数）。利用者が GBR で確かめるまで出し続ける
         var unresolved = this.config.GbrUnresolvedListRefs;
@@ -399,7 +417,10 @@ public sealed class MainWindow : Window
     {
         if (ImGui.Button("点検する"))
         {
+            // 点検は、いまの計画を作ってから行う（以前は「計画」の画面を開いたかどうかで、点検の対象が変わっていた）
             this.Ctx.Data.EnsureBuilding();
+            if (this.Ctx.Data.IsReady)
+                this.plan = PlanBuilder.Build(this.Ctx.Data, this.config.SelectedCrafters);
             this.preflight = Preflight.Run(this.Ctx, this.plan);
         }
 
@@ -424,6 +445,70 @@ public sealed class MainWindow : Window
             ImGui.TextColored(color, $"{(item.Severity == Severity.Error ? "×" : item.Severity == Severity.Warn ? "！" : "○")} {item.Text}");
             ImGui.PopTextWrapPos();
         }
+    }
+
+    /// <summary>
+    /// 設定（購入の確認の基準・作り直しの上限などに絞る。入力の範囲を確かめる。内部の控えはここに出さない）。
+    /// 動作中は変えられない（途中で基準が変わると、確認の判断が食い違うため）。
+    /// </summary>
+    private void DrawSettingsTab()
+    {
+        var running = this.services.Runner.IsRunning;
+        ImGui.PushTextWrapPos(0);
+        using (ImRaii.Disabled(running))
+        {
+            ImGui.TextUnformatted("マーケットボードの購入の確認");
+
+            var perPurchase = this.config.ConfirmPurchaseAboveGil;
+            ImGui.SetNextItemWidth(160);
+            if (ImGui.InputInt("1回の購入額がこれを超えたら確かめる（ギル）", ref perPurchase, 10_000, 100_000))
+            {
+                this.config.ConfirmPurchaseAboveGil = Math.Clamp(perPurchase, 0, 999_999_999);
+                this.config.Save();
+            }
+
+            ImGui.TextColored(this.config.ConfirmPurchaseAboveGil == 0 ? Red : Grey,
+                this.config.ConfirmPurchaseAboveGil == 0
+                    ? "0 になっています：1回の購入額では確かめません（確認なしで買います）"
+                    : "既定は 500,000。0 にすると、1回の購入額では確かめません");
+
+            var ratio = (float)this.config.ConfirmUnitPriceRatio;
+            ImGui.SetNextItemWidth(160);
+            if (ImGui.InputFloat("単価が最近の取引の中央値の何倍を超えたら確かめる", ref ratio, 0.5f, 1f, "%.1f"))
+            {
+                // 0（確かめない）か、1.5 倍以上（1倍近くだと、ふつうの値動きで毎回確かめることになる）
+                this.config.ConfirmUnitPriceRatio = ratio <= 0 ? 0 : Math.Clamp(Math.Round(ratio, 1), 1.5, 100);
+                this.config.Save();
+            }
+
+            ImGui.TextColored(Grey, "既定は 3.0。0 で確かめない。取引履歴が届かない品では確かめられません");
+
+            var runTotal = (int)Math.Min(this.config.ConfirmRunTotalAboveGil, 999_999_999);
+            ImGui.SetNextItemWidth(160);
+            if (ImGui.InputInt("この実行でマーケットに払う合計がこれを超えたら確かめる（ギル）", ref runTotal, 100_000, 1_000_000))
+            {
+                this.config.ConfirmRunTotalAboveGil = Math.Clamp(runTotal, 0, 999_999_999);
+                this.config.Save();
+            }
+
+            ImGui.TextColored(Grey, "既定は 0（使わない）。「はい」で続けると、さらにこの額を払ったところでまた確かめます");
+
+            ImGui.Separator();
+            ImGui.TextUnformatted("製作");
+            var retry = this.config.MaxRetryRounds;
+            ImGui.SetNextItemWidth(160);
+            if (ImGui.InputInt("HQ ができなかったとき、同じ品を何回まで作り直すか", ref retry, 1, 1))
+            {
+                this.config.MaxRetryRounds = Math.Clamp(retry, 1, 10);
+                this.config.Save();
+            }
+
+            ImGui.TextColored(Grey, "既定は 3（1〜10）。品目ごとに数え、届いたら何を見直せばよいかを出して止めます");
+        }
+
+        if (running)
+            ImGui.TextColored(Grey, "動作中は変えられません");
+        ImGui.PopTextWrapPos();
     }
 
     /// <summary>

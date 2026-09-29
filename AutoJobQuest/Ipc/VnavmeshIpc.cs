@@ -1,4 +1,7 @@
+using System.Collections.Generic;
 using System.Numerics;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace AutoJobQuest.Ipc;
 
@@ -13,7 +16,7 @@ namespace AutoJobQuest.Ipc;
 ///  ・Path.Stop は全体に効く（他のプラグインが始めた移動も止まる）。自分が始めた移動のときだけ呼ぶ。
 ///  ・Nav.PathfindCancelAll の中身はメッシュの再読み込み（Reload(true)）なので使わない。
 /// </summary>
-public sealed class VnavmeshIpc : IpcGate
+public sealed class VnavmeshIpc : IpcGate, Automation.INavControl
 {
     public override string InternalName => "vnavmesh";
 
@@ -41,6 +44,26 @@ public sealed class VnavmeshIpc : IpcGate
                () => this.Func<Vector3, bool, float, bool>("vnavmesh.SimpleMove.PathfindAndMoveCloseTo")
                    .InvokeFunc(destination, fly, range), out var ok)
            && ok;
+
+    /// <summary>
+    /// 経路だけを求める。あとから取り消せる（vnavmesh の IPCProvider.cs：Nav.PathfindCancelable、
+    /// 型は Func&lt;Vector3, Vector3, bool, CancellationToken, Task&lt;List&lt;Vector3&gt;&gt;&gt;。導入版 1.2.3.14 の DLL にも名前がある）。
+    /// 求めた経路は、こちらが <see cref="MoveAlong"/> を呼ぶまで使われない（SimpleMove と違い、止めた後に遅れて歩き出さない）。
+    /// 戻り値は必ず Task のまま受け取る（List で受け取ると Dalamud が JSON に変えようとして失敗する：実測）。
+    /// 範囲（range）の引数は無い（0 固定）。手前で止めるのはこちらの到着の判断で行う。
+    /// </summary>
+    public bool TryPathfindCancelable(Vector3 from, Vector3 to, bool fly, CancellationToken cancel, out Task<List<Vector3>>? task)
+        => this.TryInvoke("Nav.PathfindCancelable",
+            () => this.Func<Vector3, Vector3, bool, CancellationToken, Task<List<Vector3>>>("vnavmesh.Nav.PathfindCancelable")
+                .InvokeFunc(from, to, fly, cancel), out task);
+
+    /// <summary>
+    /// 求めた経路をたどらせる（vnavmesh の Path.MoveTo。Action なので InvokeAction で呼ぶ）。
+    /// 経路をたどる仕組みは vnavmesh 全体で1つなので、他の経路を上書きする（SimpleMove も同じ）。
+    /// </summary>
+    public bool MoveAlong(List<Vector3> waypoints, bool fly)
+        => this.TraceThen($"Path.MoveTo({waypoints.Count} 点, 飛行={fly})") && this.TryAction("Path.MoveTo",
+            () => this.Func<List<Vector3>, bool, object>("vnavmesh.Path.MoveTo").InvokeAction(waypoints, fly));
 
     /// <summary>
     /// 指定の水平位置の真下（上下 halfExtentXZ の範囲）で、立てる床の点を返す。

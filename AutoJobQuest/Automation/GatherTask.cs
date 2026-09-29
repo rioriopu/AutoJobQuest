@@ -101,6 +101,15 @@ public sealed class GatherTask : AutoTask
         if (!ctx.GatherBuddy.IsLoaded)
             return this.Fail("GatherBuddyReborn が読み込まれていません");
 
+        // 釣りは、始める直前に要るもの（GBR の同意・AutoHook・GBR の UseAutoHook）をもう一度確かめる（
+        // 計画を立て直して初めて釣りが要った・途中で AutoHook を外した・設定を変えた場合に、90分待ってから止まらないように）
+        if (this.Route == Planning.Route.Fish)
+        {
+            var missing = RequiredCapabilities.Fishing(ctx.Gbr.ReadAutoGatherBool("FishDataCollection"), ctx.AutoHook.IsLoaded, ctx.Gbr.ReadAutoGatherBool("UseAutoHook"));
+            if (missing.Count > 0)
+                return this.Fail($"釣りを始められません（{string.Join(" / ", this.needs.Select(n => CraftPlanner.ItemName(n.ItemId)))}）：{string.Join(" / ", missing)}");
+        }
+
         // 動いている・読めないときは始めない（利用者の操作を横取りしない。fail-closed）
         var running = ctx.GatherBuddy.IsAutoGatherEnabled();
         if (running != false)

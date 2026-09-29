@@ -75,6 +75,14 @@ public static class Preflight
         if (!installed.Any(x => x.IsLoaded && x.InternalName is "InventoryTools" or "AllaganItemSearch"))
             list.Add(new PreflightItem(Severity.Warn, "Allagan Tools（または Allagan Item Search）が無いため、GBR の NPC 購入が使えません。NPC で買える素材は別の手段で集めます"));
 
+        // 1.2) 結果の分からないマーケットの購入が残っている。自動では買い直さず、利用者に確かめてもらう。
+        // 「はい」で続けると控えを消す（JobQuestFlow の事前点検の答え）。買えていなければ、次の購入で不足分を買う
+        if (ctx.Config.PendingPurchase is { } pending)
+            list.Add(new PreflightItem(Severity.Warn,
+                $"前回のマーケット購入の結果が確かめられていません：{pending.Describe()}。"
+                + "マーケットボードの「取引履歴」（またはギルと所持品）で、買えたかどうかを確かめてください。"
+                + "確かめたうえで続けるなら「はい」（控えを消します。買えていなければ、足りない分をあらためて買います）"));
+
         // 1.5) 画面の開閉の知らせ（AddonLifecycle）を受け取れないと、自分が開いた選択肢・確認窓を見分けられず、会話や交換が進まない
         if (!ctx.Ownership.Registered)
             list.Add(new PreflightItem(Severity.Error, "画面の開閉の知らせを受け取る仕組みを登録できませんでした（自分が開いた画面を見分けられません）。プラグインを読み込み直してください"));
@@ -186,6 +194,18 @@ public static class Preflight
                         $"{m.Quest}：マテリアを付ける {CraftPlanner.ItemName(m.TargetItemId)}{(m.TargetHq ? "（HQ）" : string.Empty)} がアーマリーチェストにあります。カバンに移してから始めてください"));
             }
 
+            // Questionable の手順に、在庫に関係なく Artisan の既製リストが動く「Craft」手順（作る品の指定が無い）があるクエスト
+            // （木工 Lv1〜25 の6本・調理 Lv53〜60 の4本）。こちらからは止められないので、
+            // 名前を出して、続けるか利用者に決めてもらう（追加製作を防げるとは言わない）
+            var premadeAlways = plan.RemainingQuests
+                .Where(q => QuestionablePaths.CraftSteps(q.ShortId) is { } steps && steps.Any(s => s.ItemId == null))
+                .Select(q => $"{Jobs.Name(q.ClassJobId)} {q}")
+                .ToList();
+            if (premadeAlways.Count > 0)
+                list.Add(new PreflightItem(Severity.Warn,
+                    $"次のクエストは、Questionable の手順で Artisan の既製リストが必ず動きます（在庫に関係なく、手持ちの材料で追加製作します。"
+                    + $"材料が無ければ Questionable が NPC から買い足します。こちらからは止められません）：{string.Join("、", premadeAlways)}"));
+
             // 前提のクエストが自動で進められない（メインクエスト等が未完了）ジョブクエ。
             // 止めずに「どのクエストが未達なので動作保証しない」と注意を出す（確認窓で続けるか決める）。
             // 続けた場合、そのクエストは計画に入れない（素材も集めない）。進められる分だけ進める
@@ -210,6 +230,26 @@ public static class Preflight
         // Questionable が動かしたリストが前回から残っている場合がある
         if (ctx.Artisan.IsLoaded && (ctx.Artisan.IsListRunning() == true || ctx.Artisan.IsEndurance() == true))
             list.Add(new PreflightItem(Severity.Error, "Artisan が動いています（リスト実行中か連続製作中）。Artisan の画面で止めてから始めてください"));
+
+        // 5.95) Artisan の「連続製作が終わったら製作の構えを解く」（ExitCraftStanceEndurance。既定 true：Artisan の Configuration.cs）。
+        // OFF だと製作の後に構えが残り、次の作業（移動・マテリア装着・クエスト）が「動ける状態になるのを待つ」まま止まる。
+        // 利用者の設定なので、こちらからは変えない
+        if (plan != null && plan.Craft.Crafts.Count > 0 && ReadArtisanBool("ExitCraftStanceEndurance") == false)
+            list.Add(new PreflightItem(Severity.Warn,
+                "Artisan の「Exit Crafting Stance After Completion」（連続製作の後に製作の構えを解く）が OFF です。製作の後に構えが残り、次の作業が進まずに止まります。"
+                + "Artisan の設定画面（Endurance の欄）で ON にしてから始めることを勧めます"));
+
+        // 5.96) Artisan の「NQ ができたら連続製作をやめる」「失敗したらやめる」（EnduranceStopNQ・EnduranceStopFail。既定 false：
+        // Artisan の Configuration.cs・EnduranceCraftWatcher.cs）。ON だと1回ずつしか進まず、そのたびに計画を立て直して宿屋からやり直す
+        // 利用者の設定なので変えない
+        if (plan != null && plan.Craft.Crafts.Count > 0)
+        {
+            var stops = new[] { ("EnduranceStopNQ", "NQ ができたら連続製作をやめる"), ("EnduranceStopFail", "製作に失敗したら連続製作をやめる") }
+                .Where(x => ReadArtisanBool(x.Item1) == true).Select(x => $"「{x.Item2}」（{x.Item1}）").ToList();
+            if (stops.Count > 0)
+                list.Add(new PreflightItem(Severity.Warn,
+                    $"Artisan の {string.Join("・", stops)} が ON です。製作が1回ずつしか進まず、そのたびに計画を立て直して時間がかかります（止まりはしません）"));
+        }
 
         // 6) Artisan の簡易製作（設定ファイルを読むだけ）
         var quick = ReadArtisanBool("QuickSynthMode");
