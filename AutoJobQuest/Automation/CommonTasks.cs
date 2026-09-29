@@ -41,6 +41,7 @@ public sealed class MoveToTask : AutoTask
     // 自分の経路探索と追従（取り消せる）。使えないときは SimpleMove で代える
     private readonly OwnPath path = new();
     private bool usingSimpleMove;
+    private Vector3? registeredEnd;
 
     public MoveToTask(Vector3 destination, float range, string label, TimeSpan? limit = null)
     {
@@ -73,7 +74,6 @@ public sealed class MoveToTask : AutoTask
 
         if (this.path.Request(ctx.Navmesh, Me.Position, newDestination, this.fly))
         {
-            ctx.OwnMove.Issued(newDestination, Math.Max(1f, this.range * 0.7f));
             this.interruptionsAtIssue = ctx.OwnMove.Interruptions;
         }
         else
@@ -182,9 +182,19 @@ public sealed class MoveToTask : AutoTask
             }
 
             this.started = true;
-            ctx.OwnMove.Issued(this.destination, Math.Max(1f, this.range * 0.7f));
+            if (this.usingSimpleMove)
+                this.RegisterMovement(ctx, this.destination);
             this.interruptionsAtIssue = ctx.OwnMove.Interruptions;
             this.NextPhase($"{this.label} へ移動中（{this.Distance:0}m）");
+            return TaskResult.Running;
+        }
+
+        if (ctx.OwnMove.Interruptions != this.interruptionsAtIssue)
+        {
+            this.path.Stop(ctx.Navmesh);
+            this.started = false;
+            this.interruptionsAtIssue = ctx.OwnMove.Interruptions;
+            this.Status = "反撃で止めた移動を現在位置から引き直します";
             return TaskResult.Running;
         }
 
@@ -196,6 +206,8 @@ public sealed class MoveToTask : AutoTask
                     this.Status = $"{this.label} への経路を探しています（残り {this.Distance:0}m）";
                     return TaskResult.Running;
                 case OwnPath.State.Following:
+                    if (this.path.FollowingEnd is { } following)
+                        this.RegisterMovement(ctx, following);
                     this.Status = $"{this.label} へ移動中（残り {this.Distance:0}m）";
                     return TaskResult.Running;
                 case OwnPath.State.Stale:
@@ -243,8 +255,14 @@ public sealed class MoveToTask : AutoTask
     /// <summary>自分の移動の控えを消す（控えがこの移動の行き先のときだけ。別の移動の控えは残す）。</summary>
     private void ForgetOwnMove(TaskContext ctx)
     {
-        if (ctx.OwnMove.Destination is { } d && Vector3.Distance(d, this.destination) < 0.01f)
+        if (this.registeredEnd is { } end && ctx.OwnMove.Destination is { } d && Vector3.Distance(d, end) < 0.01f)
             ctx.OwnMove.Clear();
+    }
+
+    private void RegisterMovement(TaskContext ctx, Vector3 end)
+    {
+        this.registeredEnd = end;
+        ctx.OwnMove.Issued(end, Math.Max(1f, this.range * 0.7f));
     }
 
     /// <summary>見張りの名前。</summary>

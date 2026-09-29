@@ -51,9 +51,12 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
     // Henched にしたことと使う前のモードの控え（設定ファイル）。試験では無し
     private readonly Configuration? store;
 
-    public RotationSolverIpc(Configuration? store = null)
+    private readonly Func<bool?> readTargetOverride;
+
+    public RotationSolverIpc(Configuration? store = null, Func<bool?>? readTargetOverride = null)
     {
         this.store = store;
+        this.readTargetOverride = readTargetOverride ?? RsrStateReader.ReadTargetFreelyOverride;
     }
 
     /// <summary>動作モードを切り替える。</summary>
@@ -86,6 +89,20 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
     // 真偽の設定：こちらが変えたもの（名前 → 使う前の値）・入れ直した回数・最後に確かめた時刻
     private readonly Dictionary<string, bool> boolTaken = [];
     private readonly Dictionary<string, int> boolResends = [];
+    private readonly HashSet<string> boolWarnings = [];
+    private string? safetyProblem;
+
+    public void BeginRun() => this.boolWarnings.Clear();
+
+    /// <summary>利用者が明示的に現在値を保持する。自動復元の控えだけを破棄し、RSRの設定は変更しない。</summary>
+    public void KeepCurrentBoolSettings()
+    {
+        this.boolTaken.Clear();
+        this.boolResends.Clear();
+        this.store?.RsrBoolOriginals.Clear();
+        this.store?.Save();
+    }
+
     private DateTime lastBoolCheck = DateTime.MinValue;
 
     /// <summary>Henched の間、真偽の設定を false にしておく（3秒に1回だけ確かめる）。</summary>
@@ -107,9 +124,8 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
                     Core.DebugLog.Current?.Line("IPC", $"前回こちらが false にした RSR の {name} が残っています。使い終わったら {d.Original} に戻します");
                     break;
                 case RsrAoe.TakeAction.Warn:
-                    if (this.boolResends.GetValueOrDefault(name) != -1)
+                    if (this.boolWarnings.Add(name))
                     {
-                        this.boolResends[name] = -1; // 警告は1回だけ
                         var msg = current == null
                             ? $"RSR の設定 {name} を読めません（{RsrStateReader.LastError}）。指定外の敵を狙う・FATE の敵に反撃しない可能性があります"
                             : $"RSR の設定 {name} を false にしても戻ります（利用者か RSR が変えた可能性）";
@@ -308,10 +324,10 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
     /// なお AutorotationActive は「State か IsManual」なので、true でも Henched になったことまでは証明しない
     /// （IPC にモードを読む口が無いため。RSR の IPCProvider.cs:274・DataCenter.cs:246）。
     /// </summary>
-    public bool HenchedUnresponsive => this.tracker.Unresponsive;
+    public bool HenchedUnresponsive => this.safetyProblem != null || this.tracker.Unresponsive;
 
     /// <summary><see cref="HenchedUnresponsive"/> のときの理由（記録と停止の文言用）。</summary>
-    public string HenchedProblem => this.tracker.Problem;
+    public string HenchedProblem => this.safetyProblem ?? this.tracker.Problem;
 
     /// <summary>
     /// Henched にする（まだこちらが入れていなければ）。入れる前の RSR のモードを RSR の内部から読んで覚える
@@ -323,6 +339,12 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
     /// </summary>
     public bool EnsureHenched()
     {
+        var externalTarget = this.readTargetOverride();
+        this.safetyProblem = externalTarget == false ? null : externalTarget == true
+            ? "RSR の外部ターゲット指定が有効です。指定外を狙う可能性があるため戦闘を止めます"
+            : "RSR の外部ターゲット指定の状態を読めないため戦闘を止めます";
+        if (this.safetyProblem != null)
+            return false;
         var active = this.IsActive();
 
         // 動作中でも Henched とは限らない（AutorotationActive は「State か IsManual」。利用者が Auto に切り替えた等）。

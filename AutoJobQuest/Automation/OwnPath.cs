@@ -70,6 +70,9 @@ public sealed class OwnPath
     /// <summary>探索中か。</summary>
     public bool Searching => this.task != null;
 
+    /// <summary>実際に渡した経路の終点（探索中の行き先とは分ける）。</summary>
+    public Vector3? FollowingEnd => this.followingEnd;
+
     /// <summary>
     /// 探索を頼む（前の探索は取り消す・捨てる）。取り消せる探索の窓口が使えなければ false（呼び出し側が SimpleMove で代える）。
     /// 前に渡した経路は止めない（新しい経路を渡すまで歩き続ける。止めるのは <see cref="Stop"/>）。

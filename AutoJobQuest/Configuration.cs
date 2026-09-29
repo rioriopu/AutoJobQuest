@@ -18,8 +18,11 @@ public sealed class Configuration : IPluginConfiguration
 {
     public int Version { get; set; } = 1;
 
-    /// <summary>ジョブクエを回すか（木工→調理の順）。</summary>
-    public bool[] SelectedCrafters { get; set; } = new bool[8];
+    /// <summary>AutoRetainerの抑制をこちらが変更し、まだ復元を確認できていないか。</summary>
+    public bool RetainerSuppressionPendingRestore { get; set; }
+
+    /// <summary>ジョブクエを回すか（木工→調理→採掘・園芸・漁師。保存済み設定との互換のためプロパティ名を維持）。</summary>
+    public bool[] SelectedCrafters { get; set; } = new bool[11];
 
     /// <summary>
     /// マーケットボードの購入で、1回の合計金額がこれを超えたら確認窓を出す（ギル）。
@@ -156,10 +159,10 @@ public sealed class Configuration : IPluginConfiguration
     public bool UseArtisanConsumables { get; set; }
 
     /// <summary>
-    /// 実行の間、受注中のほかのクエストをジャーナルで非表示にするか（既定 true）。
+    /// 実行の間、受注中のほかのクエストをジャーナルで非表示にするか（既定 false。実機での確認がまだ少ないため）。
     /// 実行していない間に元の状態へ戻す（控え <see cref="JournalHiddenByMe"/>）。Automation.JournalHide の説明を参照。
     /// </summary>
-    public bool HideOtherQuestsDuringRun { get; set; } = true;
+    public bool HideOtherQuestsDuringRun { get; set; }
 
     /// <summary>こちらがジャーナルで非表示にしたクエスト（クエスト番号 → 元の状態：0＝通常・1＝優先表示）。戻ったのを確かめたら消す。</summary>
     public Dictionary<ushort, byte> JournalHiddenByMe { get; set; } = [];
@@ -215,11 +218,11 @@ public sealed class Configuration : IPluginConfiguration
         Data.SpecialCurrency.Fallback = this.SpecialCurrencyFallback;
 
         // 古い設定ファイルで配列の長さが違うと、チェックボックスの描画で範囲外になる
-        if (this.SelectedCrafters is not { Length: 8 })
+        if (this.SelectedCrafters is not { Length: 11 })
         {
-            var fixedArr = new bool[8];
+            var fixedArr = new bool[11];
             if (this.SelectedCrafters != null)
-                Array.Copy(this.SelectedCrafters, fixedArr, Math.Min(8, this.SelectedCrafters.Length));
+                Array.Copy(this.SelectedCrafters, fixedArr, Math.Min(11, this.SelectedCrafters.Length));
             this.SelectedCrafters = fixedArr;
         }
     }

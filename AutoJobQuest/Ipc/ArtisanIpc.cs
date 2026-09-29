@@ -1,3 +1,6 @@
+using System;
+using System.Collections;
+using System.Reflection;
 using System.Linq;
 
 namespace AutoJobQuest.Ipc;
@@ -25,6 +28,31 @@ namespace AutoJobQuest.Ipc;
 public sealed class ArtisanIpc : IpcGate
 {
     public override string InternalName => "Artisan";
+    private readonly Func<uint, bool?> readConsumablesRestored;
+
+    public ArtisanIpc(Func<uint, bool?>? readConsumablesRestored = null)
+        => this.readConsumablesRestored = readConsumablesRestored ?? ReadConsumablesRestored;
+
+    /// <summary>4.0.5.212の一時指定は0で通常設定に戻る。読めない場合は復元済みにしない。</summary>
+    private static bool? ReadConsumablesRestored(uint recipeId)
+    {
+        try
+        {
+            var plugin = RsrStateReader.FindPluginInstance("Artisan");
+            if (plugin == null) return null;
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            var config = plugin.GetType().GetField("Config", flags)?.GetValue(plugin);
+            if (config?.GetType().GetField("RecipeConfigs", flags)?.GetValue(config) is not IDictionary recipes)
+                return null;
+            if (!recipes.Contains(recipeId)) return true;
+            var recipe = recipes[recipeId];
+            if (recipe == null) return null;
+            return recipe.GetType().GetField("TempRequiredFood", flags)?.GetValue(recipe) is uint food
+                && recipe.GetType().GetField("TempRequiredPotion", flags)?.GetValue(recipe) is uint potion
+                ? food == 0 && potion == 0 : null;
+        }
+        catch { return null; }
+    }
 
     public bool CraftItem(ushort recipeId, int crafts)
     {
@@ -60,6 +88,8 @@ public sealed class ArtisanIpc : IpcGate
     /// そのレシピの食事・薬を一時的に「使わない」にする（IPC ChangeFood・ChangePotion の temporary=true。
     /// Artisan の一時指定は [NonSerialized] で保存されない。IPC.cs の ChangeFood・ChangePotion）。両方送れたら true。
     /// </summary>
+    public bool CanDisableConsumables(uint recipeId) => this.readConsumablesRestored(recipeId) == true;
+
     public bool DisableConsumablesTemporarily(uint recipeId)
     {
         this.Trace($"ChangeFood/ChangePotion(レシピ {recipeId}, 使わない, 一時)");
@@ -78,7 +108,7 @@ public sealed class ArtisanIpc : IpcGate
             () => this.Func<uint, object>("Artisan.SetTempFoodBackToNormal").InvokeAction(recipeId));
         var potion = this.TryAction("SetTempPotionBackToNormal",
             () => this.Func<uint, object>("Artisan.SetTempPotionBackToNormal").InvokeAction(recipeId));
-        return food && potion;
+        return food && potion && this.readConsumablesRestored(recipeId) == true;
     }
 
     /// <summary>

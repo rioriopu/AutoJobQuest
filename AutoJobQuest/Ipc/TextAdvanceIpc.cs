@@ -31,6 +31,8 @@ public sealed class TextAdvanceIpc : IpcGate
     }
 
     private bool ownControl;
+    // 応答が失われても取得済みの可能性がある。操作許可とは分けて、依頼者指定の解除を残す。
+    private bool releasePending;
     private bool requestAllowed;
 
     /// <summary>こちらが外部制御を取っているか（ジョブクエを進める間・手動の報告の間）。</summary>
@@ -116,6 +118,16 @@ public sealed class TextAdvanceIpc : IpcGate
         return this.Apply(allow);
     }
 
+    /// <summary>重要な入力の直前に操作権を照合する。空いていれば取得し、他者の所有権は奪わない。</summary>
+    public bool EnsureTurnInControl()
+    {
+        if (this.Apply(false))
+            return true;
+        this.ownControl = false;
+        this.requestAllowed = false;
+        return false;
+    }
+
     private bool Apply(bool allowRequest)
     {
         var cfg = new ExternalTerritoryConfig
@@ -132,10 +144,13 @@ public sealed class TextAdvanceIpc : IpcGate
         };
 
         this.Trace($"EnableExternalControl（納品窓の入力={(allowRequest ? "TextAdvance に任せる" : "こちらで行う")}）");
-        var ok = this.TryInvoke("EnableExternalControl",
+        this.releasePending = true;
+        var received = this.TryInvoke("EnableExternalControl",
                      () => this.Func<string, ExternalTerritoryConfig, bool>("TextAdvance.EnableExternalControl")
-                         .InvokeFunc(Plugin.InternalNameConst, cfg), out var accepted)
-                 && accepted;
+                         .InvokeFunc(Plugin.InternalNameConst, cfg), out var accepted);
+        if (received)
+            this.releasePending = accepted;
+        var ok = received && accepted;
         if (ok)
         {
             this.ownControl = true;
@@ -148,7 +163,7 @@ public sealed class TextAdvanceIpc : IpcGate
     /// <summary>こちらが取った外部制御を解除する。</summary>
     public void ReleaseControl()
     {
-        if (!this.ownControl)
+        if (!this.ownControl && !this.releasePending)
             return;
 
         this.Trace("DisableExternalControl");
@@ -159,6 +174,7 @@ public sealed class TextAdvanceIpc : IpcGate
             && released)
         {
             this.ownControl = false;
+            this.releasePending = false;
             this.requestAllowed = false;
         }
     }

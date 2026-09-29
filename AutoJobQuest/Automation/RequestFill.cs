@@ -434,7 +434,7 @@ public sealed class RequestFiller
 
     /// <summary>納品窓の品番を元の品番に直す（HQ は +1,000,000、収集品は +500,000 されている）。</summary>
     public static uint BaseItemId(uint raw)
-        => raw >= 1_000_000 ? raw - 1_000_000 : raw >= 500_000 ? raw - 500_000 : raw;
+        => raw >= 2_000_000 ? raw : raw >= 1_000_000 ? raw - 1_000_000 : raw >= 500_000 ? raw - 500_000 : raw;
 
     private static string Describe(RequestSlot req)
         => $"{CraftPlanner.ItemName(req.ItemId)}{(req.WantHq ? " HQ" : string.Empty)}"
@@ -764,7 +764,7 @@ public sealed unsafe class GameRequestWindow : IRequestWindow
         var im = InventoryManager.Instance();
         if (im == null)
             return list;
-        foreach (var type in Inventory.Containers)
+        foreach (var type in Inventory.Containers.Append(InventoryType.KeyItems))
         {
             var c = im->GetInventoryContainer(type);
             if (c == null || !c->IsLoaded)
@@ -785,10 +785,14 @@ public sealed unsafe class GameRequestWindow : IRequestWindow
         return list;
     }
 
-    public int CountOwned(uint itemId) => Inventory.Snapshot().CountAll(itemId);
+    public int CountOwned(uint itemId) => itemId >= 2_000_000
+        ? this.OwnedItems().Where(x => x.BaseItemId == itemId).Sum(x => x.Quantity)
+        : Inventory.Snapshot().CountAll(itemId);
 
     private static TurnInItem FromSlot(InventoryItem* it)
     {
+        if (it->Container == InventoryType.KeyItems)
+            return new TurnInItem(it->ItemId, false, 0, false, 0, it->Quantity) { Container = (int)it->Container, SlotIndex = it->Slot };
         var count = it->GetMateriaCount();
 
         // マテリアの種類（ゲームは必須の条件として候補を絞る）。読む関数（位置で呼ぶ）が見つからなければ空にする

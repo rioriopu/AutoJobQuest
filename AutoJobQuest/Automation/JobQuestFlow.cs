@@ -29,6 +29,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
     private enum Stage
     {
         WaitData,
+        Retainers,
         Preflight,
         WaitPreflightAnswer,
         Unlock,
@@ -87,6 +88,9 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
 
     // 今の製作の列で頼んだ製作（終わったら HQ 失敗を品目ごとに数える）
     private readonly List<CraftOneTask> craftTasks = [];
+    private Ipc.ArtisanHqEstimate.Job? hqCheck;
+    private JobQuestPlan? preflightPlan;
+
     private HqFailureTally hqFailures = new(3);
 
     // 攻撃されたときの反撃と、こちらの会話ではない会話の窓を閉じる
@@ -95,13 +99,16 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
 
     public JobQuestFlow(bool[] selected)
     {
-        this.selected = selected;
+        this.selected = (bool[])selected.Clone();
     }
 
     public override string Name => "ジョブクエ自動化";
 
     protected override TaskResult OnStart(TaskContext ctx)
     {
+        if (Jobs.StartProblem(this.selected, Jobs.Level) is { } levelProblem)
+            return this.Fail(levelProblem);
+        ctx.Rotation.BeginRun();
         MarketBoardTask.SpentThisRun = 0;
         MarketBoardTask.RunApprovedUpTo = Math.Max(0, ctx.Config.ConfirmRunTotalAboveGil);
         Unlocks.GaveUp.Clear();
@@ -186,7 +193,8 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
                     return this.Elapsed > TimeSpan.FromMinutes(3) ? this.Fail("ゲームデータの読み込みが終わりません") : TaskResult.Running;
                 }
 
-                this.stage = Stage.Preflight;
+                this.stage = Stage.Retainers;
+                this.child = new RetainerStockTask(() => this.Plan(ctx));
                 return TaskResult.Running;
 
             case Stage.Preflight:
@@ -199,6 +207,10 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
                     return TaskResult.Running;
                 if (ans == false)
                     return this.Fail("事前点検の確認で「いいえ」が選ばれました");
+
+                if (this.hqCheck?.IsCurrent() != true || this.preflightPlan == null
+                    || PreflightSession.PlanKey(this.preflightPlan) != PreflightSession.PlanKey(this.Plan(ctx)))
+                    return this.Fail("確認待ちの間に HQ 計算の条件が変わりました。もう一度開始して点検し直してください");
 
                 // 結果の分からない購入の控えは、利用者が確かめたので消す（確かめる文言は事前点検の項目に出している）
                 if (ctx.Config.PendingPurchase is { } pending)
@@ -268,7 +280,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
 
     private TaskResult RunPreflight(TaskContext ctx)
     {
-        var plan = this.Plan(ctx);
+        var plan = this.preflightPlan ??= this.Plan(ctx);
         if (plan.NothingToDo)
         {
             // 残りが全部「前提が未達で進められない」なら、完了ではないので理由を出して止める
@@ -280,11 +292,21 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
             return TaskResult.Running;
         }
 
+        this.hqCheck ??= Preflight.BeginHq(plan);
+        this.hqCheck.Tick();
+        if (!this.hqCheck.Complete)
+        {
+            this.Status = this.hqCheck.Status;
+            return TaskResult.Running;
+        }
+
         ctx.Log.Write("計画", $"残りのジョブクエ {plan.RemainingQuests.Count} 本／製作 {plan.Craft.Crafts.Sum(c => c.Crafts)} 回／足りない素材 {plan.Shortfalls.Count()} 品目");
         foreach (var w in plan.Warnings)
             ctx.Log.Warn("計画", w);
 
-        var items = Preflight.Run(ctx, plan);
+        if (PreflightSession.PlanKey(plan) != PreflightSession.PlanKey(this.Plan(ctx)))
+            return this.Fail("HQ 計算中に在庫・クエストの計画が変わりました。もう一度開始して点検し直してください");
+        var items = Preflight.Run(ctx, plan, this.hqCheck);
         var errors = items.Where(i => i.Severity == Severity.Error).ToList();
         if (errors.Count > 0)
         {
@@ -1089,6 +1111,11 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
     {
         switch (this.stage)
         {
+            case Stage.Retainers:
+                this.preflightPlan = null;
+                this.stage = Stage.Preflight;
+                ctx.Log.Write("計画", "引き出し後の実在庫から製作・素材の計画を作り直します。この実行中は呼び鈴へ戻りません");
+                break;
             case Stage.Unlock:
                 // 解放の段は1回だけ。ここから先は、解放済みの機能だけを入手手段にする（ReduceTask.Usable）
                 Unlocks.UnlockStagePassed = true;
@@ -1139,6 +1166,9 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
 
     public override void Cleanup(TaskContext ctx)
     {
+        this.hqCheck?.Dispose();
+        this.hqCheck = null;
+
         // 中断の時計を止めたままにしない（次の実行の作業時間を狂わせない）
         WorkClock.Resume();
 

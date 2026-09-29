@@ -160,7 +160,7 @@ public static unsafe class GameUi
     /// （同じフレームでターゲットと話しかけを行うと効かないことがある）。
     /// 呼び出し側は1秒程度の間隔を置いて繰り返し呼ぶこと。
     /// </summary>
-    public static bool Interact(Dalamud.Game.ClientState.Objects.Types.IGameObject obj)
+    public static bool Interact(Dalamud.Game.ClientState.Objects.Types.IGameObject obj, bool checkLineOfSight = false)
     {
         var ts = TargetSystem.Instance();
         if (ts == null)
@@ -174,7 +174,7 @@ public static unsafe class GameUi
         }
 
         var go = (GameObject*)obj.Address;
-        var ok = ts->InteractWithObject(go, false) != 0;
+        var ok = ts->InteractWithObject(go, checkLineOfSight) != 0;
         Core.DebugLog.Current?.Line("操作", $"話しかけ: {obj.Name.TextValue}（BaseId {obj.BaseId}、距離 {System.Numerics.Vector3.Distance(obj.Position, Me.Position):0.0}m）→ {(ok ? "受け付け" : "受け付けられず")}");
         return ok;
     }

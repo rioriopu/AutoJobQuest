@@ -136,6 +136,7 @@ public sealed class JobQuestPlan
     /// 製作の計画・素材集めは、これを基にする（RemainingQuests の Items をそのまま使わない）。
     /// </summary>
     public List<QuestItemReq> Targets { get; } = [];
+    public List<QuestItemReq> RetainerTargets { get; } = [];
 
     /// <summary>クエストの今の段（納品物がもう要らない・手持ちで進めるものだけ。画面・記録用）。</summary>
     public Dictionary<uint, Automation.QuestItemStage.Stage> ItemStages { get; } = [];
@@ -219,9 +220,9 @@ public static class PlanBuilder
         }
 
         var jobs = new HashSet<uint>();
-        for (var i = 0; i < selected.Length && i < Jobs.Crafters.Length; i++)
+        for (var i = 0; i < selected.Length && i < Jobs.QuestJobs.Length; i++)
             if (selected[i])
-                jobs.Add(Jobs.Crafters[i]);
+                jobs.Add(Jobs.QuestJobs[i]);
 
         // 残りのジョブクエ。前提のクエスト（メインクエスト等）が未完了で自動では進められないものは分けて、計画に入れない
         // （開始時に「未達なので動作保証しない」と注意を出し、進められる分だけ進める。
@@ -246,12 +247,19 @@ public static class PlanBuilder
                 plan.PartialNeeds[q.RowId] = needs.Needed;
             }
 
-            plan.Targets.AddRange(needs.Needed);
+            plan.RetainerTargets.AddRange(needs.Needed);
+            // 取引可能な魚・鉱石などは先に用意できる。専用品は受注後のQuestionableの採集手順で得る。
+            plan.Targets.AddRange(needs.Needed.Where(n => !Jobs.IsGatherer(q.ClassJobId)
+                || !Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRow(n.ItemId).IsUntradable));
 
             // Questionable の「Craft」手順のうち、納品物ではない品（中間素材）の手順は、手元に無いと Artisan の既製リストが動いて
             // 追加製作・材料の買い足しになる。その数も手元に残るよう作る（まだ手順の前のクエストだけ）
             if (stage == Automation.QuestItemStage.Stage.All)
-                plan.Targets.AddRange(QuestionableHolds(q, QuestionablePaths.CraftSteps(q.ShortId)));
+            {
+                var holds = QuestionableHolds(q, QuestionablePaths.CraftSteps(q.ShortId)).ToList();
+                plan.Targets.AddRange(holds);
+                plan.RetainerTargets.AddRange(holds);
+            }
         }
 
         // 1) 製作計画（納品物 → 中間素材 → 末端素材）
@@ -426,9 +434,9 @@ public static class PlanBuilder
         if (data.Quests == null)
             return [];
         var jobs = new HashSet<uint>();
-        for (var i = 0; i < selected.Length && i < Jobs.Crafters.Length; i++)
+        for (var i = 0; i < selected.Length && i < Jobs.QuestJobs.Length; i++)
             if (selected[i])
-                jobs.Add(Jobs.Crafters[i]);
+                jobs.Add(Jobs.QuestJobs[i]);
         return FindBlocked(data.Quests.Quests.Where(q => jobs.Contains(q.ClassJobId)), PrereqContext.FromGame(data));
     }
 

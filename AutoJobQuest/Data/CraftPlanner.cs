@@ -45,6 +45,7 @@ public sealed record PlannedCraft(
 /// <summary>製作計画の結果。</summary>
 public sealed class CraftPlan
 {
+    public Dictionary<uint, (int Any, int Hq, int Parent)> StockDemand { get; } = [];
     /// <summary>作る順（下位の中間素材から）。</summary>
     public List<PlannedCraft> Crafts { get; } = [];
 
@@ -210,6 +211,7 @@ public sealed class CraftPlanner
                 done.Add(item);
                 progress = true;
 
+                plan.StockDemand[item] = (anyDemand.GetValueOrDefault(item), hqDemand.GetValueOrDefault(item), parentDemand.GetValueOrDefault(item));
                 var r = recipeOf[item];
                 var yield = Math.Max(1, (int)r.AmountResult);
                 var (crafts, reserve) = SplitCrafts(
@@ -244,6 +246,7 @@ public sealed class CraftPlanner
             if (total <= 0)
                 continue;
 
+            plan.StockDemand[item] = (anyDemand.GetValueOrDefault(item), hqDemand.GetValueOrDefault(item), parentDemand.GetValueOrDefault(item));
             plan.RawTotal[item] = total;
             var shortfall = NetNeed(item, anyDemand, hqDemand, inv);
             if (shortfall > 0)

@@ -24,6 +24,20 @@ public static class Jobs
     /// <summary>画面に出す短い名前（チェックボックス用）。並びは <see cref="Crafters"/> と同じ。</summary>
     public static readonly string[] CrafterShortNames = ["木工", "鍛冶", "甲冑", "彫金", "革細工", "裁縫", "錬金", "調理"];
 
+    public static readonly uint[] QuestJobs = [.. Crafters, .. Gatherers];
+
+    public static readonly string[] QuestJobNames = [.. CrafterShortNames, "採掘", "園芸", "漁師"];
+
+    public const int MinimumAutomationLevel = 70;
+
+    public static string? StartProblem(bool[] selected, System.Func<uint, int> level)
+    {
+        var targets = QuestJobs.Where((_, i) => i < selected.Length && selected[i]).ToList();
+        if (targets.Count == 0) return "自動化する職を選んでください";
+        var low = targets.Where(j => level(j) < MinimumAutomationLevel).ToList();
+        return low.Count == 0 ? null : "対象職はLv70以上が必要です：" + string.Join("・", low.Select(j => $"{Name(j)} Lv{level(j)}"));
+    }
+
     public static bool IsCrafter(uint classJobId) => classJobId is >= 8 and <= 15;
 
     public static bool IsGatherer(uint classJobId) => classJobId is >= 16 and <= 18;

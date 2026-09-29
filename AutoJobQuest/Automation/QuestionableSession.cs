@@ -84,7 +84,9 @@ public sealed class QuestionablePriorityGuard
         if (this.mine == null)
             return null;
         var now = q.ExportQuestPriority();
-        if (now == null || now == this.mine)
+        if (now == null)
+            return "Questionable の優先リストを読めないので、進行を止めます";
+        if (now == this.mine)
             return null;
 
         log.Warn("クエスト", "Questionable の優先リストが途中で書き換わっていたので、このクエストだけに入れ直します（優先リストの窓の「Job Quests」プリセットを開いたままだと、職が変わるたびに書き換わります）");
@@ -292,7 +294,7 @@ public sealed class GoToTask : AutoTask
             this.aethernetRequested = false;
         }
 
-        var target = NearestNode(this.territory, this.position);
+        var target = NearestNode(this.territory, this.position, IsNodeUnlocked);
         if (target == null)
             return this.Fail($"{TeleportTask.TerritoryName(this.territory)} へ行くエーテライト・エーテルネットの中継点が見つかりません");
 
@@ -305,10 +307,10 @@ public sealed class GoToTask : AutoTask
         }
 
         // 行き先の組に、いまのエリアの中継点・エーテライトが入っているか
-        var here = sheet.Where(a => a.Territory.RowId == Me.Territory && a.AethernetGroup == t.AethernetGroup && t.AethernetGroup != 0).ToList();
+        var here = sheet.Where(a => a.Territory.RowId == Me.Territory && a.AethernetGroup == t.AethernetGroup && t.AethernetGroup != 0 && IsNodeUnlocked(a.RowId)).ToList();
         if (here.Count == 0)
         {
-            var main = sheet.FirstOrDefault(a => a.IsAetheryte && a.AethernetGroup == t.AethernetGroup);
+            var main = sheet.FirstOrDefault(a => a.IsAetheryte && a.AethernetGroup == t.AethernetGroup && IsNodeUnlocked(a.RowId));
             if (main.RowId == 0)
                 return this.Fail($"{TeleportTask.TerritoryName(this.territory)} のエーテルネットの親のエーテライトが見つかりません");
             this.sub = new TeleportTask(main.Territory.RowId);
@@ -335,15 +337,21 @@ public sealed class GoToTask : AutoTask
         return TaskResult.Running;
     }
 
+    private static unsafe bool IsNodeUnlocked(uint id)
+    {
+        var state = FFXIVClientStructs.FFXIV.Client.Game.UI.UIState.Instance();
+        return state != null && state->IsAetheryteUnlocked(id);
+    }
+
     /// <summary>そのエリアで、位置に一番近いエーテライト／中継点（エーテライト表の行）。無ければ null。</summary>
-    public static uint? NearestNode(uint territory, Vector3 position)
+    public static uint? NearestNode(uint territory, Vector3 position, Func<uint, bool>? unlocked = null)
     {
         var levels = Svc.Data.GetExcelSheet<Level>();
         uint? best = null;
         var bestDist = float.MaxValue;
         foreach (var a in Svc.Data.GetExcelSheet<Aetheryte>())
         {
-            if (a.Territory.RowId != territory || a.Invisible)
+            if (a.Territory.RowId != territory || a.Invisible || (unlocked != null && !unlocked(a.RowId)))
                 continue;
             var lv = a.Level.FirstOrDefault(l => l.RowId != 0);
             var d = lv.RowId != 0 && levels.TryGetRow(lv.RowId, out var row)
@@ -382,10 +390,13 @@ public sealed unsafe class NpcStepTask : AutoTask
     private GoToTask? travel;
     private bool arrived;
     private int interactions;
+    private int interactionAttempts;
     private DateTime interactedAt = DateTime.MinValue;
     private bool talked;
     private byte seqBefore;
     private byte[] varsBefore = [];
+    private string? selectedMenu;
+    private DateTime firstInteractAt = DateTime.MinValue;
 
     public NpcStepTask(QuestionableStep step, uint questRowId)
     {
@@ -422,6 +433,29 @@ public sealed unsafe class NpcStepTask : AutoTask
         if (this.WorkElapsed > TimeSpan.FromMinutes(10))
             return this.Fail($"{NpcName(this.step.DataId)} との手順が10分以内に終わりませんでした");
 
+        // カウンター越しでは終点への到達を待たず試す。拒否された場合は経路を続け、壁越しで止まり続けない。
+        var nearby = Svc.Objects.Where(o => o.ObjectKind == ObjectKind.EventNpc && o.BaseId == this.step.DataId && o.IsTargetable)
+            .OrderBy(o => Vector3.Distance(o.Position, Me.Position)).FirstOrDefault();
+        if (!this.arrived && Me.Territory == this.step.Territory && GameUi.PlayerFree()
+            && nearby != null && Vector3.Distance(nearby.Position, Me.Position) <= 5f
+            && DateTime.UtcNow - this.interactedAt >= TimeSpan.FromSeconds(2))
+        {
+            this.interactedAt = DateTime.UtcNow;
+            (this.seqBefore, this.varsBefore) = QuestState(this.questRowId);
+            if (GameUi.Interact(nearby, checkLineOfSight: true))
+            {
+                this.travel?.Cleanup(ctx);
+                this.travel = null;
+                this.arrived = true;
+                this.firstInteractAt = this.interactedAt;
+                this.interactions++;
+                this.selectedMenu = null;
+                this.talked = false;
+                this.Status = $"{NpcName(this.step.DataId)} に経路の途中から話しかけました";
+                return TaskResult.Running;
+            }
+        }
+
         if (!this.arrived)
         {
             this.travel ??= new GoToTask(this.step.Territory, this.step.Position.Value, 3f, NpcName(this.step.DataId));
@@ -435,6 +469,15 @@ public sealed unsafe class NpcStepTask : AutoTask
             if (failed != null)
                 return this.Fail(failed);
             this.arrived = true;
+        }
+
+        if (QuestMenuChoice.Handle(ctx, this.questRowId, this.firstInteractAt, ref this.selectedMenu, out var menuFailure))
+        {
+            if (menuFailure != null)
+                return this.Fail(menuFailure);
+            this.talked = true;
+            this.Status = "選択したクエストの会話を待っています";
+            return TaskResult.Running;
         }
 
         // 会話・納品の最中は待つ（納品窓は QuestTask が扱う）
@@ -495,12 +538,18 @@ public sealed unsafe class NpcStepTask : AutoTask
             return TaskResult.Running;
         }
 
+        if (++this.interactionAttempts > 6)
+            return this.Fail($"{NpcName(this.step.DataId)} に話しかけられません。距離・壁・高低差を確認してください");
         (this.seqBefore, this.varsBefore) = QuestState(this.questRowId);
         this.interactedAt = DateTime.UtcNow;
-        this.interactions++;
-        this.talked = false;
-        GameUi.Interact(npc);
-        this.Status = $"{NpcName(this.step.DataId)} に話しかけました（{this.interactions} 回目）";
+        if (GameUi.Interact(npc, checkLineOfSight: true))
+        {
+            this.firstInteractAt = this.interactedAt;
+            this.selectedMenu = null;
+            this.interactions++;
+            this.talked = false;
+            this.Status = $"{NpcName(this.step.DataId)} に話しかけました（{this.interactions} 回目）";
+        }
         return TaskResult.Running;
     }
 
@@ -646,6 +695,17 @@ public sealed unsafe class QuestionableStarter
             return TaskResult.Running;
         }
 
+        // 上限でも受注済みのクエストは進められる。
+        unsafe
+        {
+            var journal = QuestManager.Instance();
+            if (!accepted && journal != null && journal->NumAcceptedQuests >= journal->NormalQuests.Length)
+            {
+                fail = $"「{this.label}」を新しく受注する空きがありません。ジャーナルの空きを作って再開してください";
+                return TaskResult.Failed;
+            }
+        }
+
         // 3) 受注前なら、受注できるか
         if (!accepted && ctx.Questionable.IsReadyToAcceptQuest(this.questRowId) != true)
         {
@@ -688,6 +748,18 @@ public sealed unsafe class QuestionableStarter
                     ? "TextAdvance はほかのプラグインが外部制御しています（納品窓に TextAdvance が品を入れ、こちらの入力と取り合う可能性）"
                     : "TextAdvance の外部制御を取れませんでした（納品窓の入力が取り合いになる可能性）");
             }
+        }
+
+        // 再依頼でも必ず直前に照合する（定期監視の間隔に依存しない）。
+        if (this.Priority.Keep(ctx.Questionable, ctx.Log) is { } changedPriority)
+        {
+            fail = changedPriority;
+            return TaskResult.Failed;
+        }
+        if (this.takeTextAdvance && !ctx.TextAdvance.EnsureTurnInControl())
+        {
+            fail = "TextAdvance の操作権を確保できません。納品入力の競合を避けるため止めました";
+            return TaskResult.Failed;
         }
 
         // 6) 頼む

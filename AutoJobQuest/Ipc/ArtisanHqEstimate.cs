@@ -3,7 +3,6 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
-using System.Threading.Tasks;
 using Lumina.Excel.Sheets;
 
 namespace AutoJobQuest.Ipc;
@@ -37,81 +36,141 @@ public static class ArtisanHqEstimate
     /// <summary>1レシピの見込み。Percent が null なら計算できなかった（Note に理由）。</summary>
     public sealed record Result(uint RecipeId, uint ItemId, double? Percent, int Runs, string Stats, string Solver, string? Note);
 
-    // 同じ条件（レシピ・能力値・ソルバー）の結果は使い回す（点検のたびに計算し直さない）
-    private static readonly Dictionary<string, Result> Cache = [];
-
     /// <summary>
-    /// HQ の見込みを計算する（フレームワークのスレッドから呼ぶ。能力値はゲームの記憶から読む）。
-    /// 通すのはレシピごとに並行（Artisan の計算はゲームに触らない）。Artisan の内部が読めなければ error に理由を入れて空を返す。
+    /// 主スレッドで小分けに進める計算。導入版ソルバーは共有設定を直接読むため、別スレッドへ渡さない。
+    /// キャッシュは使わない（ソルバー名だけでは設定変更を識別できない）。
     /// </summary>
-    public static List<Result> Estimate(IEnumerable<(uint RecipeId, uint ItemId, uint ClassJob)> recipes, out string? error)
+    public sealed class Job : IDisposable
     {
-        error = null;
-        var api = Api.Load(out error);
-        if (api == null)
-            return [];
+        private readonly List<(uint RecipeId, uint ItemId, uint ClassJob)> recipes;
+        private IEnumerator<Result?>? steps;
+        private string? signature;
+        private readonly Func<IEnumerable<Result?>>? calculation;
+        private readonly Func<string>? readSignature;
+        private object? artisanInstance;
+        private string? artisanConfig;
+        public List<Result> Results { get; } = [];
+        public string? Error { get; private set; }
+        public bool Complete { get; private set; }
+        public bool Cancelled { get; private set; }
+        public string Status => $"HQ の参考値を計算中：{this.Results.Count}/{this.recipes.Count} 品";
 
-        var prepared = new List<(string Key, uint RecipeId, uint ItemId, Func<Result> Run)>();
-        var results = new List<Result>();
-        var recipeSheet = Svc.Data.GetExcelSheet<Recipe>();
-        foreach (var (recipeId, itemId, job) in recipes.DistinctBy(r => r.RecipeId))
+        /// <summary>差し替え口はゲーム外試験用。本番は省略し、導入版の計算と条件の読出しを使う。</summary>
+        public Job(IEnumerable<(uint RecipeId, uint ItemId, uint ClassJob)> recipes,
+            Func<IEnumerable<Result?>>? calculation = null, Func<string>? readSignature = null)
         {
+            this.recipes = recipes.DistinctBy(x => x.RecipeId).ToList();
+            this.calculation = calculation;
+            this.readSignature = readSignature;
+        }
+
+        public void Tick(int maxSteps = 256)
+        {
+            if (this.Complete || this.Cancelled)
+                return;
             try
             {
-                if (!recipeSheet.TryGetRow(recipeId, out var recipe))
-                    continue;
-                var craft = api.BuildCraft(recipe, job);
-                var (solver, solverName) = api.CreateSolver(recipeId, craft);
-                var stats = api.StatsText(craft);
-                if (solver == null)
+                if (this.steps == null)
                 {
-                    results.Add(new Result(recipeId, itemId, null, 0, stats, solverName, "Artisan のソルバーが選べません"));
-                    continue;
-                }
-
-                var key = $"{recipeId}|{stats}|{solverName}";
-                lock (Cache)
-                {
-                    if (Cache.TryGetValue(key, out var cached))
+                    this.signature = this.ReadSignature();
+                    if (this.calculation != null)
+                        this.steps = this.calculation().GetEnumerator();
+                    else if (this.recipes.Count == 0)
+                        this.steps = Enumerable.Empty<Result?>().GetEnumerator();
+                    else
                     {
-                        results.Add(cached);
-                        continue;
+                        var api = Api.Load(out var error) ?? throw new InvalidOperationException(error);
+                        this.artisanInstance = RsrStateReader.FindPluginInstance("Artisan");
+                        this.artisanConfig = ConfigSignature(this.artisanInstance!, this.recipes.Select(x => x.RecipeId));
+                        this.steps = api.RunSteps(this.recipes).GetEnumerator();
                     }
                 }
-
-                prepared.Add((key, recipeId, itemId, () => api.Run(recipeId, itemId, craft, solver, stats, solverName)));
+                if (this.artisanInstance != null && !ReferenceEquals(this.artisanInstance, RsrStateReader.FindPluginInstance("Artisan")))
+                    throw new InvalidOperationException("Artisan の読み込み状態が変わりました。点検し直してください");
+                if (this.artisanInstance != null && this.artisanConfig != ConfigSignature(this.artisanInstance, this.recipes.Select(x => x.RecipeId)))
+                    throw new InvalidOperationException("計算中にArtisanの設定が変わりました。点検し直してください");
+                // 時間はフレームの占有上限だけに使う。完了は列挙の終了で判断する。
+                var clock = System.Diagnostics.Stopwatch.StartNew();
+                var count = 0;
+                do
+                {
+                    if (!this.steps.MoveNext())
+                    {
+                        this.Complete = true;
+                        this.steps.Dispose();
+                        this.steps = null;
+                        if (!this.IsCurrent())
+                            throw new InvalidOperationException("計算中に装備・Artisan の設定または読み込み状態が変わりました。点検し直してください");
+                        return;
+                    }
+                    if (this.steps.Current is { } result)
+                        this.Results.Add(result);
+                } while (++count < Math.Max(1, maxSteps) && clock.Elapsed.TotalMilliseconds < 2);
             }
             catch (Exception e)
             {
-                results.Add(new Result(recipeId, itemId, null, 0, string.Empty, string.Empty, $"準備に失敗（{Unwrap(e).Message}）"));
+                this.Error = Unwrap(e).Message;
+                this.Results.Clear();
+                this.Complete = true;
+                this.steps?.Dispose();
+                this.steps = null;
             }
         }
 
-        var computed = new Result[prepared.Count];
-        Parallel.For(0, prepared.Count, i =>
+        private string ReadSignature() => this.readSignature?.Invoke() ?? (this.recipes.Count == 0 ? "対象なし" : Fingerprint(this.recipes));
+
+        public bool IsCurrent()
         {
-            try
-            {
-                computed[i] = prepared[i].Run();
-            }
-            catch (Exception e)
-            {
-                computed[i] = new Result(prepared[i].RecipeId, prepared[i].ItemId, null, 0, string.Empty, string.Empty, $"計算に失敗（{Unwrap(e).Message}）");
-            }
+            try { return !this.Cancelled && this.Error == null && this.signature != null && this.signature == this.ReadSignature(); }
+            catch { return false; }
+        }
+
+        public void Dispose()
+        {
+            this.Cancelled = true;
+            this.steps?.Dispose();
+            this.steps = null;
+        }
+    }
+
+    private static string ConfigSignature(object plugin, IEnumerable<uint> recipeIds)
+    {
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        var config = plugin.GetType().GetField("Config", flags)?.GetValue(plugin)
+            ?? throw new InvalidOperationException("Artisanの設定を読めません");
+        // 全レシピ（導入設定では約500KB）の毎フレーム直列化を避ける。
+        // 導入版のソルバーが読む単純値とソルバー設定、および今回使うレシピだけを照合する。
+        var values = config.GetType().GetFields(BindingFlags.Public | BindingFlags.Instance)
+            .Where(f => f.FieldType.IsPrimitive || f.FieldType.IsEnum || f.FieldType == typeof(string)
+                || f.Name.Contains("Solver", StringComparison.Ordinal))
+            .OrderBy(f => f.Name).ToDictionary(f => f.Name, f => f.GetValue(config));
+        if (config.GetType().GetField("RecipeConfigs", flags)?.GetValue(config) is not IDictionary recipes)
+            throw new InvalidOperationException("Artisanのレシピ別設定を読めません");
+        foreach (var id in recipeIds.Distinct().Order())
+        {
+            var recipe = recipes.Contains(id) ? recipes[id] : null;
+            // 一時指定はNonSerializedなので、通常の設定JSONに含まれない。明示的に値を写す。
+            values[$"レシピ:{id}"] = recipe?.GetType().GetFields(BindingFlags.Public | BindingFlags.Instance)
+                .OrderBy(f => f.Name).ToDictionary(f => f.Name, f => f.GetValue(recipe));
+        }
+        return Newtonsoft.Json.JsonConvert.SerializeObject(values);
+    }
+
+    private static string Fingerprint(IEnumerable<(uint RecipeId, uint ItemId, uint ClassJob)> recipes)
+    {
+        var plugin = RsrStateReader.FindPluginInstance("Artisan") ?? throw new InvalidOperationException("Artisan が読み込まれていません");
+        var api = Api.Load(out var error) ?? throw new InvalidOperationException(error);
+        var sheet = Svc.Data.GetExcelSheet<Recipe>();
+        var parts = recipes.Select(x =>
+        {
+            var craft = api.BuildCraft(sheet.GetRow(x.RecipeId), x.ClassJob);
+            // 計算が読む能力値・解放フラグ等を含める。ゲームシート自体は版で識別する。
+            var fields = craft.GetType().GetFields().Where(f => !f.IsStatic && (f.FieldType.IsPrimitive || f.FieldType.IsEnum))
+                .OrderBy(f => f.Name).Select(f => $"{f.Name}={f.GetValue(craft)}");
+            return $"{x.RecipeId}:{x.ItemId}:" + string.Join(",", fields);
         });
-
-        for (var i = 0; i < prepared.Count; i++)
-        {
-            if (computed[i].Percent != null)
-            {
-                lock (Cache)
-                    Cache[prepared[i].Key] = computed[i];
-            }
-
-            results.Add(computed[i]);
-        }
-
-        return results;
+        return $"{Svc.PlayerState.ContentId}|{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(plugin)}|{plugin.GetType().Assembly.ManifestModule.ModuleVersionId}|"
+            + ConfigSignature(plugin, recipes.Select(x => x.RecipeId)) + "|" + string.Join("|", parts);
     }
 
     /// <summary>見込みの判断（試せるように分けた部分）：100回ずつ回して、境目から10%以上離れたら打ち切る。</summary>
@@ -146,6 +205,15 @@ public static class ArtisanHqEstimate
         return solver == null
             ? new Result(recipe.RowId, recipe.ItemResult.RowId, null, 0, api.StatsText(craft), name, "Artisan のソルバーが選べません")
             : api.Run(recipe.RowId, recipe.ItemResult.RowId, craft, solver, api.StatsText(craft), name);
+    }
+
+    /// <summary>ゲーム外試験用。実際のフレーム分割計算へ能力値だけを渡す。</summary>
+    public static IEnumerable<Result?> SimulateStepsWithStats(Assembly artisan, Recipe recipe, uint job, int craftsmanship, int control, int cp, int level)
+    {
+        var api = Api.Bind(artisan);
+        var craft = api.BuildCraft(recipe, job, (craftsmanship, control, cp, level));
+        var (solver, name) = api.CreateSolver(recipe.RowId, craft);
+        return solver == null ? [] : api.RunPreparedSteps(recipe.RowId, recipe.ItemResult.RowId, craft, solver, name);
     }
 
     private static Exception Unwrap(Exception e) => e is TargetInvocationException { InnerException: { } inner } ? inner : e;
@@ -369,6 +437,53 @@ public static class ArtisanHqEstimate
 
         public string StatsText(object craft)
             => $"作業精度 {this.statCraftsmanship.GetValue(craft)}・加工精度 {this.statControl.GetValue(craft)}・CP {this.statCp.GetValue(craft)}・Lv{this.statLevel.GetValue(craft)}";
+
+        public IEnumerable<Result?> RunSteps(List<(uint RecipeId, uint ItemId, uint ClassJob)> recipes)
+        {
+            foreach (var (recipeId, itemId, job) in recipes)
+            {
+                var craft = this.BuildCraft(Svc.Data.GetExcelSheet<Recipe>().GetRow(recipeId), job);
+                var (solver, name) = this.CreateSolver(recipeId, craft);
+                if (solver == null)
+                {
+                    yield return new Result(recipeId, itemId, null, 0, this.StatsText(craft), name, "ソルバーを選べません");
+                    continue;
+                }
+                foreach (var result in this.RunPreparedSteps(recipeId, itemId, craft, solver, name))
+                    yield return result;
+            }
+        }
+
+        public IEnumerable<Result?> RunPreparedSteps(uint recipeId, uint itemId, object craft, object solver, string name)
+        {
+            var rng = new Random(unchecked((int)(recipeId * 7919u + 17u)));
+            var goal = (int)this.craftProgress.GetValue(craft)!;
+            var maximum = (int)this.qualityMax.GetValue(craft)!;
+            double sum = 0;
+            var runs = 0;
+            do
+            {
+                var s = this.clone.Invoke(solver, null)!;
+                var step = this.createInitial.Invoke(null, [craft, 0])!;
+                for (var guard = 0; guard < 200 && this.inProgress.Equals(this.status.Invoke(null, [craft, step])); guard++)
+                {
+                    var action = this.recAction.GetValue(this.solve.Invoke(s, [craft, step]))!;
+                    if (action.Equals(this.skillNone))
+                        break;
+                    var tuple = this.execute.Invoke(null, [craft, step, action, (float)rng.NextDouble(), (float)rng.NextDouble()])!;
+                    var tt = tuple.GetType();
+                    if (tt.GetField("Item1")!.GetValue(tuple)!.Equals(this.cantUse))
+                        break;
+                    step = tt.GetField("Item2")!.GetValue(tuple)!;
+                    yield return null;
+                }
+                if ((int)this.stepProgress.GetValue(step)! >= goal && maximum > 0)
+                    sum += (int)this.hqChance.Invoke(null, [(int)this.stepQuality.GetValue(step)! * 100.0 / maximum])!;
+                runs++;
+                yield return null;
+            } while (runs % 100 != 0 || !Enough(runs, sum / runs));
+            yield return new Result(recipeId, itemId, sum / runs, runs, this.StatsText(craft), name, null);
+        }
 
         /// <summary>乱数で何度も通して、完成時の HQ 率の平均を出す（乱数の種はレシピで決める：点検のたびに数字が揺れないように）。</summary>
         public Result Run(uint recipeId, uint itemId, object craft, object solver, string stats, string solverName)

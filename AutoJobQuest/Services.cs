@@ -143,10 +143,38 @@ public sealed class Services : IDisposable
         }
     }
 
+    private readonly RetainerControl retainerControl = new();
+    private DateTime nextRetainerRestore;
+
+    public bool InspectionRequested { get; set; }
+    public Planning.PreflightSession? Inspection { get; private set; }
+
     public void Tick()
     {
         // 経路探索を「頼んだのと同じフレームで取り消さない」ためのフレームの番号（OwnPath）
         Automation.OwnPath.Frame++;
+        if (this.Runner.IsRunning)
+        {
+            this.Inspection?.Dispose();
+            this.Inspection = null;
+            this.InspectionRequested = false;
+        }
+        else
+        {
+            if (this.InspectionRequested)
+            {
+                this.InspectionRequested = false;
+                this.Inspection?.Dispose();
+                this.Inspection = new Planning.PreflightSession();
+            }
+            this.Inspection?.Tick(this.Ctx);
+        }
+
+        if (!this.Runner.IsRunning && this.Config.RetainerSuppressionPendingRestore && DateTime.UtcNow >= this.nextRetainerRestore)
+        {
+            this.nextRetainerRestore = DateTime.UtcNow.AddSeconds(10);
+            this.retainerControl.Release(this.Config);
+        }
 
         // GBR の一時変更（リスト・設定）が残っていれば、こちらが止まっていて GBR も止まっている間に戻す。
         // 戻せなかったとき（GBR が動いていた・読めなかった・例外）は10秒ごとにやり直す（控えが消えるまで）
@@ -279,6 +307,7 @@ public sealed class Services : IDisposable
 
     public void Dispose()
     {
+        this.Inspection?.Dispose();
         // 【実行中に読み込みが解除されたとき（更新・無効化・再読み込み）】
         // その時点で止める。止め方は「停止」ボタンと同じ（各作業の後始末＝こちらが頼んだ処理だけを
         // 取り消す：こちらが ON にした GBR の自動採集・こちらが始めた NPC 購入・Questionable のこちらのクエスト・こちらが頼んだ
@@ -340,6 +369,13 @@ public sealed class Services : IDisposable
         {
             this.Safe("RSR の優先ターゲットを外す", this.Ctx.Rotation.ClearOwnPriorities);
             this.Safe("RSR のモードを戻す", this.Ctx.Rotation.ReleaseHenched);
+            this.Safe("Artisan の食事・薬の一時指定を戻す", () =>
+            {
+                if (this.Ctx.Artisan.IsLoaded && this.Ctx.Artisan.IsBusy() == false)
+                    this.Ctx.Artisan.RestoreLeftoverConsumables(this.Config);
+                if (this.Config.ArtisanTempConsumableRecipes.Count > 0)
+                    Svc.Chat.Print("[AutoJobQuest] Artisan の食事・薬は復元待ちです。次回読み込み時に再試行します");
+            });
         }
 
         // 他プラグインの状態（GBR の ON/OFF・リスト・Questionable 等）は、上の停止の後始末でしか触らない。

@@ -98,7 +98,7 @@ public sealed class QuestCatalog
     }
 
     private static readonly Regex CountPattern = new(
-        @"([0-9０-９]+)(つ|個|本|枚|着|足|組|杯|皿|人前|束|点|セット|箱)|(ひとつ|ふたつ|みっつ)",
+        @"([0-9０-９]+)(つ|個|本|枚|着|足|組|杯|皿|人前|束|点|セット|箱|匹|尾|粒)|(ひとつ|ふたつ|みっつ)",
         RegexOptions.Compiled);
 
     private static readonly Regex MacroPattern = new(@"<[^>]*>", RegexOptions.Compiled);
@@ -116,7 +116,7 @@ public sealed class QuestCatalog
         RegexOptions.Compiled);
 
     /// <summary>ゲームデータから組み立てる。maxLevel 以下のクエストだけを対象にする。</summary>
-    public static QuestCatalog Build(int maxLevel)
+    public static QuestCatalog Build(int maxLevel, bool includeGatherers = false)
     {
         var notes = new List<string>();
         var quests = Svc.Data.GetExcelSheet<Quest>();
@@ -142,8 +142,15 @@ public sealed class QuestCatalog
         var result = new List<JobQuest>();
         foreach (var q in quests)
         {
-            if (!genreJob.TryGetValue(q.JournalGenre.RowId, out var job) || !Jobs.IsCrafter(job))
+            if (!genreJob.TryGetValue(q.JournalGenre.RowId, out var job) || (!Jobs.IsCrafter(job) && !(includeGatherers && Jobs.IsGatherer(job))))
                 continue;
+
+            if (Jobs.IsGatherer(job))
+            {
+                var jobName = Svc.Data.GetExcelSheet<ClassJob>(ClientLanguage.Japanese).GetRow(job).Name.ExtractText();
+                var genre = Svc.Data.GetExcelSheet<JournalGenre>(ClientLanguage.Japanese).GetRow(q.JournalGenre.RowId).Name.ExtractText();
+                if (genre != jobName + "クエスト") continue;
+            }
 
             // 分類の多数決と、クエスト自身の指定が食い違うものは除く（別ジョブのクエが混ざらないように）
             if (q.ClassJobRequired.RowId != 0 && q.ClassJobRequired.RowId != job)
@@ -161,7 +168,7 @@ public sealed class QuestCatalog
                     ritems.Add(p.ScriptArg);
             }
 
-            if (ritems.Count == 0)
+            if (ritems.Count == 0 && !Jobs.IsGatherer(job))
                 continue;
 
             var idText = q.Id.ExtractText();
@@ -199,7 +206,7 @@ public sealed class QuestCatalog
         }
 
         result = result
-            .OrderBy(x => Array.IndexOf(Jobs.Crafters, x.ClassJobId))
+            .OrderBy(x => Array.IndexOf(Jobs.QuestJobs, x.ClassJobId))
             .ThenBy(x => x.Level)
             .ThenBy(x => x.RowId)
             .ToList();
@@ -331,6 +338,20 @@ public sealed class QuestCatalog
     private static (int Count, string Evidence) FindCount(List<string> seqs, uint itemId)
     {
         var itemRef = new Regex($@"sheet\(Item(HQ)?,\s*{itemId},");
+        // 「その方法のひとつ」のような説明中の数より、「品名を15個」の指定を先に読む。
+        foreach (var sentence in seqs.SelectMany(s => s.Split('。')).Where(s => itemRef.IsMatch(s)))
+        foreach (Match item in itemRef.Matches(sentence))
+        {
+            var end = sentence.IndexOf('>', item.Index);
+            if (end < 0) continue;
+            var after = sentence[(end + 1)..];
+            var direct = CountPattern.Match(after);
+            if (!direct.Success || direct.Index > 5) continue;
+            var count = direct.Groups[3].Success
+                ? direct.Groups[3].Value switch { "ひとつ" => 1, "ふたつ" => 2, _ => 3 }
+                : ZenToInt(direct.Groups[1].Value);
+            return (count, MacroPattern.Replace(sentence, "◇").Trim());
+        }
         foreach (var s in seqs)
         {
             foreach (var sentence in s.Split('。'))

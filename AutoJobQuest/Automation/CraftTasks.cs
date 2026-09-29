@@ -150,6 +150,7 @@ public sealed class CraftOneTask : AutoTask
 
     // 今の頼みを出した時点の完成品の数・頼んだ回数・頼み直した回数（連続製作が途中で止まったら残りを頼み直す：CraftResume）
     private int attemptBase;
+    private int attemptHq;
     private int requestCrafts;
     private int resumed;
 
@@ -210,6 +211,7 @@ public sealed class CraftOneTask : AutoTask
             : this.craft.HqTarget > 0 ? Math.Min(this.expected, Math.Max(0, this.craft.HqTarget - this.beforeHq))
             : this.expected;
         this.attemptBase = this.beforeAll;
+        this.attemptHq = this.beforeHq;
         this.requestCrafts = this.craft.Crafts;
         this.trial = this.craft.WantHq && this.craft.Crafts > 1 && this.HqNeeded > 0 && !this.collectable;
         if (this.trial)
@@ -250,6 +252,8 @@ public sealed class CraftOneTask : AutoTask
             // 送る前に控えを保存する（読み込みの解除をまたいでも戻せるように）
             if (!ctx.Config.UseArtisanConsumables && !this.consumablesDisabled)
             {
+                if (!ctx.Artisan.CanDisableConsumables(this.craft.RecipeId))
+                    return this.Fail("Artisan の食事・薬に既存の一時指定があるか、読み取れません。他の処理の指定を上書きせず止めました。Artisan を確認してください");
                 if (!ctx.Config.ArtisanTempConsumableRecipes.Contains(this.craft.RecipeId))
                 {
                     ctx.Config.ArtisanTempConsumableRecipes.Add(this.craft.RecipeId);
@@ -324,12 +328,19 @@ public sealed class CraftOneTask : AutoTask
 
         // 連続製作が予定の途中で止まった（Artisan の「NQ ができたら止める」「失敗したら止める」等。Crafting List ではなく
         // 連続製作で頼んでいるので、この設定が効く）→ この頼みで進んでいれば、残りを同じ作業の中で頼み直す（CraftResume）
+        // 試し作り後の依頼でHQが増えず途中停止したら、同じ条件で材料を使い続けない。
+        if (!stopAfterTrial && this.craft.WantHq && this.HqNeeded > 0 && !this.collectable
+            && nowCount - this.beforeAll < this.expected && inv.CountHq(this.craft.ItemId) <= this.attemptHq
+            && inv.CountHq(this.craft.ItemId) - this.beforeHq < this.HqNeeded)
+            return this.Fail($"{CraftPlanner.ItemName(this.craft.ItemId)} の HQ が増えないまま連続製作が止まりました。材料を残して停止します。装備・Artisan の設定を確認してください");
+
         var resume = stopAfterTrial ? 0 : CraftResume.Decide(nowCount - this.beforeAll, this.expected, nowCount - this.attemptBase, this.resumed,
             this.craft.Crafts, CraftCut.Craftable(CraftPlanner.Ingredients(this.recipe), inv), this.craft.Yield);
         if (resume > 0)
         {
             this.resumed++;
             this.attemptBase = nowCount;
+            this.attemptHq = inv.CountHq(this.craft.ItemId);
             this.requestCrafts = resume;
             this.requested = false;
             this.sawBusy = false;

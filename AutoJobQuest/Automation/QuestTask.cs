@@ -46,6 +46,8 @@ public sealed unsafe class QuestTask : AutoTask
     private DateTime interactedAt = DateTime.MinValue;
     private int interactions;
     private bool textAdvanceWarned;
+    private string? selectedMenu;
+    private DateTime manualInteractionAt = DateTime.MinValue;
 
     // 手動の報告で話しかける回数の上限（会話が終わっても完了しないときに、延々と話しかけ続けないため）
     private const int MaxInteractions = 10;
@@ -56,9 +58,6 @@ public sealed unsafe class QuestTask : AutoTask
     private DateTime claimedAt = DateTime.MinValue;
     private bool foreignRequestLogged;
     private bool materiaNoteLogged;
-
-    // TextAdvance に入力を任せた納品窓（アドレスと開いた時刻）。別の窓が開いたら、まず任せるのをやめてから判断する
-    private (nint Addon, DateTime OpenedAt) delegatedWindow;
 
     // 始める前に Artisan のリストが動いていたか（止めた後、Questionable が動かしたリストが残っていないかを見分ける）
     private bool? artisanListAtStart;
@@ -83,6 +82,12 @@ public sealed unsafe class QuestTask : AutoTask
     {
         this.quest = quest;
         this.questItems = quest.Items.Select(i => i.ItemId).ToHashSet();
+        // クエストのスクリプトが参照する専用品だけを追加する。窓の要求を無条件に信用しない。
+        if (Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Quest>().TryGetRow(quest.RowId, out var row))
+            foreach (var p in row.QuestParams)
+                if (p.ScriptInstruction.ExtractText().Contains("ITEM", StringComparison.Ordinal)
+                    && p.ScriptArg >= 2_000_000 && Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.EventItem>().TryGetRow(p.ScriptArg, out _))
+                    this.questItems.Add(p.ScriptArg);
         this.starter = new QuestionableStarter(quest.RowId, quest.ToString(), takeTextAdvance: true);
     }
 
@@ -111,7 +116,7 @@ public sealed unsafe class QuestTask : AutoTask
                 : $"{this.quest} は納品物を途中まで渡しています（今の段 {seq}）。まだ要る品：{(needs.Needed.Count == 0 ? "なし" : string.Join("、", needs.Needed.Select(n => $"{CraftPlanner.ItemName(n.ItemId)}×{n.Count}")))}");
         }
 
-        foreach (var r in needs.Needed)
+        foreach (var r in needs.Needed.Where(_ => !Jobs.IsGatherer(this.quest.ClassJobId)))
         {
             var have = r.Hq ? inv.CountHq(r.ItemId) : inv.CountAll(r.ItemId);
             if (have < r.Count)
@@ -173,6 +178,9 @@ public sealed unsafe class QuestTask : AutoTask
 
         if (this.Elapsed > TimeSpan.FromMinutes(30))
             return this.Fail("30分たってもクエストが完了しません");
+
+        if ((this.own != null || this.manualTurnIn) && !ctx.TextAdvance.EnsureTurnInControl())
+            return this.Fail("TextAdvance の操作権を確保できないため、自前の会話・納品を止めました。操作権が空いてから再開してください");
 
         if (this.own != null)
             return this.RunOwnSteps(ctx);
@@ -246,7 +254,7 @@ public sealed unsafe class QuestTask : AutoTask
             }
 
             // マテリア装着待ちの手順に来たら、報告だけこちらで行う（経路データが読めないときの従来の扱い）
-            if (stepData.InteractionType == "WaitForManualProgress")
+            if (stepData.InteractionType == "WaitForManualProgress" && this.quest.Materia != null)
             {
                 ctx.Log.Write("クエスト", "Questionable が手動の操作（マテリア装着）を待っています。装着済みなので、報告はこちらで行います");
                 ctx.Questionable.Stop(Plugin.InternalNameConst);
@@ -306,11 +314,11 @@ public sealed unsafe class QuestTask : AutoTask
         if (this.submittedAt is { } at)
         {
             var inv = Inventory.Snapshot();
-            var dropped = this.countsBeforeSubmit.Where(kv => inv.CountAll(kv.Key) < kv.Value).ToList();
+            var dropped = this.countsBeforeSubmit.Where(kv => GameRequestWindow.Instance.CountOwned(kv.Key) < kv.Value).ToList();
             if (dropped.Count > 0)
             {
                 this.submittedAt = null;
-                ctx.Log.Write("納品", $"納品を確かめました（{string.Join("、", dropped.Select(kv => $"{CraftPlanner.ItemName(kv.Key)} {kv.Value}→{inv.CountAll(kv.Key)}"))}）");
+                ctx.Log.Write("納品", $"納品を確かめました（{string.Join("、", dropped.Select(kv => $"{CraftPlanner.ItemName(kv.Key)} {kv.Value}→{GameRequestWindow.Instance.CountOwned(kv.Key)}"))}）");
             }
             else if (DateTime.UtcNow - at > TimeSpan.FromSeconds(15))
             {
@@ -322,14 +330,9 @@ public sealed unsafe class QuestTask : AutoTask
 
         if (!GameUi.IsReady("Request", out var request))
         {
-            // 窓が閉じた。次に開く窓は新しい窓として扱う。TextAdvance に任せていた納品窓の入力は、会話が終わってから（動ける状態に
-            // 戻ってから）こちらへ戻す。導入版の TextAdvance は埋めた欄を覚えていて、窓が閉じたのを自分の処理の中で見たときだけ忘れる。
-            // 入力を任せるのを窓が閉じた最初のフレームでやめると、TextAdvance がそれを見る前に止まり、次に任せた納品窓を埋めない
-            // （導入版 3.3.0.1 の ExecRequestFill）
+            // 次に開いた窓は新しい窓として扱う。納品入力はTextAdvanceへ委任しない。
             this.filler.Reset();
             this.foreignRequestLogged = false;
-            if (ctx.TextAdvance.RequestAllowed && GameUi.PlayerFree())
-                ctx.TextAdvance.AllowRequestFill(false);
             return null;
         }
 
@@ -347,10 +350,8 @@ public sealed unsafe class QuestTask : AutoTask
             return null;
         }
 
-        // TextAdvance に任せたままの間に、別の納品窓が開いた（同じ会話の続きの窓）：こちらの納品物の窓かもしれないので、
-        // TextAdvance が一覧の先頭を入れる前に、まず任せるのをやめる（こちらの品でなければ下でまた任せる）
-        if (ctx.TextAdvance.RequestAllowed && this.delegatedWindow != ((nint)request, openedAt))
-            ctx.TextAdvance.AllowRequestFill(false);
+        if (!ctx.TextAdvance.EnsureTurnInControl())
+            return "TextAdvance の操作権を確認できないため、納品窓には入力せず止めました";
 
         var result = this.filler.Tick(GameRequestWindow.Instance, (nint)request, openedAt, this.questItems, out var detail);
         if (this.filler.MateriaNote is { } note && !this.materiaNoteLogged)
@@ -367,15 +368,7 @@ public sealed unsafe class QuestTask : AutoTask
                 ctx.Log.Write("納品", detail);
                 break;
             case RequestFiller.Outcome.NotOurs:
-                // このクエストの間に開いた窓だが、こちらの納品物ではない品（クエスト専用アイテム等）を求めている。
-                // こちらは入れないので、この窓の間だけ TextAdvance に入力を任せる（任せないと誰も入れずに詰まる）
-                ctx.Log.Warn("納品", detail);
-                if (ctx.TextAdvance.OwnsControl && ctx.TextAdvance.AllowRequestFill(true))
-                {
-                    this.delegatedWindow = ((nint)request, openedAt);
-                    ctx.Log.Write("納品", "この納品窓はこちらで扱わない品なので、会話が終わるまで TextAdvance に入力を任せます");
-                }
-                break;
+                return $"{detail}。対象クエストの品と照合できないため入力しません。クエストのスクリプトと要求品を確認してください";
             case RequestFiller.Outcome.Failed:
                 return detail;
             case RequestFiller.Outcome.Busy:
@@ -502,6 +495,14 @@ public sealed unsafe class QuestTask : AutoTask
                 : "TextAdvance の外部制御を取れませんでした（会話と納品の入力が進まない可能性）");
         }
 
+        if (QuestMenuChoice.Handle(ctx, this.quest.RowId, this.manualInteractionAt, ref this.selectedMenu, out var menuFailure))
+        {
+            if (menuFailure != null)
+                return this.Fail(menuFailure);
+            this.Status = "クエストの選択肢を処理しています";
+            return TaskResult.Running;
+        }
+
         if (!GameUi.PlayerFree())
         {
             this.Status = "会話・納品中";
@@ -528,7 +529,11 @@ public sealed unsafe class QuestTask : AutoTask
 
         this.interactedAt = DateTime.UtcNow;
         this.interactions++;
-        GameUi.Interact(npc);
+        if (GameUi.Interact(npc, checkLineOfSight: true))
+        {
+            this.manualInteractionAt = this.interactedAt;
+            this.selectedMenu = null;
+        }
         this.Status = $"{npc.Name} に話しかけました（{this.interactions} 回目）";
         return TaskResult.Running;
     }

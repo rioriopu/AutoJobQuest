@@ -33,7 +33,7 @@ public static class Preflight
 {
     /// <summary>画面に常に出す前提の文言。</summary>
     public const string Premise =
-        "前提：クラフター8職・ギャザラー3職がすべて Lv60 以上であること。"
+        "開始条件：選択した対象職はそれぞれ Lv70 以上。対象クエストは製作8職・採集3職の Lv60 までです。"
         + "製作装備は、ショップで購入できる Lv60 装備（ノーマル品）以上を着けていること"
         + "（主道具・副道具・頭・胴・手・脚・足）。満たしていない場合、動作は保証しません。";
 
@@ -50,9 +50,11 @@ public static class Preflight
         ("TextAdvance", "TextAdvance", "会話送り・納品"),
     ];
 
-    public static List<PreflightItem> Run(TaskContext ctx, JobQuestPlan? plan)
+    public static List<PreflightItem> Run(TaskContext ctx, JobQuestPlan? plan, Ipc.ArtisanHqEstimate.Job? hq = null)
     {
         var list = new List<PreflightItem>();
+        if (hq?.Error is { } calculationError)
+            list.Add(new PreflightItem(Severity.Error, $"HQ 計算の条件を確かめられません：{calculationError}"));
 
         // 1) プラグイン
         var installed = Svc.PluginInterface.InstalledPlugins.ToList();
@@ -90,6 +92,9 @@ public static class Preflight
         // 2) ジョブの並び（定数の前提）
         if (Jobs.VerifyLayout() is { } layoutProblem)
             list.Add(new PreflightItem(Severity.Error, layoutProblem));
+
+        if (Jobs.StartProblem(ctx.Config.SelectedCrafters, Jobs.Level) is { } levelProblem)
+            list.Add(new PreflightItem(Severity.Error, levelProblem));
 
         // 3) レベル
         var low = Jobs.Crafters.Concat(Jobs.Gatherers)
@@ -227,7 +232,11 @@ public static class Preflight
 
         // 5.8) RSR の設定（戦闘で集める素材があるときだけ。RSR の内部を読むだけ）
         if (plan != null && Uses(Route.Combat) && installed.Any(x => x.InternalName == Ipc.RsrStateReader.InternalName && x.IsLoaded))
+        {
             list.AddRange(RsrSettings(ctx));
+            if (Ipc.RsrStateReader.ReadTargetFreelyOverride() != false)
+                list.Add(new PreflightItem(Severity.Error, "RSR の外部ターゲット指定が有効、または読めません。指定外を狙わないと確認できるまで戦闘は始められません"));
+        }
 
         // 5.85) vnavmesh の「詰まったら止める」「止めた後に探し直す」が両方 ON（設定ファイルを読むだけ）。
         // 詰まったときに vnavmesh が自分で経路を探し直して歩き出す（vnavmesh の FollowPath.OnStuck → AsyncMoveRequest）。
@@ -243,12 +252,7 @@ public static class Preflight
         if (ctx.Artisan.IsLoaded && (ctx.Artisan.IsListRunning() == true || ctx.Artisan.IsEndurance() == true))
             list.Add(new PreflightItem(Severity.Error, "Artisan が動いています（リスト実行中か連続製作中）。Artisan の画面で止めてから始めてください"));
 
-        // （以前の 5.95・5.96 は外した）
-        //  ・「連続製作が終わったら製作の構えを解く」（ExitCraftStanceEndurance）が OFF でも、製作の列の最後にこちらで構えを解く
-        //    （ExitCraftStanceTask。Artisan の TaskExitCraft と同じやり方）ので、注意は要らない。
-        //  ・「NQ ができたら／失敗したら連続製作をやめる」（EnduranceStopNQ・EnduranceStopFail）が ON でも、止まったところから
-        //    同じ作業の中で残りを頼み直す（CraftResume）ので、進み方は変わらない。これらは Artisan の連続製作（CraftItem が内部で使う）
-        //    にだけ効く設定で、Crafting List には効かない（Artisan の EnduranceCraftWatcher.cs）。
+        // 製作後は構えを解除する。HQが増えない途中停止は材料を残して止める。
 
         // 5.97) Questionable の設定（pluginConfigs\Questionable.json を読むだけ）。
         // 止める条件に対象のクエストが入っている・完了を止める設定が ON だと、クエストの途中で Questionable が止まり、やり直しても進まない
@@ -264,7 +268,7 @@ public static class Preflight
                 var accepted = qm->NumAcceptedQuests;
                 var cap = qm->NormalQuests.Length;
                 if (accepted >= cap)
-                    list.Add(new PreflightItem(Severity.Error, $"受注中のクエストが {accepted} 本で上限です。新しいクエストを受けられないので、いらないクエストを破棄してから始めてください"));
+                    list.Add(new PreflightItem(Severity.Warn, $"受注中のクエストが {accepted} 本で上限です。受注済みは進められますが、新規受注時に空きがなければ止めます"));
                 else if (accepted >= cap - 2)
                     list.Add(new PreflightItem(Severity.Warn, $"受注中のクエストが {accepted} 本です（上限 {cap} 本）。ジョブクエと前提のクエストを受けるうちに上限に届くと止まります"));
             }
@@ -278,7 +282,7 @@ public static class Preflight
         // 6.5) HQ 指定の品が HQ になる見込み（Artisan 自身の計算を借りて、いまのギアセットの能力値で計算する：ArtisanHqEstimate）。
         // CP が足りないと Lv53 以上の品は HQ になりにくく、HQ にならなかった回数の上限で止まる（材料を使ってから）。始める前に知らせる
         if (plan != null && quick != true && ctx.Artisan.IsLoaded)
-            list.AddRange(HqOutlook(ctx, plan));
+            list.AddRange(HqOutlook(ctx, plan, hq));
 
         // 7) 秘伝書
         if (plan != null && plan.Craft.LockedBySecretBook.Count > 0)
@@ -375,9 +379,14 @@ public static class Preflight
 
     /// <summary>
     /// HQ 指定の品の見込み。見込みが ArtisanHqEstimate.WarnBelow を下回る品を、能力値つきで注意に出す。
-    /// 計算できなかったものは記録に残す（注意にはしない：始めるのを止める理由にならない）。
+    /// 準備は主スレッド、計算はフレームごとに進める。条件変更・例外は結果を破棄して停止する。
     /// </summary>
-    private static IEnumerable<PreflightItem> HqOutlook(TaskContext ctx, JobQuestPlan plan)
+    public static Ipc.ArtisanHqEstimate.Job BeginHq(JobQuestPlan? plan)
+        => new(plan == null ? [] : plan.Craft.Crafts
+            .Where(c => c.WantHq && (c.HqTarget <= 0 || Inventory.CountNow(c.ItemId, hqOnly: true) < c.HqTarget))
+            .Select(c => (c.RecipeId, c.ItemId, c.ClassJobId)));
+
+    private static IEnumerable<PreflightItem> HqOutlook(TaskContext ctx, JobQuestPlan plan, Ipc.ArtisanHqEstimate.Job? hq)
     {
         // 手持ちの HQ で足りている品は、実際の製作でも HQ を求めない（CraftOneTask.HqNeeded＝0）ので外す
         var targets = plan.Craft.Crafts.Where(c => c.WantHq && (c.HqTarget <= 0 || Inventory.CountNow(c.ItemId, hqOnly: true) < c.HqTarget))
@@ -385,12 +394,18 @@ public static class Preflight
         if (targets.Count == 0)
             yield break;
 
-        var results = Ipc.ArtisanHqEstimate.Estimate(targets, out var error);
-        if (error != null)
+        if (hq == null || !hq.Complete)
         {
-            ctx.Log.Write("事前点検", $"HQ の見込みを計算できませんでした：{error}");
+            yield return new PreflightItem(Severity.Warn, "HQ の参考値は未計算です");
             yield break;
         }
+        if (hq.Error != null)
+        {
+            // Runの先頭でエラーとして追加済み。
+            yield break;
+        }
+        var results = hq.Results;
+        yield return new PreflightItem(Severity.Ok, "HQ は参考値です。実際のソルバー・食事・HQ素材と異なる場合、上振れも下振れもあります。成功率の下限ではありません");
 
         foreach (var r in results.Where(r => r.Percent == null))
             ctx.Log.Write("事前点検", $"HQ の見込みを計算できませんでした：{CraftPlanner.ItemName(r.ItemId)}（{r.Note}）");

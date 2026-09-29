@@ -25,6 +25,7 @@ public sealed unsafe class AddonOwnership : IDisposable
         "InclusionShop", "ShopExchangeItemDialog", "ShopExchangeCurrency", "ShopExchangeCurrencyDialog", "CollectablesShop",
         "SelectYesno", "SelectString", "SelectIconString", "Talk",
         "PurifyResult", // 精選の結果（自分の精選で出たものだけ閉じる）
+        "RetainerList", "InventoryRetainer", "InventoryRetainerLarge", "ContextMenu", "InputNumeric",
         "Request",      // クエストの納品窓（自分が始めたクエストの間に開いたものだけ入れる）
     ];
 

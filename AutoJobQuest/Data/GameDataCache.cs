@@ -82,7 +82,7 @@ public sealed class GameDataCache
             {
                 var started = DateTime.UtcNow;
                 var planner = new CraftPlanner();
-                var quests = QuestCatalog.Build(MaxQuestLevel);
+                var quests = QuestCatalog.Build(MaxQuestLevel, includeGatherers: true);
                 var sources = SourceIndex.Build();
                 var baselines = GearCheck.ComputeBaselines();
 

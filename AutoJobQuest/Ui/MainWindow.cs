@@ -32,7 +32,6 @@ public sealed class MainWindow : Window
     private readonly Services services;
 
     private JobQuestPlan? plan;
-    private List<PreflightItem>? preflight;
     private bool planRequested;
     private List<ReportSection>? report;
     private DateTime reportAt;
@@ -104,7 +103,7 @@ public sealed class MainWindow : Window
     {
         var runner = this.services.Runner;
         var anySelected = this.config.SelectedCrafters.Any(x => x);
-        var blocker = runner.IsRunning ? null : runner.StartBlocker();
+        var blocker = runner.IsRunning ? null : runner.StartBlocker() ?? Jobs.StartProblem(this.config.SelectedCrafters, Jobs.Level);
 
         // 一時停止：止めると他のプラグインに頼んだことを全部戻す（止めている間に Artisan・GBR・Questionable が
         // 勝手に動き続けないように）。進み具合は毎回ゲームから読み直すので、もう一度開始すれば続きから進む。
@@ -170,10 +169,24 @@ public sealed class MainWindow : Window
         ImGui.TextColored(Yellow, Preflight.Premise);
 
         // 確かめ待ちの控え（復旧に使える形で出す）
+        if (this.config.RetainerSuppressionPendingRestore && !runner.IsRunning)
+            ImGui.TextColored(Yellow, "AutoRetainerの抑制解除を確認しています。読戻しが成功するまで復元待ちの記録を残します。");
         if (this.config.PendingPurchase is { } pending)
             ImGui.TextColored(Red, $"⚠ 前回のマーケット購入の結果が確かめられていません：{pending.Describe()}。マーケットボードの取引履歴で確かめてから始めてください（事前点検の確認で「はい」を押すと控えを消します）");
         if (this.Ctx.Rotation.RestorePending && !runner.IsRunning)
             ImGui.TextColored(Grey, "RSR のモード・範囲攻撃の設定を元に戻したかを確かめています（10秒おき。戻っていなければ戻します）");
+        if (this.config.RsrBoolOriginals.Count > 0)
+        {
+            ImGui.TextColored(Yellow, "RSR の真偽設定を同じ値に手動変更したことは自動検出できません。今の値を残す場合は次のボタンを使ってください");
+            if (ImGui.Button("RSR の真偽設定を今の値で保持して停止"))
+            {
+                runner.RequestStop("RSR の真偽設定を利用者へ引き渡しました");
+                this.Ctx.Rotation.KeepCurrentBoolSettings();
+            }
+        }
+        if (this.config.ArtisanTempConsumableRecipes.Count > 0 && !runner.IsRunning)
+            ImGui.TextColored(Yellow, "Artisan の食事・薬の一時指定は復元待ちです。Artisan が空いてから再試行します");
+
         if (this.config.GbrConfigAwaitingSave.Count > 0)
             ImGui.TextColored(Grey, $"GBR の設定（{string.Join("、", this.config.GbrConfigAwaitingSave.Keys)}）を元に戻しました。保存ファイルに書かれたかを確かめています");
 
@@ -197,6 +210,7 @@ public sealed class MainWindow : Window
 
     private void DrawJobSelection()
     {
+        ImGui.TextWrapped("対象職はそれぞれLv70以上が必要です。開始時に呼び鈴で必要品を引き出し、実在庫から計画を更新します。");
         var sel = this.config.SelectedCrafters;
         var all = sel.All(x => x);
 
@@ -215,14 +229,14 @@ public sealed class MainWindow : Window
             {
                 if (table)
                 {
-                    for (var i = 0; i < Jobs.Crafters.Length; i++)
+                    for (var i = 0; i < Jobs.QuestJobs.Length; i++)
                     {
                         ImGui.TableNextColumn();
                         var v = sel[i];
-                        var label = Jobs.CrafterShortNames[i];
+                        var label = Jobs.QuestJobNames[i];
                         if (this.plan != null)
                         {
-                            var remaining = this.plan.RemainingQuests.Count(q => q.ClassJobId == Jobs.Crafters[i]);
+                            var remaining = this.plan.RemainingQuests.Count(q => q.ClassJobId == Jobs.QuestJobs[i]);
                             label += v ? $"（残り{remaining}本）" : string.Empty;
                         }
 
@@ -437,14 +451,14 @@ public sealed class MainWindow : Window
 
     private void DrawPreflightTab()
     {
-        if (ImGui.Button("点検する"))
+        using (ImRaii.Disabled(this.services.Runner.IsRunning))
         {
-            // 点検は、いまの計画を作ってから行う（以前は「計画」の画面を開いたかどうかで、点検の対象が変わっていた）
-            this.Ctx.Data.EnsureBuilding();
-            if (this.Ctx.Data.IsReady)
-                this.plan = PlanBuilder.Build(this.Ctx.Data, this.config.SelectedCrafters);
-            this.preflight = Preflight.Run(this.Ctx, this.plan);
+            if (ImGui.Button("点検する"))
+                this.services.InspectionRequested = true;
         }
+        if (this.services.Inspection is { Complete: false } pending)
+            ImGui.TextUnformatted(pending.Status);
+        var preflight = this.services.Inspection?.Items;
 
         if (!this.Ctx.Data.IsReady)
         {
@@ -452,10 +466,10 @@ public sealed class MainWindow : Window
             ImGui.TextColored(Grey, "（装備の基準値はゲームデータの読み込み後に点検します）");
         }
 
-        if (this.preflight == null)
+        if (preflight == null)
             return;
 
-        foreach (var item in this.preflight)
+        foreach (var item in preflight)
         {
             var color = item.Severity switch
             {
@@ -554,7 +568,7 @@ public sealed class MainWindow : Window
                 this.config.Save();
             }
 
-            ImGui.TextColored(Grey, "既定は ON。Questionable が無関係なクエストへ移らないように、進めるクエスト以外をジャーナルの「非表示」にし、"
+            ImGui.TextColored(Grey, "既定は OFF（実機での確認がまだ少ない機能です）。有効にすると、進めるクエスト以外をジャーナルの「非表示」にし、"
                                     + "止まったら元の状態（通常・優先表示）に戻します。途中で自分で表示の状態を変えたクエストは戻しません");
         }
 

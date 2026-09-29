@@ -138,6 +138,22 @@ public static class RsrStateReader
         }
     }
 
+    /// <summary>導入版7.5.6.12のDataCenter.TargetFreelyOverride（静的Boolean）を読むだけ。</summary>
+    public static bool? ReadTargetFreelyOverride()
+    {
+        try
+        {
+            var plugin = FindPluginInstance(InternalName);
+            if (plugin == null)
+                return null;
+            var basic = AssemblyLoadContext.GetLoadContext(plugin.GetType().Assembly)?.Assemblies
+                .FirstOrDefault(a => a.GetName().Name == "RotationSolver.Basic");
+            return basic?.GetType("RotationSolver.Basic.DataCenter")?
+                .GetProperty("TargetFreelyOverride", BindingFlags.Public | BindingFlags.Static)?.GetValue(null) as bool?;
+        }
+        catch { return null; }
+    }
+
     /// <summary>範囲攻撃の設定の名前（RSR の AoEType の名前。IPC の設定コマンドにもこの名前で渡す）。</summary>
     public static string AoeName(byte value) => value switch
     {
