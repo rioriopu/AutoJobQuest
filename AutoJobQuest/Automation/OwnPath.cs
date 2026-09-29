@@ -21,8 +21,10 @@ namespace AutoJobQuest.Automation;
 ///  ・頼んだのと同じフレームで取り消すと、vnavmesh の探索件数が戻らず Nav.PathfindInProgress が true のまま残る。
 ///    同じフレームのうちは取り消さず、結果を捨てるだけにする（探索は最後まで走るが、こちらが使わないので歩き出さない）。
 ///  ・取り消した探索は、すぐ終わるとは限らない（前の探索を待ってから Faulted で終わる）。終わるのを待たない。
-///  ・経路の最初の点は、頼んだときの出発点。捨ててから渡す。
-///  ・探索の間にこちらが動いていたら（反撃など）、古い出発点からの経路は使わない（引き直す）。
+///  ・経路の最初の点は、頼んだときの出発点。捨ててから渡す。探索の間に経路の上を進んでいたら、通り過ぎた点も捨てる
+///    （歩きながら引き直すため。vnavmesh は先頭の点から順にたどるので、残すと戻ろうとする：ffxiv_navmesh の FollowPath.cs）。
+///  ・探索の間に経路から離れていたら（反撃など）、その経路は使わない（引き直す）。
+///  ・新しい探索の間も、前に渡した経路は歩き続ける（止めない＝立ち止まらない）。前の経路も自分のものとして覚えておき、止めるときは止める。
 ///  ・範囲（手前で止まる距離）は無い。到着はこちらで判断して止める。
 ///  ・探索は1件だけ持つ（vnavmesh は頼めば何件でも順番に積む）。
 /// </summary>
@@ -52,7 +54,7 @@ public sealed class OwnPath
     /// <summary>フレームの番号（プラグインが毎フレーム1つ進める。試験では直接動かす）。</summary>
     public static long Frame { get; set; }
 
-    /// <summary>探索の間に、これ以上動いていたら結果を使わない（m）。</summary>
+    /// <summary>探索の結果の経路から、いまの位置がこれ以上離れていたら結果を使わない（m）。</summary>
     public const float StaleDistance = 5f;
 
     private CancellationTokenSource? cts;
@@ -70,6 +72,7 @@ public sealed class OwnPath
 
     /// <summary>
     /// 探索を頼む（前の探索は取り消す・捨てる）。取り消せる探索の窓口が使えなければ false（呼び出し側が SimpleMove で代える）。
+    /// 前に渡した経路は止めない（新しい経路を渡すまで歩き続ける。止めるのは <see cref="Stop"/>）。
     /// </summary>
     public bool Request(INavControl nav, Vector3 start, Vector3 destination, bool flying)
     {
@@ -86,7 +89,6 @@ public sealed class OwnPath
         this.issuedFrame = Frame;
         this.from = start;
         this.fly = flying;
-        this.followingEnd = null;
         return true;
     }
 
@@ -118,11 +120,10 @@ public sealed class OwnPath
             if (points == null || points.Count == 0)
                 return State.NoPath;
 
-            if (Vector3.Distance(now, this.from) > StaleDistance)
+            // いまの位置より先の点だけを渡す（出発点・通り過ぎた点は捨てる）。経路から離れていたら使わない
+            var route = AheadOf(points, this.from, now, StaleDistance);
+            if (route == null)
                 return State.Stale;
-
-            // 最初の点は頼んだときの出発点（捨てる）。1点だけなら直線でその点へ
-            var route = points.Count > 1 ? points.Skip(1).ToList() : points;
             if (!nav.MoveAlong(route, this.fly))
                 return State.Failed;
 
@@ -138,6 +139,40 @@ public sealed class OwnPath
         }
 
         return State.Idle;
+    }
+
+    /// <summary>
+    /// 経路のうち、いまの位置より先の点。いまの位置に一番近い区間を探し、その区間の終わりの点から返す
+    /// （一番近い区間と 1m 以内の差の区間が手前にあれば、経路の順で手前のもの：経路が折り返して近くを2度通るとき、先の区間へ近道しない）。
+    /// 1点だけの経路は「頼んだときの出発点 → その点」の区間とみなす。どの区間からも maxOff より離れていれば null（その経路は使わない）。
+    /// </summary>
+    public static List<Vector3>? AheadOf(IReadOnlyList<Vector3> points, Vector3 from, Vector3 now, float maxOff)
+    {
+        if (points.Count == 0)
+            return null;
+        var pts = points.Count == 1 ? new List<Vector3> { from, points[0] } : points;
+
+        var dists = new float[pts.Count - 1];
+        var best = float.MaxValue;
+        for (var i = 0; i < dists.Length; i++)
+        {
+            dists[i] = DistanceToSegment(now, pts[i], pts[i + 1]);
+            best = MathF.Min(best, dists[i]);
+        }
+
+        if (best > maxOff)
+            return null;
+
+        var idx = Array.FindIndex(dists, d => d <= best + 1f);
+        return pts.Skip(idx + 1).ToList();
+    }
+
+    private static float DistanceToSegment(Vector3 p, Vector3 a, Vector3 b)
+    {
+        var ab = b - a;
+        var len = ab.LengthSquared();
+        var t = len <= 0 ? 0 : Math.Clamp(Vector3.Dot(p - a, ab) / len, 0f, 1f);
+        return Vector3.Distance(p, a + (ab * t));
     }
 
     /// <summary>止める：探索は取り消す（同じフレームなら捨てるだけ）。自分の経路をたどっていれば止める。他人の経路は止めない。</summary>

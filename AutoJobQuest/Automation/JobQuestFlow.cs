@@ -24,7 +24,7 @@ namespace AutoJobQuest.Automation;
 ///   ⑦ マテリア装着
 ///   ⑧ ジョブクエを Questionable で1本ずつ
 /// </summary>
-public sealed class JobQuestFlow : AutoTask
+public sealed class JobQuestFlow : AutoTask, IOutcomeHint
 {
     private enum Stage
     {
@@ -259,6 +259,9 @@ public sealed class JobQuestFlow : AutoTask
     }
 
     private JobQuestPlan Plan(TaskContext ctx) => PlanBuilder.Build(ctx.Data, this.selected, this.excluded);
+
+    /// <summary>前提が未達で外したクエストを残して終わったか（結果の分類）。</summary>
+    public bool HasExclusions { get; private set; }
 
     // ------------------------------------------------------------------
     // ② 事前点検
@@ -760,9 +763,12 @@ public sealed class JobQuestFlow : AutoTask
             return TaskResult.Running;
         }
 
-        var town = this.books.ChooseTown();
+        // 窓口のある町：スクリップ取引窓口の画面を開くクエストが済んでいる窓口を選ぶ。収集品の納品に要るクエスト
+        // （b.RequiredQuest＝67631「職人の新たなお仕事」＝モードゥナの窓口を開くクエストでもある）は、この段で進めるので済んだものとして数える
+        var townQuest = this.books.RequiredQuest;
+        var town = this.books.ChooseTown(questDone: q => FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(q) || (q != 0 && q == townQuest));
         if (town == null)
-            return this.Fail("収集品納品窓口とスクリップ取引窓口のある街に、解放済みのエーテライトがありません");
+            return this.Fail(this.books.WhyNoTown());
 
         var steps = new List<Func<TaskContext, AutoTask?>>();
         var b = this.books;
@@ -770,7 +776,9 @@ public sealed class JobQuestFlow : AutoTask
 
         // 収集品の納品に要るクエスト（職人の新たなお仕事）。納品が要るときだけ、未完了の前提（同じ区分のもの）ごと進める
         // （以前は紫貨が足りていて納品しないときも進め、前提も進めなかった）
-        if (this.NeedsDelivery() && b.RequiredQuest != 0 && !FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(b.RequiredQuest))
+        // 選んだ窓口の画面を開くのにこのクエストが要るときも、納品の要らないときでも進める
+        var windowNeedsQuest = town.Value.Scrip.UnlockQuest != 0 && town.Value.Scrip.UnlockQuest == b.RequiredQuest;
+        if ((this.NeedsDelivery() || windowNeedsQuest) && b.RequiredQuest != 0 && !FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(b.RequiredQuest))
         {
             var chain = Unlocks.ChainToRun(b.RequiredQuest, out var blockedBy);
             if (blockedBy != null)
@@ -898,6 +906,9 @@ public sealed class JobQuestFlow : AutoTask
         foreach (var c in plan.Craft.Crafts)
             steps.Add(cc => this.NextCraft(cc, c));
 
+        // 最後に製作の構えを解く（Artisan の設定 ExitCraftStanceEndurance に頼らない。構えのままだと次の段が動けない）
+        steps.Add(_ => new ExitCraftStanceTask());
+
         this.child = new SequenceTask("グリダニアの宿屋で製作", steps);
         return TaskResult.Running;
     }
@@ -913,6 +924,23 @@ public sealed class JobQuestFlow : AutoTask
     {
         if (this.craftCut != null)
             return null;
+
+        // 納品用の取り置き（HQ 指定の中間素材を、親の製作の後に作る分）は、いまの手持ちで回数を数え直す。
+        // 計画は「親が HQ を先に使う」（Artisan のふつうの動き）で見積もっている。もし親が NQ を先に使って HQ が残っていれば、
+        // その分は作らない
+        if (c.Reserve)
+        {
+            var now = c.ReserveCrafts(Inventory.Snapshot());
+            if (now <= 0)
+            {
+                ctx.Log.Write("製作", $"{CraftPlanner.ItemName(c.ItemId)}（納品用の取り置き）は手持ちで足りているので作りません");
+                return null;
+            }
+
+            if (now != c.Crafts)
+                ctx.Log.Write("製作", $"{CraftPlanner.ItemName(c.ItemId)}（納品用の取り置き）は、親の製作の後の手持ちで数え直して {c.Crafts} 回 → {now} 回");
+            c = c with { Crafts = now };
+        }
 
         var recipe = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Recipe>().GetRow(c.RecipeId);
         var lacking = CraftCut.Lacking(CraftPlanner.Ingredients(recipe), c.Crafts, Inventory.Snapshot());
@@ -937,10 +965,11 @@ public sealed class JobQuestFlow : AutoTask
         string? stop = null;
         foreach (var t in this.craftTasks.Where(t => t.Finished))
         {
-            if (!this.hqFailures.Record(t.Craft.ItemId, t.Craft.WantHq, t.Expected, t.MadeHq))
+            // HQ が要る数は「作る前の手持ちの HQ で足りない分」（作る回数×出来高ではない：品質を問わない納品の分まで HQ を求めない）
+            if (!this.hqFailures.Record(t.Craft.ItemId, t.Craft.WantHq, t.HqNeeded, t.MadeHq))
             {
-                if (t.Craft.WantHq && t.MadeHq < t.Expected)
-                    ctx.Log.Warn("製作", $"{CraftPlanner.ItemName(t.Craft.ItemId)} の HQ が足りません（{t.Made}個中 HQ {t.MadeHq}個。この品の HQ 失敗 {this.hqFailures.Count(t.Craft.ItemId)}/{this.hqFailures.Limit} 回）");
+                if (t.Craft.WantHq && t.MadeHq < t.HqNeeded)
+                    ctx.Log.Warn("製作", $"{CraftPlanner.ItemName(t.Craft.ItemId)} の HQ が足りません（{t.Made}個中 HQ {t.MadeHq}個・HQ が要る数 {t.HqNeeded}個。この品の HQ 失敗 {this.hqFailures.Count(t.Craft.ItemId)}/{this.hqFailures.Limit} 回）");
                 continue;
             }
 
@@ -949,7 +978,7 @@ public sealed class JobQuestFlow : AutoTask
             var baseline = ctx.Data.GearBaselines?.GetValueOrDefault(job) ?? (0, 0);
             var recipe = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Recipe>().TryGetRow(t.Craft.RecipeId, out var r) ? r : default;
             stop ??= $"{CraftPlanner.ItemName(t.Craft.ItemId)}（HQ 指定）を {this.hqFailures.Count(t.Craft.ItemId)} 回作っても HQ が足りません"
-                     + $"（最後の回：{t.Made}個中 HQ {t.MadeHq}個、HQ が要る数 {t.Expected}個）。"
+                     + $"（最後の回：{t.Made}個中 HQ {t.MadeHq}個、HQ が要る数 {t.HqNeeded}個）。"
                      + $"レシピ {t.Craft.RecipeId}（{Jobs.Name(job)}・レシピLv {recipe.RecipeLevelTable.RowId}）、"
                      + $"{Jobs.Name(job)} の装備：作業精度 {gear.Craftsmanship}（基準 {baseline.Item1}）・加工精度 {gear.Control}（基準 {baseline.Item2}）、"
                      + $"Artisan の簡易製作={Planning.Preflight.ReadArtisanBool("QuickSynthMode")?.ToString() ?? "読めない"}。"
@@ -992,8 +1021,11 @@ public sealed class JobQuestFlow : AutoTask
         var plan = this.Plan(ctx);
         if (plan.NothingToDo)
         {
-            // 前提が未達で飛ばしたクエストがあれば、終わりに改めて知らせる
-            foreach (var line in plan.BlockedSummary())
+            // 前提が未達で飛ばしたクエストがあれば、終わりに改めて知らせる。
+            // 結果は「前提未達のため一部除外して完了」になる
+            var blockedLines = plan.BlockedSummary();
+            this.HasExclusions = blockedLines.Count > 0;
+            foreach (var line in blockedLines)
             {
                 ctx.Log.Warn("クエスト", $"前提のクエストが未完了のため進めていません：{line}");
                 Svc.Chat.Print($"[AutoJobQuest] 前提のクエストが未完了のため進めていません：{line}");

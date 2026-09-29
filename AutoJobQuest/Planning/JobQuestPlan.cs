@@ -378,9 +378,10 @@ public static class PlanBuilder
 
             if (prereq.AreaReachable != null && FirstUnreachable(chain, prereq.AreaReachable) is { } area)
             {
+                // 文言は「交感すればよい」か「メインクエスト等で解放する」かで分ける（AreaAccess.UnreachableHint）
                 list.Add(new BlockedQuest(q, 0,
-                    $"「{AreaAccess.Name(area.Territory)}」へ行けません（入口のエーテライト「{AreaAccess.GateNames(area.Territory)}」が未解放。"
-                    + $"{(area.Quest == q.RowId ? "このクエスト" : $"前提のクエスト「{Unlocks.QuestName(area.Quest)}」")}の場所です。メインクエスト等でその地域を解放してから進めてください）"));
+                    $"「{AreaAccess.Name(area.Territory)}」へ行けません（{(area.Quest == q.RowId ? "このクエスト" : $"前提のクエスト「{Unlocks.QuestName(area.Quest)}」")}の場所です。"
+                    + $"{AreaAccess.UnreachableHint(area.Territory, prereq.IsComplete)}）"));
                 continue;
             }
 

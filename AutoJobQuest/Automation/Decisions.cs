@@ -17,9 +17,6 @@ public static class CollectableSelection
         /// <summary>撃ってよい。</summary>
         Fire,
 
-        /// <summary>選べているが、納品ボタンが押せるようになるのを待つ。</summary>
-        WaitButton,
-
         /// <summary>まだ選べたと言えない（待つ。上限を過ぎたら呼び出し側が止める）。</summary>
         Wait,
     }
@@ -29,24 +26,29 @@ public static class CollectableSelection
     ///  ①同じ所持数の別の収集品が一覧に無い（行数で区別できる）
     ///  ②選ぶ前の行数から、目的の品の所持数へ変わったのを見た（選択が効いた）
     ///  ③この画面で前に確かめた選択が同じ行のまま（自分の納品で数が1つ減っただけ）
-    /// 納品ボタンが押せるだけでは撃たない。
+    ///  ④右の一覧の行の品名が、目的の品と一致した（品名が読めたとき。読めて違う品なら、ほかの条件がそろっても撃たない）
+    /// 【納品ボタンを待たない】以前は納品ボタン（node 51）が見えて押せるまで待っていた。実機記録では、
+    /// 選択が効いて右の一覧が変わってもボタンが出ないことがあり、ボタンを待たずに Fire(15, 0u) を撃つ方式に
+    /// 変えている（画面定義でも node 51 の初期状態は見えない）。こちらも選択を確かめたら撃つ。
     /// </summary>
     /// <param name="rows">いまの右の一覧の行数（読めなければ null）。</param>
     /// <param name="ownedBefore">目的の品の所持数（選ぶ前）。</param>
     /// <param name="rowsBeforeSelect">選ぶ前の右の一覧の行数（読めなければ -1）。</param>
     /// <param name="ambiguous">同じ所持数の別の収集品が一覧にあるか。</param>
     /// <param name="sameAsConfirmed">この画面で前に確かめた選択と同じ行か。</param>
-    /// <param name="buttonReady">納品ボタンが見えていて押せるか。</param>
-    public static Verdict Decide(int? rows, int ownedBefore, int rowsBeforeSelect, bool ambiguous, bool sameAsConfirmed, bool buttonReady)
+    /// <param name="nameMatches">右の一覧の行の品名が目的の品と一致したか（読めなければ null）。</param>
+    public static Verdict Decide(int? rows, int ownedBefore, int rowsBeforeSelect, bool ambiguous, bool sameAsConfirmed, bool? nameMatches)
     {
         if (rows is not { } r || r <= 0 || r != ownedBefore)
             return Verdict.Wait;
-
-        var changed = rowsBeforeSelect >= 0 && rowsBeforeSelect != r;
-        if (ambiguous && !changed && !sameAsConfirmed)
+        if (nameMatches == false)
             return Verdict.Wait;
 
-        return buttonReady ? Verdict.Fire : Verdict.WaitButton;
+        var changed = rowsBeforeSelect >= 0 && rowsBeforeSelect != r;
+        if (ambiguous && !changed && !sameAsConfirmed && nameMatches != true)
+            return Verdict.Wait;
+
+        return Verdict.Fire;
     }
 }
 
@@ -565,10 +567,16 @@ public static class PurchaseGuard
     /// <param name="ratio">相場の何倍を超えたら確かめるか（0 なら確かめない）。</param>
     /// <param name="spentThisRun">この実行でマーケットに払った合計。</param>
     /// <param name="runApprovedUpTo">この実行の合計を、いくらまで了承済みか（任意の上限を使わないなら 0）。</param>
+    /// <param name="excessCost">必要数を超えて買う分の額（(個数 − 必要数) × 単価。余りが無ければ 0）。</param>
+    /// <param name="excessLimit">余りの額がこれを超えたら確かめる（0 なら確かめない）。</param>
     public static List<string> ConfirmReasons(long total, uint unitPrice, long perPurchaseLimit, bool listingApproved,
-        double? marketUnit, double ratio, long spentThisRun, long runApprovedUpTo)
+        double? marketUnit, double ratio, long spentThisRun, long runApprovedUpTo, long excessCost = 0, long excessLimit = 0)
     {
         var reasons = new List<string>();
+        // 4) 必要数より大きいまとまりしか無く、余りの分の額が大きい（例：
+        //    1個ほしいのに 99個×5,000＝495,000 ギルの出品しか無いと、1回の額の確認〔50万〕にかからずに余りごと買っていた）
+        if (!listingApproved && excessLimit > 0 && excessCost > excessLimit)
+            reasons.Add($"必要な数より多く買う分（余り）に {excessCost:N0} ギルかかります（{excessLimit:N0} ギルを超えています）");
         if (!listingApproved && perPurchaseLimit > 0 && total > perPurchaseLimit)
             reasons.Add($"1回の購入額が {perPurchaseLimit:N0} ギルを超えています");
         if (!listingApproved && ratio > 0 && marketUnit is { } m && m > 0 && unitPrice > m * ratio)
@@ -589,6 +597,119 @@ public static class PurchaseGuard
     }
 }
 
+/// <summary>購入の応答（InfoProxyItemSearch.ProcessPurchaseResponse）の種類。</summary>
+public enum PurchaseResponse
+{
+    /// <summary>送った出品への応答がまだ来ていない。</summary>
+    None,
+
+    /// <summary>ゲームが成功と返した（errorMessageId が 0）。</summary>
+    Success,
+
+    /// <summary>ゲームが断った（errorMessageId が 0 でない＝断られた理由の LogMessage の行番号）。</summary>
+    Rejected,
+}
+
+/// <summary>断られた理由ごとの扱い（文言はゲームデータの LogMessage で確認）。</summary>
+public enum RejectKind
+{
+    /// <summary>一覧を取り直して別の出品を選ぶ（4523「販売状況が変化した」・386/390「購入ができませんでした」ほか）。</summary>
+    Reselect,
+
+    /// <summary>少し待って同じように取り直す（387/391「しばらく待ってから」）。</summary>
+    WaitAndRetry,
+
+    /// <summary>続けても変わらないので止める（388「所持品がいっぱい」・392「ギルがたりません」）。</summary>
+    StopAll,
+
+    /// <summary>その品はあきらめる（389「RARE をすでに所持」・4249「マーケットでは売買できない」）。</summary>
+    GiveUpItem,
+
+    /// <summary>その出品だけ外して選び直す（468「自分が雇ったリテイナーの出品」・4525「マネキンでセット販売」）。</summary>
+    ExcludeListing,
+
+    /// <summary>支払いが済んで品が届いていないかもしれない（460/461「入手完了できていない」）。買い直さずに、結果が分からないとして止める。</summary>
+    MaybePaid,
+}
+
+/// <summary>購入の応答の読み方。</summary>
+public static class PurchaseReply
+{
+    /// <summary>断られた理由（errorMessageId＝LogMessage の行番号）ごとの扱い。</summary>
+    public static RejectKind Classify(uint errorMessageId) => errorMessageId switch
+    {
+        387 or 391 => RejectKind.WaitAndRetry,
+        388 or 392 => RejectKind.StopAll,
+        389 or 4249 => RejectKind.GiveUpItem,
+        468 or 4525 => RejectKind.ExcludeListing,
+        460 or 461 => RejectKind.MaybePaid,
+        _ => RejectKind.Reselect,
+    };
+
+    /// <summary>
+    /// 応答の品目 ID の HQ の印（＋1,000,000）を外す（ゲームの ProcessPurchaseResponse と同じ直し方：1,000,001〜1,999,999 なら −1,000,000）。
+    /// </summary>
+    public static uint NormalizeItem(uint itemId) => itemId is > 1_000_000 and < 2_000_000 ? itemId - 1_000_000 : itemId;
+
+    /// <summary>
+    /// 送った出品への応答を、応答の記録から探す（送った後の応答で、出品の番号が一致するもの）。
+    /// 品目 ID ではなく出品の番号で照合する（HQ の品目 ID のずれ・同じ品の別の要求への応答を取り違えない）。
+    /// </summary>
+    public static (PurchaseResponse Response, uint Message) Find(IEnumerable<(int Serial, ulong ListingId, uint Message)> log, int serialBefore, ulong listingId)
+    {
+        foreach (var r in log)
+        {
+            if (r.Serial <= serialBefore || r.ListingId != listingId)
+                continue;
+            return (r.Message == 0 ? PurchaseResponse.Success : PurchaseResponse.Rejected, r.Message);
+        }
+
+        return (PurchaseResponse.None, 0);
+    }
+}
+
+/// <summary>
+/// 出品一覧が「いま頼んだ検索の分として」そろったか。
+///
+/// ゲームは件数の応答を受けた時点で件数（ListingCount）を新しい値に書き換えるが、一覧の行は最初のページが届くまで前回のまま。
+/// 同じ品を検索し直すと、前回の行が「その品で単価が入っている」を満たしてしまう。そこで、件数の応答で振られた番号（CurrentRequestId）と
+/// Dalamud の出品一覧の通知の番号（RequestId の下位1バイト。ゲームも1バイトで比べる）が一致するページの数を数え、
+/// 今回のページがそろい、ゲームが受け取った行数（EntryCount）が件数に届くまで待つ。
+/// </summary>
+public static class ListingReceipt
+{
+    public enum Verdict
+    {
+        /// <summary>まだ待つ。</summary>
+        Wait,
+
+        /// <summary>そろった。</summary>
+        Complete,
+
+        /// <summary>出品が0件（ゲームは一覧を空にする）。</summary>
+        Empty,
+    }
+
+    /// <summary>ページの数（1ページ10件。ゲームが送る上限は100件）。</summary>
+    public static int PagesFor(int count) => (Math.Min(count, 100) + 9) / 10;
+
+    /// <param name="count">件数の応答の件数。</param>
+    /// <param name="pages">今回の番号のページを受け取った数。</param>
+    /// <param name="currentSeq">ゲームがいま受け付けているページの番号（CurrentRequestId）。</param>
+    /// <param name="seqAtResult">件数の応答の直後に控えた番号。</param>
+    /// <param name="entryCount">ゲームが受け取った行数（EntryCount。最初のページで 0 に戻り、ページごとに +10）。</param>
+    /// <param name="filled">先頭から件数ぶんのうち、いま検索した品で単価が入っている行の数。</param>
+    public static Verdict Decide(int count, int pages, byte currentSeq, byte seqAtResult, uint entryCount, int filled)
+    {
+        if (count <= 0)
+            return Verdict.Empty;
+        var expected = Math.Min(count, 100);
+        return pages >= PagesFor(count) && currentSeq == seqAtResult && entryCount >= expected && filled >= expected
+            ? Verdict.Complete
+            : Verdict.Wait;
+    }
+}
+
 /// <summary>
 /// マーケットで購入の要求を送った後の判断（二重購入を防ぐ）。
 /// 成功は「ギルが減った AND 品が増えた」。
@@ -596,6 +717,11 @@ public static class PurchaseGuard
 /// 同じに見える）。以前は「15秒たっても何も変わらず通知も無い」を買い直しにしていたので、反映が遅いと1出品ぶん多く買いえた。
 /// いまは、ゲームが購入の応答で「断った」と返し（InfoProxyItemSearch.ProcessPurchaseResponse の errorMessageId が 0 でない）、
 /// しかも少し待ってもギルも所持も変わらないときだけ買い直す。それ以外で何も変わらないまま上限まで待ったら「分からない」として止める。
+///
+/// 以前は「断った」を Dalamud の「買えた」の通知（ItemPurchased）と組み合わせていたが、この通知は購入の応答の
+/// パケットなら成功でも失敗でも出る（Dalamud は errorMessageId を読み捨てる：MarketBoardPurchase.cs）。そのため「断った かつ 買えた通知なし」が
+/// 常に偽で、断られても毎回60秒待って「分からない」で止まっていた。いまは応答の errorMessageId だけで
+/// 成功・断られたを決め、送った出品とは出品の番号で照合する（<see cref="PurchaseReply.Find"/>）。
 /// </summary>
 public static class PurchaseOutcome
 {
@@ -627,10 +753,10 @@ public static class PurchaseOutcome
     /// <param name="gil">いまのギル。</param>
     /// <param name="countBefore">送る前の所持数。</param>
     /// <param name="count">いまの所持数。</param>
-    /// <param name="serverConfirmed">送った後に、その品の「買えた」の通知が来たか。</param>
-    /// <param name="rejected">送った後に、その品の購入の応答で「断った」と返ってきたか。</param>
+    /// <param name="response">送った出品への購入の応答（<see cref="PurchaseReply.Find"/>）。</param>
+    /// <param name="reject">断られたときの理由の扱い（<see cref="PurchaseReply.Classify"/>）。</param>
     /// <param name="waited">送ってからの時間。</param>
-    public static Verdict Decide(long gilBefore, long gil, int countBefore, int count, bool serverConfirmed, bool rejected, TimeSpan waited)
+    public static Verdict Decide(long gilBefore, long gil, int countBefore, int count, PurchaseResponse response, RejectKind reject, TimeSpan waited)
     {
         if (gil < gilBefore && count > countBefore)
             return Verdict.Bought;
@@ -639,11 +765,16 @@ public static class PurchaseOutcome
         if (gil != gilBefore || count != countBefore)
             return waited < RetryAfter ? Verdict.Wait : Verdict.Unknown;
 
-        // 何も変わっていない。はっきり断られていて（「買えた」の通知とは食い違っていない）、少し待っても変わらなければ買い直してよい
-        if (rejected && !serverConfirmed)
+        // 何も変わっていない。はっきり断られていて、少し待っても変わらなければ買い直してよい。
+        // ただし「入手完了できていない」（460/461）は支払いが済んでいるかもしれないので、買い直さずに分からないとして止める
+        if (response == PurchaseResponse.Rejected)
+        {
+            if (reject == RejectKind.MaybePaid)
+                return waited < RetryAfter ? Verdict.Wait : Verdict.Unknown;
             return waited < RejectSettle ? Verdict.Wait : Verdict.Retry;
+        }
 
-        // 断られたと分からない（通知の有無にかかわらず）。上限まで待って、変わらなければ買い直さずに止める
+        // 成功と返った（反映待ち）か、応答が無い。上限まで待って、変わらなければ買い直さずに止める
         return waited < ConfirmedLimit ? Verdict.Wait : Verdict.Unknown;
     }
 }
@@ -678,6 +809,37 @@ public sealed class HqFailureTally
             return false;
         var n = this.counts[item] = this.counts.GetValueOrDefault(item) + 1;
         return n >= this.Limit;
+    }
+}
+
+/// <summary>
+/// Artisan の連続製作（CraftItem）が予定の回数の途中で止まったときに、残りを頼み直すか。
+///
+/// CraftItem は Artisan の中では「連続製作（Endurance）」として動く。Artisan の設定「NQ ができたら止める」（EnduranceStopNQ）・
+/// 「失敗したら止める」（EnduranceStopFail）は連続製作にだけ効き（Artisan の EnduranceCraftWatcher.cs。Crafting List には効かない）、
+/// ON だと1回ごとに止まる。以前はそのたびに製作の段を立て直していた（遅いだけで止まりはしない）。
+/// いまは同じ作業の中で残りを頼み直すので、この設定の ON/OFF で進み方が変わらない。
+///
+/// 頼み直すのは、直前の頼みで1つ以上できていて（進んでいる）、まだ予定に届かず、材料が1回分以上あるときだけ。
+/// 1回もできなかった頼みの後は頼み直さない（Artisan が作れない理由があるので、今までどおり結果で判断する）。
+/// 頼み直しの回数は、予定の製作回数までで打ち切る（1回の頼みで必ず1つ以上進むので、それ以上は要らない）。
+/// </summary>
+public static class CraftResume
+{
+    /// <summary>頼み直す製作回数。頼み直さないなら 0。</summary>
+    /// <param name="made">この作業でできた数（合計）。</param>
+    /// <param name="expected">この作業で作るはずの数。</param>
+    /// <param name="gainedLast">直前の頼みでできた数。</param>
+    /// <param name="resumed">これまでに頼み直した回数。</param>
+    /// <param name="plannedCrafts">この作業の予定の製作回数。</param>
+    /// <param name="craftable">いまの材料で作れる回数。</param>
+    /// <param name="yield">1回でできる数。</param>
+    public static int Decide(int made, int expected, int gainedLast, int resumed, int plannedCrafts, int craftable, int yield)
+    {
+        if (made >= expected || gainedLast <= 0 || resumed >= plannedCrafts || craftable <= 0)
+            return 0;
+        var remaining = (expected - made + Math.Max(1, yield) - 1) / Math.Max(1, yield);
+        return Math.Min(remaining, craftable);
     }
 }
 
@@ -747,6 +909,20 @@ public static class CraftCut
             .Where(x => x.Have < x.Need)
             .ToList();
 
+    /// <summary>いまの手持ちで、そのレシピを何回作れるか（材料ごとの「持っている数 ÷ 1回に使う数」の最小）。材料が無いレシピは int.MaxValue。</summary>
+    public static int Craftable(IEnumerable<(uint Item, int Amount)> ingredients, IInventoryView inv)
+    {
+        var min = int.MaxValue;
+        foreach (var (item, amount) in ingredients)
+        {
+            if (amount <= 0)
+                continue;
+            min = Math.Min(min, (inv.CountNq(item) + inv.CountHq(item)) / amount);
+        }
+
+        return min;
+    }
+
     /// <summary>計画で使う職のうち、ギアセットの無いもの（「職（品）」の並び）。全部あれば null。</summary>
     public static string? MissingGearsets(CraftPlan plan, Func<uint, bool> hasGearset)
     {
@@ -757,4 +933,114 @@ public static class CraftCut
             .ToList();
         return missing.Count == 0 ? null : string.Join("、", missing);
     }
+}
+
+/// <summary>
+/// テレポを頼んだ後の見方（以前は「何かの詠唱中かエリア移動中」でなければ 10 秒ごとに頼み直していた）。
+/// Lifestream 自身の確実なテレポも「自分がテレポ（Action 5）を詠唱中か」で成否を決め、始まらなければ間隔を空けて頼み直す
+/// （Lifestream の TeleportService.ReliableTeleportToAetheryte）。詠唱が頼んだのと同じフレームで始まるかはゲームの中（ネイティブ）で読めないので、
+/// 詠唱が一度も始まらないときだけ上限（NoCastLimit）で頼み直す。詠唱を見た後に途切れた（動いた・攻撃された）ときは、動けるようになった時点ですぐ頼み直す。
+/// </summary>
+public static class TeleportWatch
+{
+    public enum Verdict
+    {
+        /// <summary>テレポの詠唱中かエリア移動中。</summary>
+        InProgress,
+
+        /// <summary>待つ（詠唱がまだ始まらない／詠唱の後の動けない間）。</summary>
+        Wait,
+
+        /// <summary>頼み直す。</summary>
+        Retry,
+    }
+
+    /// <summary>頼んでから詠唱が一度も始まらないときの上限（この間は待つ）。</summary>
+    public static readonly TimeSpan NoCastLimit = TimeSpan.FromSeconds(10);
+
+    /// <param name="castingTeleport">自分がテレポ（Action 5）を詠唱中か。</param>
+    /// <param name="betweenAreas">エリア移動中か。</param>
+    /// <param name="sawCast">頼んだ後にテレポの詠唱を一度でも見たか。</param>
+    /// <param name="playerFree">動ける状態か（詠唱の後の動けない間・会話中などは false）。</param>
+    /// <param name="teleportStatus">テレポがいま使えるか（GetActionStatus(Action, 5)：0＝使える、それ以外＝使えない理由の LogMessage の行番号）。</param>
+    /// <param name="sinceRequest">頼んでからの時間。</param>
+    public static Verdict Decide(bool castingTeleport, bool betweenAreas, bool sawCast, bool playerFree, uint teleportStatus, TimeSpan sinceRequest)
+    {
+        if (castingTeleport || betweenAreas)
+            return Verdict.InProgress;
+
+        // 詠唱を見た後：動けてテレポがまた使えるなら、詠唱が途切れた（テレポしなかった）。まだ動けない・使えないなら、詠唱が終わった後の間なので待つ
+        if (sawCast)
+            return playerFree && teleportStatus == 0 ? Verdict.Retry : Verdict.Wait;
+
+        return sinceRequest < NoCastLimit ? Verdict.Wait : Verdict.Retry;
+    }
+}
+
+/// <summary>
+/// ギアセットでの着替えの頼み直し（以前は頼んでから 3 秒たっても変わらなければ頼み直していた）。
+/// EquipGearset は「受け付けた 0／断った -1」を返す（FFXIVClientStructs の RaptureGearsetModule）。
+/// 受け付けたら、ジョブが変わるのを長い上限まで待つだけ（頼み直さない）。断られたら、同じフレームで何度も頼まないよう間隔を空けて頼み直す。
+/// </summary>
+public static class EquipRetry
+{
+    public enum Verdict
+    {
+        /// <summary>待つ。</summary>
+        Wait,
+
+        /// <summary>頼む（頼み直す）。</summary>
+        Request,
+
+        /// <summary>頼める回数を使い切った。</summary>
+        Fail,
+    }
+
+    /// <summary>受け付けた（0）のにジョブが変わらないときの上限（サーバーの応答が届かなかった場合に備える）。</summary>
+    public static readonly TimeSpan AcceptedLimit = TimeSpan.FromSeconds(10);
+
+    /// <summary>断られた（-1）あとの頼み直しの間隔（同じフレームで何度も頼まない）。</summary>
+    public static readonly TimeSpan RefusedSpacing = TimeSpan.FromSeconds(1);
+
+    /// <summary>頼む回数の上限。</summary>
+    public const int MaxRequests = 5;
+
+    /// <param name="lastResult">前に頼んだときの戻り値（まだ頼んでいなければ null）。</param>
+    /// <param name="sinceRequest">前に頼んでからの時間。</param>
+    /// <param name="requests">これまでに頼んだ回数。</param>
+    public static Verdict Decide(int? lastResult, TimeSpan sinceRequest, int requests)
+    {
+        if (lastResult is { } r && sinceRequest < (r == 0 ? AcceptedLimit : RefusedSpacing))
+            return Verdict.Wait;
+
+        return requests >= MaxRequests ? Verdict.Fail : Verdict.Request;
+    }
+}
+
+/// <summary>
+/// Lifestream に宿屋への移動を頼んだ直後の見方（以前は IsBusy が立つのを 5 秒待っていた）。
+/// Lifestream の受け付けは同じフレームで終わる：忙しければエラーを出して戻る・プレイヤーが無ければ戻る、それ以外はその場で作業を積むので
+/// IsBusy（作業が積まれている）がすぐ true になる（Lifestream の TaskPropertyShortcut.Enqueue・ECommons の TaskManager.IsBusy）。
+/// </summary>
+public static class InnRequest
+{
+    public enum Verdict
+    {
+        /// <summary>受け付けた（Lifestream が動き出した）。</summary>
+        Accepted,
+
+        /// <summary>受け付けなかった。</summary>
+        Refused,
+
+        /// <summary>状態を読めない（受け付けたか分からない。頼み直すと二重になるので、読めるまで待つ）。</summary>
+        Unknown,
+    }
+
+    /// <param name="busyAfter">頼んだ直後の Lifestream の IsBusy（読めなければ null）。</param>
+    public static Verdict AfterRequest(bool? busyAfter) => busyAfter switch
+    {
+        true => Verdict.Accepted,
+        false => Verdict.Refused,
+        null => Verdict.Unknown,
+    };
 }

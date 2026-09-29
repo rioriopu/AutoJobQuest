@@ -80,10 +80,9 @@ public sealed class GoToInnTask : AutoTask
                 return TaskResult.Running;
             }
 
-            // 受け付けられなかった（IsBusy が一度も立たない）か、終わったのに宿屋でない
-            if (!this.sawBusy && this.PhaseElapsed < TimeSpan.FromSeconds(5))
-                return TaskResult.Running;
-
+            // Lifestream の作業が終わったのに宿屋でない（宿屋が未解放なら Lifestream が自分で中断する：Lifestream の EnqueueGoToInn）→ 頼み直す
+            if (this.sawBusy)
+                ctx.Log.Write("宿屋", "Lifestream の作業が終わりましたが、宿屋に入っていません。頼み直します");
             this.requested = false;
         }
 
@@ -93,14 +92,31 @@ public sealed class GoToInnTask : AutoTask
             return TaskResult.Running;
         }
 
+        // Lifestream が別の作業中（他のプラグインや利用者が頼んだもの）なら、頼んでも「忙しい」で断られるので、終わるのを待つ
+        if (busy == true)
+        {
+            this.Status = "Lifestream が別の作業中です（終わるのを待っています）";
+            return TaskResult.Running;
+        }
+
         if (this.attempts++ >= 3)
-            return this.Fail("Lifestream で宿屋へ入れませんでした（宿屋が未解放の可能性）");
+            return this.Fail("Lifestream で宿屋へ入れませんでした（3 回頼みました。宿屋が未解放の可能性）");
 
         if (!ctx.Lifestream.EnqueueLocalInn(LifestreamIpc.GridaniaInnIndex))
             return this.Fail("Lifestream に宿屋への移動を頼めませんでした");
 
+        // 受け付けたかは頼んだ直後の IsBusy で分かる（Lifestream の受け付けは同じフレームで終わる：InnRequest。以前は 5 秒待っていた）
         this.requested = true;
         this.sawBusy = false;
+        switch (InnRequest.AfterRequest(ctx.Lifestream.IsBusy()))
+        {
+            case InnRequest.Verdict.Accepted:
+                this.sawBusy = true;
+                break;
+            case InnRequest.Verdict.Refused:
+                return this.Fail("Lifestream が宿屋への移動を受け付けませんでした（Lifestream が別の作業中か、キャラクターが読み込み中。直前に確かめたときは空いていました）");
+        }
+
         this.NextPhase("Lifestream に宿屋への移動を頼みました");
         return TaskResult.Running;
     }
@@ -130,6 +146,19 @@ public sealed class CraftOneTask : AutoTask
     private bool requested;
     private bool sawBusy;
     private bool collectable;
+    private Recipe recipe;
+
+    // 今の頼みを出した時点の完成品の数・頼んだ回数・頼み直した回数（連続製作が途中で止まったら残りを頼み直す：CraftResume）
+    private int attemptBase;
+    private int requestCrafts;
+    private int resumed;
+
+    // こちらが Artisan の食事・薬を一時的に「使わない」にしたか（後始末で戻す）
+    private bool consumablesDisabled;
+
+    // HQ 指定の品の「試し作り」中か（まず1回作って HQ になるのを確かめてから残りを作る。
+    // HQ にならなければ残りは作らず、材料を残したまま HQ の失敗として数える）
+    private bool trial;
 
     // Artisan の IsBusy が読めない（null）のを最初に見た時刻。読めないのを「終わった」と扱わない
     private DateTime? unknownSince;
@@ -153,6 +182,12 @@ public sealed class CraftOneTask : AutoTask
     /// <summary>作るはずだった数。</summary>
     public int Expected => this.expected;
 
+    /// <summary>
+    /// HQ でできてほしい数（HQ 指定の品だけ）。作る前の手持ちの HQ で足りない分（HQ の納品の数 − 手持ちの HQ）で、
+    /// 作る数より多くはしない。品質を問わない納品の分や材料の分まで HQ を求めない（HQ の失敗の数え方）。
+    /// </summary>
+    public int HqNeeded { get; private set; }
+
     /// <summary>作った品の計画。</summary>
     public PlannedCraft Craft => this.craft;
 
@@ -171,10 +206,21 @@ public sealed class CraftOneTask : AutoTask
         this.beforeAll = this.CountMade(inv);
         this.beforeHq = inv.CountHq(this.craft.ItemId);
         this.expected = this.craft.Crafts * this.craft.Yield;
+        this.HqNeeded = !this.craft.WantHq ? 0
+            : this.craft.HqTarget > 0 ? Math.Min(this.expected, Math.Max(0, this.craft.HqTarget - this.beforeHq))
+            : this.expected;
+        this.attemptBase = this.beforeAll;
+        this.requestCrafts = this.craft.Crafts;
+        this.trial = this.craft.WantHq && this.craft.Crafts > 1 && this.HqNeeded > 0 && !this.collectable;
+        if (this.trial)
+        {
+            this.requestCrafts = 1;
+            ctx.Log.Write("製作", $"{CraftPlanner.ItemName(this.craft.ItemId)}（HQ 指定）は、まず1回作って HQ になるのを確かめてから残りの {this.craft.Crafts - 1} 回を作ります");
+        }
 
         // 材料が足りるかを先に確かめる（足りないまま頼むと Artisan は材料切れで止まるだけ）
-        var recipe = Svc.Data.GetExcelSheet<Recipe>().GetRow(this.craft.RecipeId);
-        foreach (var (ing, amount) in CraftPlanner.Ingredients(recipe))
+        this.recipe = Svc.Data.GetExcelSheet<Recipe>().GetRow(this.craft.RecipeId);
+        foreach (var (ing, amount) in CraftPlanner.Ingredients(this.recipe))
         {
             var have = inv.CountAll(ing);
             this.ingredientsBefore[ing] = have;
@@ -200,7 +246,22 @@ public sealed class CraftOneTask : AutoTask
                 return TaskResult.Running;
             }
 
-            if (!ctx.Artisan.CraftItem((ushort)this.craft.RecipeId, this.craft.Crafts))
+            // Artisan の既定の食事・薬を、こちらが頼む製作では使わない（設定 UseArtisanConsumables が false のとき）。
+            // 送る前に控えを保存する（読み込みの解除をまたいでも戻せるように）
+            if (!ctx.Config.UseArtisanConsumables && !this.consumablesDisabled)
+            {
+                if (!ctx.Config.ArtisanTempConsumableRecipes.Contains(this.craft.RecipeId))
+                {
+                    ctx.Config.ArtisanTempConsumableRecipes.Add(this.craft.RecipeId);
+                    ctx.Config.Save();
+                }
+
+                if (!ctx.Artisan.DisableConsumablesTemporarily(this.craft.RecipeId))
+                    return this.Fail($"Artisan に「この製作では食事・薬を使わない」を頼めませんでした（高価な消耗品を使わないよう、製作を始めません）: {string.Join(" / ", ctx.Artisan.LastErrors.Values)}");
+                this.consumablesDisabled = true;
+            }
+
+            if (!ctx.Artisan.CraftItem((ushort)this.craft.RecipeId, this.requestCrafts))
                 return this.Fail($"Artisan に製作を頼めませんでした: {string.Join(" / ", ctx.Artisan.LastErrors.Values)}");
 
             this.requested = true;
@@ -230,7 +291,7 @@ public sealed class CraftOneTask : AutoTask
             var made = this.CountMade(Inventory.Snapshot()) - this.beforeAll;
             this.Status = $"Artisan が製作中（{Math.Max(0, made)}/{this.expected}個）";
 
-            var limit = TimeSpan.FromSeconds(60 + 90 * this.craft.Crafts);
+            var limit = TimeSpan.FromSeconds(60 + 90 * this.requestCrafts);
             if (this.PhaseElapsed > limit)
             {
                 ctx.Artisan.SetEndurance(false);
@@ -242,11 +303,43 @@ public sealed class CraftOneTask : AutoTask
 
         // 頼んだ直後は Endurance がまだ OFF（レシピ選択の後で ON になる）。IsBusy が立つか、品が増えるまで待つ。
         // 60 秒は「動き出さなかった」と判断する上限（15 秒では開始の遅い環境で別の理由の失敗になる）
-        if (!this.sawBusy && this.CountMade(Inventory.Snapshot()) <= this.beforeAll && this.PhaseElapsed < TimeSpan.FromSeconds(60))
+        if (!this.sawBusy && this.CountMade(Inventory.Snapshot()) <= this.attemptBase && this.PhaseElapsed < TimeSpan.FromSeconds(60))
             return TaskResult.Running;
 
         var inv = Inventory.Snapshot();
-        this.Made = this.CountMade(inv) - this.beforeAll;
+        var nowCount = this.CountMade(inv);
+
+        // HQ 指定の試し作り（1回）の結果：HQ になっていれば残りを作る（下の頼み直しで続ける）。NQ だったら残りは作らない
+        var stopAfterTrial = false;
+        if (this.trial)
+        {
+            this.trial = false;
+            var hqGain = inv.CountHq(this.craft.ItemId) - this.beforeHq;
+            if (nowCount - this.attemptBase > 0 && hqGain <= 0)
+            {
+                stopAfterTrial = true;
+                ctx.Log.Warn("製作", $"{CraftPlanner.ItemName(this.craft.ItemId)}（HQ 指定）の試し作りが NQ でした。材料を無駄にしないよう、残りの {this.craft.Crafts - 1} 回は作らずに HQ の失敗として数えます");
+            }
+        }
+
+        // 連続製作が予定の途中で止まった（Artisan の「NQ ができたら止める」「失敗したら止める」等。Crafting List ではなく
+        // 連続製作で頼んでいるので、この設定が効く）→ この頼みで進んでいれば、残りを同じ作業の中で頼み直す（CraftResume）
+        var resume = stopAfterTrial ? 0 : CraftResume.Decide(nowCount - this.beforeAll, this.expected, nowCount - this.attemptBase, this.resumed,
+            this.craft.Crafts, CraftCut.Craftable(CraftPlanner.Ingredients(this.recipe), inv), this.craft.Yield);
+        if (resume > 0)
+        {
+            this.resumed++;
+            this.attemptBase = nowCount;
+            this.requestCrafts = resume;
+            this.requested = false;
+            this.sawBusy = false;
+            ctx.Log.Write("製作", $"{CraftPlanner.ItemName(this.craft.ItemId)} の連続製作が {nowCount - this.beforeAll}/{this.expected} 個で止まったので、"
+                                 + $"残り {resume} 回を頼み直します（Artisan の「NQ ができたら止める」等の設定で止まることがある）");
+            this.NextPhase("残りの製作を Artisan に頼み直します");
+            return TaskResult.Running;
+        }
+
+        this.Made = nowCount - this.beforeAll;
         var madeHq = inv.CountHq(this.craft.ItemId) - this.beforeHq;
         this.MadeHq = madeHq;
 
@@ -281,6 +374,14 @@ public sealed class CraftOneTask : AutoTask
 
     public override void Cleanup(TaskContext ctx)
     {
+        // 一時的に「使わない」にした食事・薬を戻す（戻せなければ控えに残し、止まっている間に戻す：Services）。
+        // Artisan がまだ製作中なら、止め切るまで戻さない（戻した直後の製作で食べないように、控えに残して後で戻す）
+        if (this.consumablesDisabled && ctx.Artisan.IsBusy() == false && ctx.Artisan.RestoreConsumables(this.craft.RecipeId))
+        {
+            ctx.Config.ArtisanTempConsumableRecipes.Remove(this.craft.RecipeId);
+            ctx.Config.Save();
+        }
+
         // こちらが頼んだ製作がまだ動いていれば止める（Endurance を OFF）
         if (!this.requested || ctx.Artisan.IsBusy() == false)
             return;
@@ -298,6 +399,17 @@ public sealed class CraftOneTask : AutoTask
     public const string ArtisanWatchName = "Artisan の製作を止め切る";
 
     /// <summary>
+    /// 製作の構え（製作手帳を開いた状態）のままか。Artisan の Crafting.State の IdleBetween と同じ見方
+    /// （ConditionFlag.PreparingToCraft が立ち、製作中・製作の操作中ではない）。
+    /// </summary>
+    public static bool InCraftStanceIdle()
+    {
+        var c = Svc.Condition;
+        return c[Dalamud.Game.ClientState.Conditions.ConditionFlag.PreparingToCraft]
+               && !c[Dalamud.Game.ClientState.Conditions.ConditionFlag.ExecutingCraftingAction];
+    }
+
+    /// <summary>
     /// 止めた後の見張り：Artisan が空くまで、遅れて Endurance が ON になったら OFF にする。
     /// 読み込みの解除（更新・無効化）の後は見張れないので、次に読み込んだとき同じ見張りを置き直す（Services）。
     /// </summary>
@@ -308,4 +420,62 @@ public sealed class CraftOneTask : AutoTask
                 artisan.SetEndurance(false);
             return artisan.IsBusy() == false;
         });
+}
+
+/// <summary>
+/// 製作の列の最後で、製作の構えを解く（以前は Artisan の「連続製作が終わったら構えを解く」
+/// ＝ExitCraftStanceEndurance が OFF だと、構えのまま次の段〔マテリア装着・クエストの移動〕へ進んで待たされていた。
+/// 事前点検で注意を出すだけだった）。
+///
+/// やり方は Artisan 自身の PreCrafting.TaskExitCraft と同じ：製作中でない（IdleBetween）ときに、製作手帳（RecipeNote）へ
+/// 閉じる合図（Callback -1）を送る。製作手帳はこちらが CraftItem で頼んだ製作で開いたもの。Artisan が動いている間は触らない。
+/// 進む判断は状態（構えが解けたか）。閉じる合図は、前の合図で状態が変わらないまま次のフレーム以降も窓が見えているときだけ
+/// 送り直す（3回まで）。
+/// </summary>
+public sealed unsafe class ExitCraftStanceTask : AutoTask
+{
+    private int closes;
+    private DateTime? sentAt;
+
+    public override string Name => "製作の構えを解く";
+
+    protected override TaskResult Tick(TaskContext ctx)
+    {
+        var c = Svc.Condition;
+        var inStance = c[Dalamud.Game.ClientState.Conditions.ConditionFlag.PreparingToCraft]
+                       || c[Dalamud.Game.ClientState.Conditions.ConditionFlag.Crafting];
+        if (!inStance)
+            return TaskResult.Done;
+
+        if (this.WorkElapsed > TimeSpan.FromMinutes(1))
+            return this.Fail("製作の構えを1分たっても解けません（製作手帳を閉じられない）");
+
+        // Artisan が動いている・製作の操作中は待つ（Artisan の TaskExitCraft と同じく、製作中は触らない）
+        if (ctx.Artisan.IsBusy() != false || !CraftOneTask.InCraftStanceIdle())
+        {
+            this.Status = "製作が終わるのを待っています";
+            return TaskResult.Running;
+        }
+
+        var note = GameUi.Addon("RecipeNote");
+        if (note == null)
+        {
+            this.Status = "製作手帳が閉じるのを待っています";
+            return TaskResult.Running;
+        }
+
+        // 送った合図が効くまで（窓が消える・構えが解ける）待つ。同じフレームには効かないので、送った後は少なくとも次の
+        // フレームまで待ち、2秒たっても窓が残っていれば送り直す（送り直しの間隔の2秒は、進む判断ではなく合図の再送の間隔）
+        if (this.sentAt is { } at && DateTime.UtcNow - at < TimeSpan.FromSeconds(2))
+            return TaskResult.Running;
+
+        if (this.closes++ >= 3)
+            return this.Fail("製作手帳に閉じる合図を3回送っても、製作の構えが解けません");
+
+        GameUi.Fire(note, true, -1);
+        this.sentAt = DateTime.UtcNow;
+        ctx.Log.Write("製作", "製作手帳を閉じて、製作の構えを解きます");
+        this.Status = "製作の構えを解いています";
+        return TaskResult.Running;
+    }
 }

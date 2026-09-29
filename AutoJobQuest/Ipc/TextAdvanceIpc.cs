@@ -55,9 +55,13 @@ public sealed class TextAdvanceIpc : IpcGate
     private System.DateTime lastCheck = System.DateTime.MinValue;
 
     /// <summary>
-    /// 取ったはずの外部制御がまだあるか確かめ、無くなっていれば取り直す（3秒に1回。以前は、
+    /// 取ったはずの外部制御がまだこちらのものか確かめ、無くなっていれば取り直す（3秒に1回。以前は、
     /// TextAdvance が読み直されると依頼者の記録が消え、Questionable が取り直して納品窓の取り合いが戻るのに、
     /// こちらは「取っている」と思ったままだった）。TextAdvance が読み込まれていなければ、取っている印を下ろす。
+    ///
+    /// 【確かめ方】同じ設定で EnableExternalControl を呼び直す。TextAdvance は「誰も持っていない」か「依頼者が同じ」ときだけ受け付けて
+    /// true を返す（TextAdvance の IPCProvider.cs）。true ならこちらのもの、false なら他者（Questionable 等）が持っている。
+    /// 以前は IsInExternalControl（誰かが持っているか）だけを見ていたので、他者が取り直しても「こちらが持っている」と取り違えた。
     /// </summary>
     public bool KeepControl()
     {
@@ -74,13 +78,29 @@ public sealed class TextAdvanceIpc : IpcGate
             return false;
         }
 
-        if (this.IsInExternalControl() == false)
+        if (this.Apply(this.requestAllowed))
+            return true;
+
+        // 他者が持っている（こちらの設定にならない）。印を下ろし、呼び出し側が記録に出す
+        Core.DebugLog.Current?.Line("IPC", "TextAdvance の外部制御がほかの依頼者に移っていました（取り直せません）");
+        this.ownControl = false;
+        this.requestAllowed = false;
+        return false;
+    }
+
+    /// <summary>
+    /// 外部制御がこちらのものか、いま確かめる（間引かない）。こちらのものなら true、他者が持っていれば false、読めなければ null。
+    /// こちらが持っていないときは、取りに行かずに「誰かが持っているか」だけを返す（誰も持っていなければ true＝取れる）。
+    /// </summary>
+    public bool? CanOwn()
+    {
+        if (this.ownControl)
         {
-            Core.DebugLog.Current?.Line("IPC", "TextAdvance の外部制御が外れていた（TextAdvance の読み直しなど）ので、取り直します");
-            return this.Apply(this.requestAllowed);
+            this.lastCheck = System.DateTime.MinValue;
+            return this.KeepControl();
         }
 
-        return true;
+        return this.IsInExternalControl() is { } held ? !held : null;
     }
 
     /// <summary>

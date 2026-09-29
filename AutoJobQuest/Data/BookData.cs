@@ -7,7 +7,8 @@ using Lumina.Excel.Sheets;
 namespace AutoJobQuest.Data;
 
 /// <summary>NPC の置き場所（Level シートから）。</summary>
-public sealed record NpcSpot(uint NpcId, uint Territory, Vector3 Position);
+/// <summary>窓口1つ（NPC・エリア・位置）。UnlockQuest は、その窓口の画面を開くのに要るクエスト（PreHandler.UnlockQuest。無ければ 0）。</summary>
+public sealed record NpcSpot(uint NpcId, uint Territory, Vector3 Position, uint UnlockQuest = 0);
 
 /// <summary>秘伝書1冊の交換条件。</summary>
 /// <param name="BookItemId">秘伝書のアイテム。</param>
@@ -227,6 +228,10 @@ public sealed class BookData
 
         var collectNpcs = new HashSet<uint>();
         var scripNpcs = new HashSet<uint>();
+
+        // 窓口 → 画面を開くのに要るクエスト（PreHandler.UnlockQuest。イディルシャイア＝67634「職人、新たな世界へ」、
+        // モードゥナ＝67631「職人の新たなお仕事」。未完了だと話しかけても画面が開かない）
+        var unlockOf = new Dictionary<uint, uint>();
         foreach (var npc in Svc.Data.GetExcelSheet<ENpcBase>())
         {
             foreach (var d in npc.ENpcData)
@@ -245,6 +250,8 @@ public sealed class BookData
                         break;
                     case HandlerPreHandler when preHandler.TryGetRow(v, out var ph) && IsBookInclusionShop(ph.Target.RowId):
                         scripNpcs.Add(npc.RowId);
+                        if (ph.UnlockQuest.RowId != 0)
+                            unlockOf[npc.RowId] = ph.UnlockQuest.RowId;
                         break;
                     case HandlerInclusionShop when IsBookInclusionShop(v):
                         scripNpcs.Add(npc.RowId);
@@ -261,7 +268,7 @@ public sealed class BookData
             if (collectNpcs.Contains(id))
                 this.CollectableNpcs.Add(new NpcSpot(id, lv.Territory.RowId, new Vector3(lv.X, lv.Y, lv.Z)));
             if (scripNpcs.Contains(id))
-                this.ScripNpcs.Add(new NpcSpot(id, lv.Territory.RowId, new Vector3(lv.X, lv.Y, lv.Z)));
+                this.ScripNpcs.Add(new NpcSpot(id, lv.Territory.RowId, new Vector3(lv.X, lv.Y, lv.Z), unlockOf.GetValueOrDefault(id)));
         }
 
         if (this.CollectableNpcs.Count == 0)
@@ -280,7 +287,8 @@ public sealed class BookData
     /// <param name="requiredBookItems">交換が要る秘伝書（アイテム ID）。</param>
     /// <param name="currencyItem">特殊通貨の番号 → アイテム（省略時はゲームから：SpecialCurrency.ItemId。試すときに差し替える）。</param>
     /// <param name="townAvailable">両方の窓口のある街に行けるか（省略時はゲームから：ChooseTown。試すときに差し替える）。</param>
-    public List<string> Validate(IEnumerable<uint> requiredBookItems, Func<byte, uint>? currencyItem = null, Func<bool>? townAvailable = null)
+    /// <param name="questDone">クエストが完了しているか（省略時はゲームから。行ける街が無いときの理由の文言に使う。試すときに差し替える）。</param>
+    public List<string> Validate(IEnumerable<uint> requiredBookItems, Func<byte, uint>? currencyItem = null, Func<bool>? townAvailable = null, Func<uint, bool>? questDone = null)
     {
         currencyItem ??= SpecialCurrency.ItemId;
         townAvailable ??= () => this.ChooseTown() != null;
@@ -314,28 +322,53 @@ public sealed class BookData
         if (this.CollectableNpcs.Count == 0 || this.ScripNpcs.Count == 0)
             problems.Add("収集品納品窓口かスクリップ取引窓口の場所がゲームデータから引けません");
         else if (!townAvailable())
-            problems.Add("収集品納品窓口とスクリップ取引窓口のある街に、解放済みのエーテライトがありません");
+            problems.Add(this.WhyNoTown(questDone));
 
         return problems;
     }
 
     /// <summary>
-    /// 収集品納品窓口とスクリップ取引窓口が同じエリアにあり、そのエリアに解放済みのエーテライトがある組を選ぶ
-    /// （イディルシャイア・モードゥナはどちらも Level シートだけで座標が引ける）。
+    /// 収集品納品窓口とスクリップ取引窓口が同じエリアにあり、そのエリアに解放済みのエーテライトがあり、
+    /// スクリップ取引窓口の画面を開くクエスト（PreHandler.UnlockQuest）が完了している組を選ぶ
+    /// （イディルシャイア・モードゥナはどちらも Level シートだけで座標が引ける。
+    /// 以前はクエストを見ずに、並びが先のイディルシャイアを選び、67634 が未完了だと画面が開かずに止まった）。
     /// </summary>
-    public (NpcSpot Collect, NpcSpot Scrip)? ChooseTown()
+    /// <param name="aetheryteUnlocked">エーテライトが解放済みか（省略時はゲームから。試すときに差し替える）。</param>
+    /// <param name="questDone">クエストが完了しているか（省略時はゲームから。試すときに差し替える）。</param>
+    public (NpcSpot Collect, NpcSpot Scrip)? ChooseTown(Func<uint, bool>? aetheryteUnlocked = null, Func<uint, bool>? questDone = null)
     {
-        var unlocked = Svc.Aetherytes.Select(a => a.AetheryteId).ToHashSet();
+        if (aetheryteUnlocked == null)
+        {
+            var unlocked = Svc.Aetherytes.Select(a => a.AetheryteId).ToHashSet();
+            aetheryteUnlocked = unlocked.Contains;
+        }
+
+        questDone ??= q => FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(q);
         var aetherytes = Svc.Data.GetExcelSheet<Aetheryte>();
         foreach (var c in this.CollectableNpcs)
         {
-            var s = this.ScripNpcs.FirstOrDefault(x => x.Territory == c.Territory);
+            var s = this.ScripNpcs.FirstOrDefault(x => x.Territory == c.Territory && (x.UnlockQuest == 0 || questDone(x.UnlockQuest)));
             if (s == null)
                 continue;
-            if (aetherytes.Any(a => a.IsAetheryte && a.Territory.RowId == c.Territory && unlocked.Contains(a.RowId)))
+            if (aetherytes.Any(a => a.IsAetheryte && a.Territory.RowId == c.Territory && aetheryteUnlocked(a.RowId)))
                 return (c, s);
         }
 
         return null;
     }
+
+    /// <summary>窓口のある町を選べない理由（事前点検・止めるときの文言。クエストが未完了の窓口を名前つきで出す）。</summary>
+    public string WhyNoTown(Func<uint, bool>? questDone = null)
+    {
+        questDone ??= q => FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(q);
+        var locked = this.ScripNpcs.Where(x => x.UnlockQuest != 0 && !questDone(x.UnlockQuest))
+            .Select(x => $"{TerritoryLabel(x.Territory)} の窓口は「{Unlocks.QuestName(x.UnlockQuest)}」が未完了")
+            .ToList();
+        return locked.Count > 0
+            ? $"スクリップ取引窓口を開けません（{string.Join("、", locked)}）。どちらかの町の窓口を開けるようにしてから始めてください"
+            : "収集品納品窓口とスクリップ取引窓口のある街に、解放済みのエーテライトがありません";
+    }
+
+    private static string TerritoryLabel(uint territory)
+        => Svc.Data.GetExcelSheet<TerritoryType>().TryGetRow(territory, out var t) ? t.PlaceName.ValueNullable?.Name.ExtractText() ?? $"#{territory}" : $"#{territory}";
 }

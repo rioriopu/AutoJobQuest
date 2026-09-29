@@ -1,18 +1,29 @@
+using System;
+using System.Collections.Generic;
 using System.Numerics;
+using System.Text;
 
 namespace AutoJobQuest.Ipc;
 
 /// <summary>
 /// Questionable への窓口。クエストの受注・進行・報告を任せる。
 ///
-/// IPC 名と型は Questionable 15.756.3.22 の逆コンパイルで確認済み（Questionable.External/QuestionableIpc.cs）:
+/// IPC 名と型は Questionable の本物のソース（HEAD 6f91d9af＝導入版 15.756.3.24）で確認済み
+/// （Questionable\External\QuestionableIpc.cs）:
 ///   bool IsRunning()
 ///   string GetCurrentQuestId()
 ///   StepData GetCurrentStepData()
 ///   bool StartSingleQuest(string questId)   … questId は Quest の行 ID − 65536 を10進の文字列にしたもの
 ///   bool IsQuestComplete(string) / bool IsQuestAccepted(string) / bool IsReadyToAcceptQuest(string)
-///   bool IsQuestLocked(string)
+///   bool IsQuestLocked(string) / (bool, string) IsQuestLockedReason(string)
 ///   bool Stop(string label)
+///   優先リスト：string ExportQuestPriority() / bool ClearQuestPriority() / bool AddQuestPriority(string) / bool ImportQuestPriority(string)
+///
+/// 【受注できるかの判定】Questionable の IsReadyToAcceptQuest は「今の職のレベル」で判定する（QuestFunctions.cs:721-723）。
+///  受注前に単体進行を頼んで「受注できない」だと、Questionable は未受注のメインクエストなど別のクエストを単体進行のまま進め続け、
+///  止まらない（QuestController.cs:613, 633, 685-706）。必ず先に着替えて、受注できると確かめてから頼む。
+/// 【優先リスト】保存されない（メモリだけ・全キャラ共通・読み込み直しで消える）。Import は追加（上書きではない）。
+///  Add・Import・Clear の戻り値はほぼ常に true なので、入ったかは Export で確かめる（QuestPriorityManager.cs・PriorityWindow.cs）。
 ///
 /// 【製作系クラスクエでの Questionable の動き（ソースで確認した事実）】
 ///  ・ほぼ全部のクエストに「Craft」の手順がある。そこで Questionable はまず
@@ -70,6 +81,38 @@ public sealed class QuestionableIpc : IpcGate
     public bool? IsQuestLocked(uint questRowId)
         => this.TryInvoke("IsQuestLocked",
             () => this.Func<string, bool>("Questionable.IsQuestLocked").InvokeFunc(ToQuestId(questRowId)), out var v) ? v : null;
+
+    public bool? IsQuestAccepted(uint questRowId)
+        => this.TryInvoke("IsQuestAccepted",
+            () => this.Func<string, bool>("Questionable.IsQuestAccepted").InvokeFunc(ToQuestId(questRowId)), out var v) ? v : null;
+
+    /// <summary>受けられない理由（"Prev quest"・"Low level (…)"・"Aetheryte locked: …" 等。読めなければ null）。</summary>
+    public (bool Locked, string Reason)? IsQuestLockedReason(uint questRowId)
+        => this.TryInvoke("IsQuestLockedReason",
+            () => this.Func<string, (bool, string)>("Questionable.IsQuestLockedReason").InvokeFunc(ToQuestId(questRowId)), out var v) ? v : null;
+
+    /// <summary>優先リストを書き出す（"qst:priority:"＋Base64("番号;番号…")）。読めなければ null。</summary>
+    public string? ExportQuestPriority()
+        => this.TryInvoke("ExportQuestPriority", () => this.Func<string>("Questionable.ExportQuestPriority").InvokeFunc(), out var v) ? v : null;
+
+    /// <summary>優先リストを空にする（「受注のみ」の印も消える）。送れたら true（消えたかは Export で確かめる）。</summary>
+    public bool ClearQuestPriority()
+        => this.TraceThen("ClearQuestPriority()") && this.TryInvoke("ClearQuestPriority",
+            () => this.Func<bool>("Questionable.ClearQuestPriority").InvokeFunc(), out _);
+
+    /// <summary>優先リストの末尾に足す（既にあれば何もしない）。送れたら true（入ったかは Export で確かめる）。</summary>
+    public bool AddQuestPriority(uint questRowId)
+        => this.TraceThen($"AddQuestPriority(\"{ToQuestId(questRowId)}\")") && this.TryInvoke("AddQuestPriority",
+            () => this.Func<string, bool>("Questionable.AddQuestPriority").InvokeFunc(ToQuestId(questRowId)), out _);
+
+    /// <summary>書き出した文字列を優先リストの末尾に読み込む（上書きではない）。送れたら true。</summary>
+    public bool ImportQuestPriority(string encoded)
+        => this.TraceThen("ImportQuestPriority(控え)") && this.TryInvoke("ImportQuestPriority",
+            () => this.Func<string, bool>("Questionable.ImportQuestPriority").InvokeFunc(encoded), out _);
+
+    /// <summary>優先リストの書き出しの形（Questionable の PriorityWindow.EncodeQuestPriority と同じ）。</summary>
+    public static string EncodePriority(IEnumerable<string> questIds)
+        => "qst:priority:" + Convert.ToBase64String(Encoding.UTF8.GetBytes(string.Join(';', questIds)));
 
     /// <summary>Questionable を止める。自分が始めた進行のときだけ呼ぶこと。</summary>
     public bool Stop(string label)

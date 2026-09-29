@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace AutoJobQuest.Ipc;
 
@@ -66,6 +67,114 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
     public bool SetAoeType(byte value)
         => this.TraceThen($"OtherCommand(Settings, AoEType {RsrStateReader.AoeName(value)})") && this.TryAction("OtherCommand",
             () => this.Func<byte, string, object>(Prefix + "OtherCommand").InvokeAction(0, $"AoEType {RsrStateReader.AoeName(value)}"));
+
+    /// <summary>RSR の真偽の設定を変える（OtherCommand(Settings=0, "名前 値")。メモリ上だけ変わる）。</summary>
+    public bool SetBoolSetting(string name, bool value)
+        => this.TraceThen($"OtherCommand(Settings, {name} {(value ? "true" : "false")})") && this.TryAction("OtherCommand",
+            () => this.Func<byte, string, object>(Prefix + "OtherCommand").InvokeAction(0, $"{name} {(value ? "true" : "false")}"));
+
+    /// <summary>
+    /// Henched の間だけ false にする RSR の真偽の設定：
+    ///  ・TargetFreely：狙い（ハードターゲット）が空になった瞬間に、RSR が48m 以内の一番近い敵を自分で狙う。候補に FATE や
+    ///    「攻撃してよいか」の絞り込みが無いので、指定外の敵を殴り始めうる（対象モンスター以外は攻撃しない仕様に反する）。
+    ///  ・IgnoreNonFateInFate：FATE の円の中では FATE 以外の敵を、FATE の外では FATE の敵を殴らない。狙った敵が FATE の中にいる・
+    ///    FATE の敵に攻撃されたときに RSR が殴らず、45秒むだにして諦める（棒立ちにならず反撃する仕様に反する）。
+    /// </summary>
+    public static readonly string[] HenchedFalseSettings = ["TargetFreely", "IgnoreNonFateInFate"];
+
+    // 真偽の設定：こちらが変えたもの（名前 → 使う前の値）・入れ直した回数・最後に確かめた時刻
+    private readonly Dictionary<string, bool> boolTaken = [];
+    private readonly Dictionary<string, int> boolResends = [];
+    private DateTime lastBoolCheck = DateTime.MinValue;
+
+    /// <summary>Henched の間、真偽の設定を false にしておく（3秒に1回だけ確かめる）。</summary>
+    private void EnsureBoolsOff()
+    {
+        if (DateTime.UtcNow - this.lastBoolCheck < HenchedTracker.ResendInterval)
+            return;
+        this.lastBoolCheck = DateTime.UtcNow;
+
+        foreach (var name in HenchedFalseSettings)
+        {
+            var current = RsrStateReader.ReadBool(name);
+            var pendingOriginal = this.store != null && this.store.RsrBoolOriginals.TryGetValue(name, out var po) ? po : (bool?)null;
+            var d = RsrBoolSetting.Take(current, false, this.boolTaken.ContainsKey(name), this.boolResends.GetValueOrDefault(name), pendingOriginal);
+            switch (d.Action)
+            {
+                case RsrAoe.TakeAction.Adopt:
+                    this.boolTaken[name] = d.Original ?? true;
+                    Core.DebugLog.Current?.Line("IPC", $"前回こちらが false にした RSR の {name} が残っています。使い終わったら {d.Original} に戻します");
+                    break;
+                case RsrAoe.TakeAction.Warn:
+                    if (this.boolResends.GetValueOrDefault(name) != -1)
+                    {
+                        this.boolResends[name] = -1; // 警告は1回だけ
+                        var msg = current == null
+                            ? $"RSR の設定 {name} を読めません（{RsrStateReader.LastError}）。指定外の敵を狙う・FATE の敵に反撃しない可能性があります"
+                            : $"RSR の設定 {name} を false にしても戻ります（利用者か RSR が変えた可能性）";
+                        Core.DebugLog.Current?.Line("IPC", $"⚠ {msg}");
+                        Svc.Chat.Print($"[AutoJobQuest] {msg}");
+                    }
+
+                    break;
+                case RsrAoe.TakeAction.SendOff:
+                    if (!this.boolTaken.ContainsKey(name))
+                    {
+                        this.boolTaken[name] = d.Original ?? true;
+                        this.SaveBool(name, d.Original ?? true);
+                        Core.DebugLog.Current?.Line("IPC", $"RSR の {name} を戦闘の間だけ false にします（使う前は {d.Original}。使い終わったら戻します）");
+                    }
+                    else
+                    {
+                        this.boolResends[name] = this.boolResends.GetValueOrDefault(name) + 1;
+                    }
+
+                    this.SetBoolSetting(name, false);
+                    break;
+            }
+        }
+    }
+
+    /// <summary>真偽の設定を使う前の値へ戻す（こちらが変えたものだけ。利用者が変えていたら戻さない）。</summary>
+    private void ReleaseBools()
+    {
+        foreach (var (name, original) in this.boolTaken.ToList())
+        {
+            var current = RsrStateReader.ReadBool(name);
+            if (RsrBoolSetting.Restore(current, false, original) is not { } back)
+            {
+                Core.DebugLog.Current?.Line("IPC", $"RSR の {name} はもう {current} になっている（利用者が変えた）ので、戻しません");
+                this.SaveBool(name, null);
+                continue;
+            }
+
+            // 送れても、控えは戻ったと確かめるまで残す（RestoreLeftover が確かめる）
+            if (this.SetBoolSetting(name, back))
+                Core.DebugLog.Current?.Line("IPC", $"RSR の {name} を {back} に戻しました（戻ったかは後で確かめます）");
+        }
+
+        this.boolTaken.Clear();
+        this.boolResends.Clear();
+        this.lastBoolCheck = DateTime.MinValue;
+    }
+
+    private void SaveBool(string name, bool? original)
+    {
+        if (this.store == null)
+            return;
+        if (original is { } o)
+        {
+            if (this.store.RsrBoolOriginals.TryGetValue(name, out var cur) && cur == o)
+                return;
+            this.store.RsrBoolOriginals[name] = o;
+        }
+        else if (!this.store.RsrBoolOriginals.Remove(name))
+        {
+            return;
+        }
+
+        this.store.Save();
+    }
 
     // 範囲攻撃をこちらが Off にしているか・使う前の値・入れ直した回数・最後に確かめた時刻
     private bool aoeTakenByMe;
@@ -232,7 +341,11 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
         if (action != HenchedTracker.Action.Send)
         {
             if (this.tracker.HenchedByMe)
+            {
                 this.EnsureAoeOff();
+                this.EnsureBoolsOff();
+            }
+
             return true; // 応答あり、または送った直後の反映待ち
         }
 
@@ -258,7 +371,14 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
         this.tracker.Sent(DateTime.UtcNow);
         if (firstTake)
             this.SaveStore(true, this.originalMode);
+
+        // 送った直後に内部のモードを読んで確かめる（RSR の IPC は同じ呼び出しの中で状態を変える）。
+        // Henched になっていなければ（PvP のエリア・自動 OFF の条件など）、3秒×3回を待たずに「応答なし」として扱う
+        if (RsrStateReader.ReadMode() is { } after && after != ModeHenched)
+            this.tracker.Reject($"RSR に Henched を送った直後も、モードが {RsrStateReader.ModeName(after)} のままです（PvP のエリア・RSR の自動 OFF の条件〔カットシーン・エリア移動・ジョブ変更・戦闘不能〕の可能性）");
+
         this.EnsureAoeOff();
+        this.EnsureBoolsOff();
         return true;
     }
 
@@ -274,6 +394,7 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
         if (!this.tracker.HenchedByMe)
         {
             this.ReleaseAoe();
+            this.ReleaseBools();
             return;
         }
 
@@ -290,6 +411,7 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
             Core.DebugLog.Current?.Line("IPC", $"RSR はもう {RsrStateReader.ModeName(current!.Value)} になっている（利用者か RSR が切り替えた）ので、モードは戻しません");
             this.SaveStore(false, null);
             this.ReleaseAoe();
+            this.ReleaseBools();
             return;
         }
 
@@ -299,6 +421,7 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
             Core.DebugLog.Current?.Line("IPC", $"⚠ RSR を {RsrStateReader.ModeName(back)} に戻す命令を送れませんでした（控えを残し、実行していない間に10秒おきにやり直します）");
 
         this.ReleaseAoe();
+        this.ReleaseBools();
     }
 
     /// <summary>
@@ -366,11 +489,35 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
             }
         }
 
+        // 真偽の設定（TargetFreely・IgnoreNonFateInFate）
+        foreach (var (name, original) in this.store.RsrBoolOriginals.ToList())
+        {
+            if (this.boolTaken.ContainsKey(name))
+                continue;
+            var current = RsrStateReader.ReadBool(name);
+            switch (RsrBoolSetting.Verify(current, false, original))
+            {
+                case RsrRestore.VerifyResult.Unknown:
+                    break;
+                case RsrRestore.VerifyResult.Restored:
+                    this.SaveBool(name, null);
+                    Core.DebugLog.Current?.Line("IPC", $"RSR の {name} が使う前の値（{original}）に戻ったことを確かめました");
+                    break;
+                case RsrRestore.VerifyResult.UserChanged:
+                    this.SaveBool(name, null);
+                    break;
+                case RsrRestore.VerifyResult.Resend:
+                    if (this.SetBoolSetting(name, original))
+                        notes.Add($"前回戻せなかった RSR の {name} を {original} に戻しました（戻ったかは次に確かめます）");
+                    break;
+            }
+        }
+
         return notes.Count > 0 ? string.Join(" / ", notes) : null;
     }
 
     /// <summary>戻したかを確かめる控えが残っているか（画面・事前点検用）。</summary>
-    public bool RestorePending => this.store?.RsrHenchedPending == true || this.store?.RsrAoePending == true;
+    public bool RestorePending => this.store?.RsrHenchedPending == true || this.store?.RsrAoePending == true || this.store?.RsrBoolOriginals.Count > 0;
 
     private void SaveStore(bool pending, byte? original)
     {
@@ -554,6 +701,45 @@ public static class RsrAoe
 ///  ・送ってから3秒は反映待ち（送り直さない）。
 ///  ・それ以外は送り直す。こちらが入れた後の false を Unanswered、読めない（null）を Unreadable として数える。どちらか3回で「応答なし」。
 /// </summary>
+/// <summary>
+/// RSR の真偽の設定を、Henched の間だけ決めた値にするかの判断（範囲攻撃の <see cref="RsrAoe"/> と同じ考え方。IPC を呼ばない部分）。
+/// </summary>
+public static class RsrBoolSetting
+{
+    /// <summary>決めた値にするかの判断。</summary>
+    /// <param name="current">いまの値（読めなければ null）。</param>
+    /// <param name="desired">Henched の間にしたい値。</param>
+    /// <param name="takenByMe">こちらが変えているか。</param>
+    /// <param name="resends">入れ直した回数（警告した後は -1）。</param>
+    /// <param name="pendingOriginal">前回こちらが変えたままの控えの、使う前の値（無ければ null）。</param>
+    public static (RsrAoe.TakeAction Action, bool? Original) Take(bool? current, bool desired, bool takenByMe, int resends, bool? pendingOriginal)
+    {
+        if (current is not { } c)
+            return (resends == -1 ? RsrAoe.TakeAction.Nothing : RsrAoe.TakeAction.Warn, null);
+        if (c == desired)
+            return !takenByMe && pendingOriginal is { } po ? (RsrAoe.TakeAction.Adopt, po) : (RsrAoe.TakeAction.Nothing, null);
+        if (!takenByMe)
+            return (RsrAoe.TakeAction.SendOff, c);
+        if (resends == -1)
+            return (RsrAoe.TakeAction.Nothing, null);
+        return resends < RsrAoe.ResendLimit ? (RsrAoe.TakeAction.SendOff, null) : (RsrAoe.TakeAction.Warn, null);
+    }
+
+    /// <summary>戻す値（戻さないなら null）。いまの値が読めて決めた値でない（利用者が変えた）なら戻さない。</summary>
+    public static bool? Restore(bool? current, bool desired, bool original)
+        => current is { } c && c != desired ? null : original;
+
+    /// <summary>戻したかを確かめる（使う前の値なら戻った。まだ決めた値なら送り直す）。</summary>
+    public static RsrRestore.VerifyResult Verify(bool? current, bool desired, bool original)
+    {
+        if (current is not { } c)
+            return RsrRestore.VerifyResult.Unknown;
+        if (c == original)
+            return RsrRestore.VerifyResult.Restored;
+        return c == desired ? RsrRestore.VerifyResult.Resend : RsrRestore.VerifyResult.UserChanged;
+    }
+}
+
 public sealed class HenchedTracker
 {
     public enum Action
@@ -578,11 +764,17 @@ public sealed class HenchedTracker
 
     private DateTime lastSend = DateTime.MinValue;
 
-    public bool Unresponsive => this.Unanswered >= 3 || this.Unreadable >= 3;
+    /// <summary>送った直後にモードを読んで、効いていないと分かったときの理由（無ければ null）。</summary>
+    public string? Rejected { get; private set; }
 
-    public string Problem => this.Unreadable >= 3
+    public bool Unresponsive => this.Unanswered >= 3 || this.Unreadable >= 3 || this.Rejected != null;
+
+    /// <summary>送った直後にモードを読んで、効いていないと分かった。</summary>
+    public void Reject(string reason) => this.Rejected = reason;
+
+    public string Problem => this.Rejected ?? (this.Unreadable >= 3
         ? $"RSR の動作状態（AutorotationActive）を {this.Unreadable} 回続けて読めませんでした（IPC が変わった可能性）"
-        : $"RSR に Henched への切り替えを {this.Unanswered} 回送っても動作中になりません（IPC が効いていない可能性）";
+        : $"RSR に Henched への切り替えを {this.Unanswered} 回送っても動作中になりません（IPC が効いていない可能性）");
 
     /// <param name="active">RSR の AutorotationActive（読めなければ null）。</param>
     /// <param name="now">いまの時刻。</param>
@@ -618,6 +810,7 @@ public sealed class HenchedTracker
         this.HenchedByMe = false;
         this.Unanswered = 0;
         this.Unreadable = 0;
+        this.Rejected = null;
         this.lastSend = DateTime.MinValue;
     }
 }

@@ -101,22 +101,38 @@ public abstract class AutoTask
         return true;
     }
 
+    /// <summary>この作業の操作の番号（始まったときに振る。記録で同じ操作を追うため）。</summary>
+    public long OpId { get; private set; }
+
     /// <summary>実行係から呼ばれる。初回だけ <see cref="OnStart"/> を呼ぶ。</summary>
     public TaskResult Step(TaskContext ctx)
     {
-        if (!this.Started)
+        // この作業の中で書いた記録に、この作業の操作の番号が付くようにする（入れ子なので、終わったら外側の番号へ戻す）
+        var outer = RunIds.CurrentOp;
+        try
         {
-            this.Started = true;
-            this.startedAt = WorkClock.Now;
-            this.phaseAt = this.startedAt;
-            this.pausedAtStart = WorkClock.PausedTotal;
-            this.pausedAtPhase = this.pausedAtStart;
-            var first = this.OnStart(ctx);
-            if (first != TaskResult.Running)
-                return first;
-        }
+            if (!this.Started)
+            {
+                this.Started = true;
+                this.OpId = RunIds.NewOp();
+                RunIds.CurrentOp = this.OpId;
+                DebugLog.Current?.Line("操作", $"#{this.OpId} 開始: {this.Name}（{this.GetType().Name}）");
+                this.startedAt = WorkClock.Now;
+                this.phaseAt = this.startedAt;
+                this.pausedAtStart = WorkClock.PausedTotal;
+                this.pausedAtPhase = this.pausedAtStart;
+                var first = this.OnStart(ctx);
+                if (first != TaskResult.Running)
+                    return first;
+            }
 
-        return this.Tick(ctx);
+            RunIds.CurrentOp = this.OpId;
+            return this.Tick(ctx);
+        }
+        finally
+        {
+            RunIds.CurrentOp = outer;
+        }
     }
 
     /// <summary>最初の1回。Running 以外を返すと Tick を呼ばずに終わる。</summary>

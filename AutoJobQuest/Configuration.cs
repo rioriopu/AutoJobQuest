@@ -43,6 +43,13 @@ public sealed class Configuration : IPluginConfiguration
     public long ConfirmRunTotalAboveGil { get; set; }
 
     /// <summary>
+    /// 必要な数より大きいまとまりしか無いとき、余りの分（(個数 − 必要数) × 単価）の額がこれを超えたら確認窓を出す（ギル）。0 なら確かめない。
+    /// 以前は、1個ほしいのに 99個×5,000＝495,000 ギルの出品しか無いと、1回の額の確認（50万）にかからずに
+    /// 余りごと買っていた。1回ごとの確認とは別の、余りの無駄に気づくための確認。
+    /// </summary>
+    public long ConfirmExcessAboveGil { get; set; } = 100_000;
+
+    /// <summary>
     /// 結果が確かめられていないマーケットの購入（送る前に保存し、買えた・断られたと分かったら消す）。
     /// 残っていれば、次に始めるとき事前点検で利用者に確かめてもらう（二重に買わないため、自動では買い直さない）。
     /// </summary>
@@ -139,6 +146,22 @@ public sealed class Configuration : IPluginConfiguration
     public DateTime? PendingArtisanWatchUtc { get; set; }
 
     /// <summary>
+    /// ジョブクエの製作で、Artisan の既定の食事・薬を使うか（既定 false＝使わない）。
+    /// Artisan は、レシピごとの設定が無い製作に「既定の食事・薬」（利用者の設定。例：アリペブレ HQ・魔匠の薬液 HQ）を使い、
+    /// ジョブのレベルがレシピより10を超えて高くなければ、ジョブクエの Lv1〜60 の製作でも食べる・飲む（Artisan の RecipeConfig.cs・
+    /// ConsumableChecker.cs）。高価な消耗品を低いレベルの製作で使わないよう、こちらが頼む製作の間だけ、
+    /// Artisan の IPC（ChangeFood・ChangePotion の一時指定＝保存されない）で「使わない」にし、終わったら戻す。
+    /// HQ 指定の品が HQ にならないときは、これを true にすると食事・薬の分だけ HQ が出やすくなる。
+    /// </summary>
+    public bool UseArtisanConsumables { get; set; }
+
+    /// <summary>
+    /// Artisan の食事・薬を一時的に「使わない」にしたまま、まだ戻していないレシピ（読み込みの解除をまたいで戻すための控え）。
+    /// Artisan の一時指定は保存されない（Artisan を読み込み直せば消える）が、Artisan が動いたままなら残るので、次に読み込んだとき戻す。
+    /// </summary>
+    public List<uint> ArtisanTempConsumableRecipes { get; set; } = [];
+
+    /// <summary>
     /// こちらが RSR を Henched にしたまま、まだ使う前のモードへ戻していない（控え。戻したら false）。
     /// プラグインの読み込み直しなどで覚えていたことが消えても、残った Henched を「利用者の使う前のモード」と取り違えないため
     /// （戻し損ねると、次の戦闘の後も Henched のまま残る）。
@@ -158,6 +181,13 @@ public sealed class Configuration : IPluginConfiguration
 
     /// <summary><see cref="RsrAoePending"/> のときの、使う前の範囲攻撃の設定（RSR の AoEType：Off=0, Cleave=1, Full=2）。</summary>
     public byte? RsrAoeOriginal { get; set; }
+
+    /// <summary>
+    /// こちらが Henched の間だけ変えた RSR の真偽の設定（名前 → 使う前の値）。戻したと確かめるまで残す（読み込みの解除をまたいで戻すため）。
+    /// 変えるのは TargetFreely（狙いが空になると RSR が一番近い敵を自分で狙う）と IgnoreNonFateInFate（FATE の中で FATE 以外を殴らない・
+    /// FATE の外で FATE の敵を殴らない）。どちらも Henched の間は false にする。
+    /// </summary>
+    public Dictionary<string, bool> RsrBoolOriginals { get; set; } = [];
 
     [NonSerialized]
     private Dalamud.Plugin.IDalamudPluginInterface? pluginInterface;

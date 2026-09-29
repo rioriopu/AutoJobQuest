@@ -44,6 +44,14 @@ public sealed class LifestreamIpc : IpcGate
         => this.TraceThen($"EnqueueLocalInnShortcut({innIndex})") && this.TryAction("EnqueueLocalInnShortcut",
             () => this.Func<int?, object>("Lifestream.EnqueueLocalInnShortcut").InvokeAction(innIndex));
 
+    /// <summary>
+    /// エーテライト表の行（シャード）への都市内転送を頼む（IPC AethernetTeleportById。Lifestream の IPCProvider.cs：エーテライトか
+    /// シャードの近くでないと使えない。処理中なら false）。頼めたら true（着いたかはエリアと位置で確かめる）。
+    /// </summary>
+    public bool AethernetTeleportById(uint aethernetRowId)
+        => this.TraceThen($"AethernetTeleportById({aethernetRowId})") && this.TryInvoke("AethernetTeleportById",
+            () => this.Func<uint, bool>("Lifestream.AethernetTeleportById").InvokeFunc(aethernetRowId), out var ok) && ok;
+
     /// <summary>Lifestream の処理を中断する。自分が頼んだ処理のときだけ呼ぶこと。</summary>
     public bool Abort()
         => this.TraceThen("Abort()") && this.TryAction("Abort", () => this.Func<object>("Lifestream.Abort").InvokeAction());

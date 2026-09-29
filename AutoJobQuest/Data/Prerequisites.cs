@@ -71,6 +71,100 @@ public static class AreaAccess
             .Select(id => Svc.Data.GetExcelSheet<Aetheryte>().TryGetRow(id, out var a) ? a.PlaceName.ValueNullable?.Name.ExtractText() ?? $"#{id}" : $"#{id}"));
 
     /// <summary>
+    /// 行けないエリアの案内。
+    /// メインクエスト「イシュガルドへ」はエーテライトの交感を手順に含まない（QuestParams に AETHERYTE* が無い。Questionable は自分で交感を足している）ので、
+    /// 手で進めた人は「クエストは完了・エーテライトは未交感」がありうる。テレポは交感が無いと使えないので止めるのは正しいが、
+    /// 「メインクエストで解放して」ではなく「交感して」と案内する。見分けは番号を持たずにゲームデータで行う：
+    ///  ・そのエリアに受注・手順の場所があるクエストが1つでも完了していれば、その地域には入れる → 交感を案内する
+    ///  ・1つも無ければ、そのエリアに場所のある最初のクエスト（同じエリアの別のクエストを前提の連鎖に持たないもの）を名前で出す
+    ///    （イシュガルドの下層 418・上層 419 はどちらも「イシュガルドへ」になる：ゲームデータで確認）
+    /// </summary>
+    public static string UnreachableHint(uint territory, Func<uint, bool> isComplete)
+    {
+        var gates = GateNames(territory);
+        var (done, first) = EntryQuests(QuestsAt(territory), isComplete, PreviousOf);
+        if (done != 0)
+            return $"入口のエーテライト「{gates}」に交感していません。「{Unlocks.QuestName(done)}」が完了しているので、その地域には入れます。"
+                   + "エーテライトに交感してから進めてください（テレポに要ります）";
+        return $"入口のエーテライト「{gates}」が未解放。"
+               + (first != 0 ? $"その地域へは「{Unlocks.QuestName(first)}」から入れるようになります。" : string.Empty)
+               + "メインクエスト等でその地域を解放してから進めてください";
+    }
+
+    /// <summary>エリアに場所のあるクエスト1本（番号・区分 JournalSection）。</summary>
+    public sealed record QuestAt(uint Id, uint Section);
+
+    /// <summary>
+    /// 行けないエリアの案内に使うクエスト（試せるように分けた判断）。
+    /// Done＝完了済みのうち（区分, 番号）が最も小さいもの、First＝根（同じエリアの別のクエストを前提の連鎖に持たない）のうち（区分, 番号）が最も小さいもの。無ければ 0。
+    /// </summary>
+    /// <param name="quests">そのエリアに場所のあるクエスト。</param>
+    /// <param name="isComplete">クエストが完了しているか。</param>
+    /// <param name="previousOf">クエストの前提（Quest.PreviousQuest）。</param>
+    public static (uint Done, uint First) EntryQuests(IReadOnlyList<QuestAt> quests, Func<uint, bool> isComplete, Func<uint, IEnumerable<uint>> previousOf)
+    {
+        var ordered = quests.OrderBy(q => q.Section).ThenBy(q => q.Id).ToList();
+        var done = ordered.FirstOrDefault(q => isComplete(q.Id))?.Id ?? 0;
+
+        var here = ordered.Select(q => q.Id).ToHashSet();
+        bool HasAncestorHere(uint id)
+        {
+            var seen = new HashSet<uint>();
+            var stack = new Stack<uint>(previousOf(id));
+            while (stack.Count > 0)
+            {
+                var p = stack.Pop();
+                if (p == 0 || !seen.Add(p))
+                    continue;
+                if (here.Contains(p))
+                    return true;
+                foreach (var pp in previousOf(p))
+                    stack.Push(pp);
+            }
+
+            return false;
+        }
+
+        var first = ordered.FirstOrDefault(q => !HasAncestorHere(q.Id))?.Id ?? 0;
+        return (done, first);
+    }
+
+    // エリア → そこに場所のあるクエスト（ゲームデータなので変わらない。初めて要るときに全クエストから作る）
+    private static Dictionary<uint, List<QuestAt>>? questsByTerritory;
+
+    /// <summary>そのエリアに受注・手順の場所があるクエスト（ゲームデータから）。</summary>
+    public static List<QuestAt> QuestsAt(uint territory)
+    {
+        lock (TerritoryCache)
+        {
+            if (questsByTerritory == null)
+            {
+                var map = new Dictionary<uint, List<QuestAt>>();
+                foreach (var q in Svc.Data.GetExcelSheet<Quest>())
+                {
+                    var section = q.JournalGenre.ValueNullable?.JournalCategory.ValueNullable?.JournalSection.RowId ?? uint.MaxValue;
+                    foreach (var t in ReadQuestTerritories(q.RowId))
+                    {
+                        if (!map.TryGetValue(t, out var list))
+                            map[t] = list = [];
+                        list.Add(new QuestAt(q.RowId, section));
+                    }
+                }
+
+                questsByTerritory = map;
+            }
+
+            return questsByTerritory.TryGetValue(territory, out var found) ? found : [];
+        }
+    }
+
+    /// <summary>クエストの前提（Quest.PreviousQuest。ゲームデータから）。</summary>
+    private static IEnumerable<uint> PreviousOf(uint questId)
+        => Svc.Data.GetExcelSheet<Quest>().TryGetRow(questId, out var q)
+            ? q.PreviousQuest.Select(p => p.RowId).Where(x => x != 0).ToList()
+            : [];
+
+    /// <summary>
     /// クエストの受注場所と手順の場所のエリア（Quest.IssuerLocation・TodoParams[].ToDoLocation → Level → Territory。ゲームデータから）。
     /// </summary>
     public static HashSet<uint> QuestTerritories(uint questId)

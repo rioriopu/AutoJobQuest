@@ -25,17 +25,15 @@ public sealed class RunQuestTask : AutoTask
     private int restarts;
     private int notRunningFrames;
 
-    // 受注できる職への着替え（クエストごとに対象の職が違う：クラフター・ギャザラー・全クラス等）
-    private bool jobChecked;
-    private EquipJobTask? equip;
-
-    // Questionable がまだ動いているのを最初に見た時刻（前のクエストの後片付けが終わるのを少し待つ）
-    private DateTime? busySince;
+    // 頼むまでの準備（受注できる職への着替え・Questionable が止まるのを待つ・受注できるかの確かめ・優先リスト）と進行中の見張り。
+    // 納品の無いクエストなので、TextAdvance の外部制御は Questionable に任せる（取らない）
+    private readonly QuestionableStarter starter;
 
     public RunQuestTask(uint questRowId, string label)
     {
         this.questRowId = questRowId;
         this.label = label;
+        this.starter = new QuestionableStarter(questRowId, label, takeTextAdvance: false);
     }
 
     public override string Name => $"クエスト: {this.label}";
@@ -50,42 +48,20 @@ public sealed class RunQuestTask : AutoTask
 
         if (!this.started)
         {
-            // 受注の対象でない職のままだと受けられないので、先に着替える（レベルが足りてギアセットのある職）
-            if (!this.jobChecked)
-            {
-                this.jobChecked = true;
-                var job = Unlocks.PickJobFor(this.questRowId);
-                if (job == null)
-                    ctx.Log.Warn("クエスト", $"「{this.label}」を受けられる職（レベルが足りてギアセットのあるもの）が見つかりません。このまま Questionable に任せます");
-                else if (job.Value != Jobs.CurrentClassJob)
-                {
-                    ctx.Log.Write("クエスト", $"「{this.label}」を受けるため、{Jobs.Name(job.Value)} に着替えます");
-                    this.equip = new EquipJobTask(job.Value);
-                }
-            }
-
-            if (this.equip != null)
-            {
-                var r = this.equip.Step(ctx);
-                this.Status = this.equip.Status;
-                if (r == TaskResult.Running)
-                    return TaskResult.Running;
-                this.equip.Cleanup(ctx);
-                var failed = r == TaskResult.Failed ? this.equip.FailReason : null;
-                this.equip = null;
-                if (failed != null)
-                    return this.Fail(failed);
-            }
-
-            if (!this.QuestionableIdle(ctx, out var busyResult))
-                return busyResult;
-            if (!GameUi.PlayerFree())
+            var r = this.starter.Start(ctx, out var fail, out var status);
+            if (status.Length > 0)
+                this.Status = status;
+            if (r == TaskResult.Failed)
+                return this.Fail(fail!);
+            if (r == TaskResult.Running)
                 return TaskResult.Running;
-            if (!ctx.Questionable.StartSingleQuest(this.questRowId))
-                return this.Fail($"Questionable が「{this.label}」を始められませんでした（前提クエスト未完了・経路データ無しなど）");
             this.started = true;
             return TaskResult.Running;
         }
+
+        // 進行中の見張り（別のクエストへ移った・優先リストが書き換わった）
+        if (this.starter.Watch(ctx) is { } watchFail)
+            return this.Fail(watchFail);
 
         // QuestTask と同じ：続けて3回 false を見たら止まったとみなす（時間ではなく状態で判断）
         if (ctx.Questionable.IsRunning() == false)
@@ -107,37 +83,10 @@ public sealed class RunQuestTask : AutoTask
         return TaskResult.Running;
     }
 
-    /// <summary>Questionable が止まっているか。動いていれば少し待ち（戻り値 false・Running）、待っても止まらなければ止める。</summary>
-    private bool QuestionableIdle(TaskContext ctx, out TaskResult result)
-    {
-        var running = ctx.Questionable.IsRunning();
-        if (running == true)
-            this.busySince ??= DateTime.UtcNow;
-        else
-            this.busySince = null;
-
-        switch (Automation.QuestionableIdle.Decide(running, this.busySince is { } since ? DateTime.UtcNow - since : TimeSpan.Zero))
-        {
-            case Automation.QuestionableIdle.Verdict.Wait:
-                this.Status = "Questionable が前の動作を終えるのを待っています";
-                result = TaskResult.Running;
-                return false;
-            case Automation.QuestionableIdle.Verdict.Fail:
-                result = this.Fail($"Questionable が {Automation.QuestionableIdle.Limit.TotalSeconds:0} 秒たっても動いたままです（利用者の操作を横取りしないため止めました）");
-                return false;
-            default:
-                result = TaskResult.Running;
-                return true;
-        }
-    }
-
     public override void Cleanup(TaskContext ctx)
     {
-        this.equip?.Cleanup(ctx);
-        this.equip = null;
-        if (this.started && ctx.Questionable.IsRunning() == true
-            && ctx.Questionable.GetCurrentQuestId() == QuestionableIpc.ToQuestId(this.questRowId))
-            ctx.Questionable.Stop(Plugin.InternalNameConst);
+        // 自分が始めた進行（または別のクエストへ移ったのを見た進行）が動いていれば止め、優先リストを元に戻す
+        this.starter.Cleanup(ctx);
     }
 }
 
@@ -390,13 +339,17 @@ public sealed unsafe class TalkToNpcTask : AutoTask
                 return TaskResult.Running;
             }
 
-            // 配置データの座標と実際の位置が大きくずれていれば、実際の位置へ引き直す
+            // 配置データの座標と実際の位置が大きくずれていれば、実際の位置へ引き直す。
+            // 歩いている経路は止めずに、新しい経路が来たら差し替える（止めてから頼み直すと、探索の間は立ち止まるため）
             if (Vector3.Distance(live.Position, this.destination) > 3f && this.destinationUpdates < 3)
             {
                 this.destinationUpdates++;
                 this.destination = live.Position;
-                this.StopSub(ctx);
-                ctx.Log.Debug("会話", $"{this.label} の実際の位置へ経路を引き直します（{this.destinationUpdates} 回目）");
+                if (this.sub is MoveToTask move)
+                    move.Retarget(ctx, live.Position);
+                else
+                    this.StopSub(ctx);
+                ctx.Log.Debug("会話", $"{this.label} の実際の位置へ経路を引き直します（{this.destinationUpdates} 回目・止めずに差し替え）");
             }
         }
 
@@ -870,7 +823,25 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
 
         var offer = offers.FirstOrDefault(o => o.ItemId == this.Item);
         if (offer.ItemId == 0)
-            return this.Fail($"納品画面に {CraftPlanner.ItemName(this.Item)} が出ていません（ジョブのタブが違う可能性。読めた品：{string.Join("、", offers.Select(o => CraftPlanner.ItemName(o.ItemId)))}）");
+        {
+            // 納品窓口はいまのジョブのタブで開く。着替えが効いていないなどで目的の品が無ければ、
+            // その品を作るジョブのタブへ切り替えて（Fire(14, タブ番号)。GBR と同じ：0＝木工〜7＝調理）、一覧に出るのを待つ（3秒まで）
+            if (this.tabSwitchedAt == null && CollectableTab(this.Item) is { } tab)
+            {
+                this.tabSwitchedAt = DateTime.UtcNow;
+                ctx.Log.Write("納品", $"納品画面に {CraftPlanner.ItemName(this.Item)} が出ていないので、{Jobs.Name((uint)(tab + 8))} のタブへ切り替えます");
+                GameUi.Fire(addon, true, 14, (uint)tab);
+                return TaskResult.Running;
+            }
+
+            if (this.tabSwitchedAt is { } at && DateTime.UtcNow - at < TimeSpan.FromSeconds(3))
+            {
+                this.Status = "タブを切り替えて、一覧に出るのを待っています";
+                return TaskResult.Running;
+            }
+
+            return this.Fail($"納品画面に {CraftPlanner.ItemName(this.Item)} が出ていません（タブの切り替えでも出ない。読めた品：{string.Join("、", offers.Select(o => CraftPlanner.ItemName(o.ItemId)))}）");
+        }
 
         this.rowIndex = offer.Row;
         this.ownedBefore = owned;
@@ -895,6 +866,55 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
         return TaskResult.Running;
     }
 
+    // タブを切り替えた時刻（切り替えは1回だけ）
+    private DateTime? tabSwitchedAt;
+
+    /// <summary>その収集品を作るジョブのタブの番号（レシピの CraftType：0＝木工〜7＝調理）。作れない品なら null。</summary>
+    private static int? CollectableTab(uint item)
+    {
+        foreach (var r in Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Recipe>())
+        {
+            if (r.ItemResult.RowId == item && r.Number != 0)
+                return (int)r.CraftType.RowId;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 右の一覧（node 31）の各行に出ている文字（品名・収集価値）。画面の定義では、右の一覧の真上に見出し「アイテム名」「収集価値」があり、
+    /// 行の部品は「アイコン＋文字2つ」。読めなければ null。
+    /// </summary>
+    private static List<string>? HeldListTexts(AtkUnitBase* addon)
+    {
+        var comp = addon->GetComponentByNodeId(HeldListNodeId);
+        if (comp == null || comp->GetComponentType() != ComponentType.List)
+            return null;
+        var list = (AtkComponentList*)comp;
+        if (list->ItemRendererList == null)
+            return null;
+        var texts = new List<string>();
+        var n = Math.Min(list->ListLength, list->AllocatedItemRendererListLength);
+        for (var i = 0; i < n; i++)
+        {
+            var renderer = list->ItemRendererList[i].AtkComponentListItemRenderer;
+            if (renderer == null)
+                continue;
+            var uld = renderer->UldManager;
+            for (var k = 0; k < uld.NodeListCount; k++)
+            {
+                var node = uld.NodeList[k];
+                if (node == null || node->Type != NodeType.Text)
+                    continue;
+                var text = ((AtkTextNode*)node)->NodeText.ToString();
+                if (text.Length > 0)
+                    texts.Add(text);
+            }
+        }
+
+        return texts;
+    }
+
     /// <summary>右の一覧（node 31＝選んだ品の手持ち）の行数。取れなければ null。</summary>
     private static int? HeldListRows(AtkUnitBase* addon)
     {
@@ -912,30 +932,28 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
         //  ③この画面で前に確かめた選択が同じ行のまま（自分の納品で数が1つ減っただけ）
         // 納品ボタンが押せるだけでは撃たない（以前の代わりの条件は、前の品の選択が残っていても通ってしまう）。
         // 品目そのもの（選択中の ItemId）を画面から読む方法は、実機の記録で確かめるまで使わない
+        // 納品ボタンの様子は記録に残すだけ（撃つ条件にはしない：ボタンが出ないことがある。CollectableSelection の説明）
         var btn = addon->GetComponentByNodeId(TradeButtonNodeId);
-        var buttonReady = false;
         if (btn != null && btn->GetComponentType() == ComponentType.Button && btn->OwnerNode != null)
-        {
-            var visible = btn->OwnerNode->AtkResNode.IsVisible();
-            var enabled = ((AtkComponentButton*)btn)->IsEnabled;
-            buttonReady = visible && enabled;
-            this.lastButton = $"見える={visible} 押せる={enabled}";
-        }
+            this.lastButton = $"見える={btn->OwnerNode->AtkResNode.IsVisible()} 押せる={((AtkComponentButton*)btn)->IsEnabled}";
+
+        // 右の一覧の行の品名（読めたら品名で照合する。読めて違う品なら撃たない）
+        var texts = HeldListTexts(addon);
+        var name = CraftPlanner.ItemName(this.Item);
+        bool? nameMatches = texts == null || texts.Count == 0 ? null : texts.Any(t => t.Contains(name, StringComparison.Ordinal));
 
         var rows = HeldListRows(addon);
         this.lastSelection = rows is { } r
             ? $"手持ちの一覧 {r} 行 / 所持 {this.ownedBefore}（選ぶ前 {this.selectRowsBefore} 行{(this.ambiguous ? "・同数の別の品あり" : string.Empty)}）"
             : $"手持ちの一覧（node {HeldListNodeId}）を取れません";
+        if (nameMatches is { } nm)
+            this.lastSelection += nm ? "・品名が一致" : $"・品名が違う（{string.Join("／", texts!.Take(4))}）";
         var sameAsConfirmed = this.confirmedRow == this.rowIndex && this.confirmedAddon == (nint)addon;
-        switch (CollectableSelection.Decide(rows, this.ownedBefore, this.selectRowsBefore, this.ambiguous, sameAsConfirmed, buttonReady))
+        if (CollectableSelection.Decide(rows, this.ownedBefore, this.selectRowsBefore, this.ambiguous, sameAsConfirmed, nameMatches) == CollectableSelection.Verdict.Fire)
         {
-            case CollectableSelection.Verdict.Fire:
-                this.confirmedRow = this.rowIndex;
-                this.confirmedAddon = (nint)addon;
-                return this.FireDelivery(ctx, addon, this.lastSelection);
-            case CollectableSelection.Verdict.WaitButton:
-                this.Status = "納品ボタンが押せるようになるのを待っています";
-                break;
+            this.confirmedRow = this.rowIndex;
+            this.confirmedAddon = (nint)addon;
+            return this.FireDelivery(ctx, addon, this.lastSelection);
         }
 
         var waited = DateTime.UtcNow - this.selectedAt;
@@ -1018,6 +1036,16 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
         // 自分が開いたものでなければ触らない
         if (!this.TryGetShop(ctx, out var addon))
         {
+            // こちらが閉じる合図を送った後は、閉じている途中（操作できない状態）なので自分の画面として引けない。
+            // 「自分が開いたものではない」と取り違えずに、消えるまで待つ（以前はここで誤った文言を出していた）
+            if (this.closeAttempts > 0)
+            {
+                if (this.TimedOut(TimeSpan.FromSeconds(10)))
+                    return this.Fail("納品画面を10秒たっても閉じられませんでした。手で閉じてからやり直してください");
+                this.Status = "納品画面が閉じるのを待っています";
+                return TaskResult.Running;
+            }
+
             ctx.Log.Warn("納品", "納品画面は自分が開いたものではないため閉じません");
             return TaskResult.Done;
         }
@@ -1300,11 +1328,22 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
         return true;
     }
 
-    /// <summary>会話メニューの手がかり：店の名前（SpecialShop.Name）→ 系統の名前の順。</summary>
+    /// <summary>
+    /// 会話メニューの手がかり：窓口の店の名前（InclusionShop.ShopName＝「スクリップの取引」）→ 店の名前（SpecialShop.Name）→ 系統の名前。
+    /// 窓口の前段（PreHandler）には表示名が無いので、選択肢には行き先の InclusionShop の名前が出ると見込む（
+    /// 以前は系統の名前「クラフタースクリップの取引：…」の部分一致で通る見込みだったが、完全一致で先に決まるほうが確か）。
+    /// </summary>
     private IEnumerable<string> MenuHints()
     {
         var shops = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.SpecialShop>();
         var cats = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.InclusionShopCategory>();
+
+        foreach (var inc in Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.InclusionShop>())
+        {
+            if (inc.Category.Any(c => this.data.BookCategories.Contains(c.RowId)))
+                yield return inc.ShopName.ExtractText();
+        }
+
         var offers = new List<BookOffer>();
         if (this.current != null)
             offers.Add(this.current);
@@ -1690,6 +1729,15 @@ public sealed unsafe class ExchangeBooksTask : AutoTask
 
         if (!ctx.Ownership.TryGetOwned("InclusionShop", out var addon))
         {
+            // 閉じる合図を送った後は閉じている途中なので、消えるまで待つ
+            if (this.closeAttempts > 0)
+            {
+                if (this.TimedOut(TimeSpan.FromSeconds(10)))
+                    return this.Fail("アイテム交換の画面を10秒たっても閉じられませんでした。手で閉じてからやり直してください");
+                this.Status = "アイテム交換の画面が閉じるのを待っています";
+                return TaskResult.Running;
+            }
+
             ctx.Log.Warn("交換", "アイテム交換の画面は自分が開いたものではないため閉じません");
             return TaskResult.Done;
         }

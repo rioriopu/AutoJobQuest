@@ -86,7 +86,8 @@ public sealed class DebugLog : IDisposable
     /// <summary>1行書く（全体と、実行中なら実行の記録の両方へ）。</summary>
     public void Line(string category, string message)
     {
-        var text = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [{category}] {message}";
+        // 頭に「[実行#操作]」を付ける（同じ操作の記録を追えるように。動いていなければ付けない）
+        var text = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {RunIds.Tag}[{category}] {message}";
         lock (this.runGate)
         {
             this.recent.Enqueue(text);

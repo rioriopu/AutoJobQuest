@@ -391,7 +391,17 @@ public static unsafe class GameUi
         }
     }
 
+    /// <summary>その一般アクションが今使えるか（ActionManager.GetActionStatus。0＝使える、それ以外＝使えない理由の番号）。</summary>
+    public static uint GeneralActionStatus(uint id) => ActionManager.Instance()->GetActionStatus(ActionType.GeneralAction, id);
+
+    /// <summary>その行動（Action シート）が今使えるか（ActionManager.GetActionStatus。0＝使える、それ以外＝使えない理由の LogMessage の行番号）。</summary>
+    public static uint ActionStatus(uint id) => ActionManager.Instance()->GetActionStatus(ActionType.Action, id);
+
+    /// <summary>行動の後の硬直中か（ActionManager.AnimationLock が 0 より大きい。ECommons の Player.IsAnimationLocked と同じ）。</summary>
+    public static bool AnimationLocked => ActionManager.Instance()->AnimationLock > 0;
+
     /// <summary>一般アクション（GeneralAction）を使う。</summary>
+
     public static bool UseGeneralAction(uint id)
     {
         var ok = ActionManager.Instance()->UseAction(ActionType.GeneralAction, id);

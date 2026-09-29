@@ -21,10 +21,10 @@ namespace AutoJobQuest.Automation;
 /// </summary>
 public sealed class MoveToTask : AutoTask
 {
-    private readonly Vector3 destination;
     private readonly float range;
     private readonly string label;
     private readonly TimeSpan limit;
+    private Vector3 destination;
 
     private bool started;
     private int retries;
@@ -51,6 +51,36 @@ public sealed class MoveToTask : AutoTask
     }
 
     public override string Name => $"移動: {this.label}";
+
+    /// <summary>
+    /// 行き先を変える（止めずに引き直す。以前は移動を止めてから新しい移動を頼んだので、探索の間は立ち止まっていた）。
+    /// 歩いている経路はそのまま、新しい行き先への探索を頼み、結果が来たら差し替える（OwnPath：通り過ぎた点は捨てて渡す）。
+    /// まだ歩き出していなければ、次の呼び出しで新しい行き先へ頼む。SimpleMove で代えているときは、止めてから頼み直す（取り消せないため）。
+    /// </summary>
+    public void Retarget(TaskContext ctx, Vector3 newDestination)
+    {
+        this.destination = newDestination;
+        if (!this.started)
+            return;
+
+        if (this.usingSimpleMove)
+        {
+            if (ctx.Navmesh.IsMoving())
+                ctx.Navmesh.Stop();
+            this.started = false;
+            return;
+        }
+
+        if (this.path.Request(ctx.Navmesh, Me.Position, newDestination, this.fly))
+        {
+            ctx.OwnMove.Issued(newDestination, Math.Max(1f, this.range * 0.7f));
+            this.interruptionsAtIssue = ctx.OwnMove.Interruptions;
+        }
+        else
+        {
+            this.started = false;
+        }
+    }
 
     private float Distance => Vector2.Distance(new Vector2(Me.Position.X, Me.Position.Z), new Vector2(this.destination.X, this.destination.Z));
 
@@ -281,6 +311,15 @@ public sealed class TeleportTask : AutoTask
     private bool requested;
     private int attempts;
 
+    // 頼んだ後にテレポ（Action 5）の詠唱を見たか（詠唱が途切れたら上限を待たずに頼み直す）
+    private bool sawCast;
+
+    // テレポが使えない理由（GetActionStatus の番号）を最後に見たもの（止めるときの文言に使う）
+    private uint lastRefusal;
+
+    /// <summary>テレポの行動の番号（Action シート。マウント等と同じく GetActionStatus・詠唱の判定に使う）。</summary>
+    public const uint TeleportActionId = 5;
+
     /// <param name="territory">行き先のエリア。</param>
     /// <param name="near">エリア内で近づきたい位置（複数のエーテライトがあるとき、一番近いものを選ぶ）。</param>
     public TeleportTask(uint territory, Vector3? near = null)
@@ -307,16 +346,20 @@ public sealed class TeleportTask : AutoTask
 
         if (this.requested)
         {
-            // 詠唱→エリア移動が始まるのを待つ。詠唱が始まらずに一定時間たったらやり直す
-            if (GameUi.BetweenAreas || Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.Casting])
+            // 詠唱→エリア移動が始まるのを待つ。詠唱を見た後に途切れたらすぐ、詠唱が一度も始まらなければ上限でやり直す（TeleportWatch）
+            var casting = CastingTeleport();
+            this.sawCast |= casting;
+            switch (TeleportWatch.Decide(casting, GameUi.BetweenAreas, this.sawCast, GameUi.PlayerFree(), GameUi.ActionStatus(TeleportActionId), this.PhaseElapsed))
             {
-                this.Status = "テレポ中";
-                return TaskResult.Running;
+                case TeleportWatch.Verdict.InProgress:
+                    this.Status = "テレポ中";
+                    return TaskResult.Running;
+                case TeleportWatch.Verdict.Wait:
+                    this.Status = this.sawCast ? "テレポの詠唱が終わりました（エリア移動を待っています）" : "テレポの詠唱が始まるのを待っています";
+                    return TaskResult.Running;
             }
 
-            if (this.PhaseElapsed < TimeSpan.FromSeconds(10))
-                return TaskResult.Running;
-
+            ctx.Log.Write("テレポ", this.sawCast ? "テレポの詠唱が途切れました。頼み直します" : $"テレポの詠唱が {TeleportWatch.NoCastLimit.TotalSeconds:0} 秒始まりません。頼み直します");
             this.requested = false;
         }
 
@@ -326,18 +369,38 @@ public sealed class TeleportTask : AutoTask
             return TaskResult.Running;
         }
 
+        // Lifestream は「プレイヤーをターゲットできない・テレポが使えない・硬直中」ならテレポを断る（Lifestream の TeleportService.CanTeleport）。
+        // 頼む前に同じ点検をして、使えない間は待つ（断られて回数を使い切らないように）。理由は GetActionStatus の番号（LogMessage の行番号）で記録する。
+        // 変わらなければ作業の上限で止める
+        if (GameUi.AnimationLocked || Svc.Objects.LocalPlayer is not { IsTargetable: true })
+        {
+            this.Status = "動作の硬直が解けるのを待っています";
+            return TaskResult.Running;
+        }
+
+        var status = GameUi.ActionStatus(TeleportActionId);
+        if (status != 0)
+        {
+            if (status != this.lastRefusal)
+                ctx.Log.Write("テレポ", $"テレポがいま使えません{MarketBoardWatcher.MessageText(status)}。使えるようになるのを待ちます");
+            this.lastRefusal = status;
+            this.Status = $"テレポが使えるようになるのを待っています{MarketBoardWatcher.MessageText(status)}";
+            return TaskResult.Running;
+        }
+
         if (this.attempts++ >= 3)
-            return this.Fail($"{TerritoryName(this.territory)} へテレポできませんでした");
+            return this.Fail($"{TerritoryName(this.territory)} へテレポできませんでした（3 回頼んでも詠唱が始まらないか、途切れました{(this.lastRefusal != 0 ? $"。最後に見た理由{MarketBoardWatcher.MessageText(this.lastRefusal)}" : string.Empty)}）");
 
         var aetheryte = FindAetheryte(this.territory, this.near);
         if (aetheryte == null)
             return this.Fail($"{TerritoryName(this.territory)} に解放済みのエーテライトがありません");
 
+        this.sawCast = false;
         if (!ctx.Lifestream.TryTeleport(aetheryte.Value, 0, out var accepted) || !accepted)
         {
+            // 同じ点検をしてから頼んでいるので、ここに来るのは点検と Lifestream の間で状態が変わったときだけ。次のフレームで読み直す
             this.Status = "Lifestream がテレポを受け付けませんでした。やり直します";
             this.NextPhase(this.Status);
-            this.requested = true;
             return TaskResult.Running;
         }
 
@@ -345,6 +408,11 @@ public sealed class TeleportTask : AutoTask
         this.NextPhase($"{TerritoryName(this.territory)} へテレポ中");
         return TaskResult.Running;
     }
+
+    /// <summary>自分がテレポ（Action 5）を詠唱中か（Lifestream の ReliableTeleportToAetheryte と同じ見方）。</summary>
+    private static bool CastingTeleport()
+        => Svc.Objects.LocalPlayer is { } me && me.IsCasting && me.CastActionId == TeleportActionId
+           && me.CastActionType == (byte)FFXIVClientStructs.FFXIV.Client.Game.ActionType.Action;
 
     /// <summary>そのエリアの解放済みエーテライト（近い位置が分かれば一番近いもの）。</summary>
     public static uint? FindAetheryte(uint territory, Vector3? near)
@@ -382,8 +450,10 @@ public sealed class TeleportTask : AutoTask
 public sealed class EquipJobTask : AutoTask
 {
     private readonly uint classJob;
-    private bool requested;
     private int requests;
+
+    // 前に頼んだときの EquipGearset の戻り値（0＝受け付けた、-1＝断った。まだ頼んでいなければ null）
+    private int? lastResult;
 
     public EquipJobTask(uint classJob)
     {
@@ -407,20 +477,26 @@ public sealed class EquipJobTask : AutoTask
                 : TaskResult.Running;
         }
 
-        // 着替えを頼んでから 3 秒たっても変わらなければ頼み直す（ゲームの応答を待つ間隔）。頼むのは 5 回まで
-        if (this.requested && this.PhaseElapsed < TimeSpan.FromSeconds(3))
-            return TaskResult.Running;
-        if (this.requests >= 5)
-            return this.Fail($"{Jobs.Name(this.classJob)} に着替えられませんでした（5 回頼んでも変わりません）");
+        // 受け付けたらジョブが変わるのを待つだけ（長い上限を過ぎたら頼み直す）、断られたら間隔を空けて頼み直す（EquipRetry）
+        switch (EquipRetry.Decide(this.lastResult, this.PhaseElapsed, this.requests))
+        {
+            case EquipRetry.Verdict.Wait:
+                return TaskResult.Running;
+            case EquipRetry.Verdict.Fail:
+                return this.Fail(this.lastResult == 0
+                    ? $"{Jobs.Name(this.classJob)} に着替えられませんでした（{EquipRetry.MaxRequests} 回頼み、ゲームは受け付けましたが、ジョブが変わりません）"
+                    : $"{Jobs.Name(this.classJob)} に着替えられませんでした（{EquipRetry.MaxRequests} 回頼み、ゲームが断りました。ギアセットの装備が欠けている可能性）");
+        }
 
         var idx = GearCheck.FindGearset(this.classJob);
         if (idx < 0)
             return this.Fail($"{Jobs.Name(this.classJob)} のギアセットがありません");
 
-        RaptureGearsetModule.Instance()->EquipGearset(idx);
-        this.requested = true;
+        this.lastResult = RaptureGearsetModule.Instance()->EquipGearset(idx);
         this.requests++;
-        this.NextPhase("着替え中");
+        if (this.lastResult != 0)
+            ctx.Log.Write("着替え", $"ゲームが着替えを断りました（ギアセット {idx + 1}・EquipGearset の戻り値 {this.lastResult}）。{EquipRetry.RefusedSpacing.TotalSeconds:0} 秒後に頼み直します");
+        this.NextPhase(this.lastResult == 0 ? "着替え中" : "着替えを断られました（頼み直します）");
         return TaskResult.Running;
     }
 }

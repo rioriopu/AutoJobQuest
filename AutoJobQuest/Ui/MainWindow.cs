@@ -106,11 +106,18 @@ public sealed class MainWindow : Window
         var anySelected = this.config.SelectedCrafters.Any(x => x);
         var blocker = runner.IsRunning ? null : runner.StartBlocker();
 
+        // 一時停止：止めると他のプラグインに頼んだことを全部戻す（止めている間に Artisan・GBR・Questionable が
+        // 勝手に動き続けないように）。進み具合は毎回ゲームから読み直すので、もう一度開始すれば続きから進む。
+        // 利用者が止めた後は、開始ボタンを「続きから再開」と出す
+        var resume = !runner.IsRunning && runner.LastOutcome == RunOutcome.UserStopped;
         using (ImRaii.Disabled(runner.IsRunning || !anySelected || blocker != null))
         {
-            if (ImGui.Button("ジョブクエ開始", new Vector2(160, 32)))
+            if (ImGui.Button(resume ? "続きから再開" : "ジョブクエ開始", new Vector2(160, 32)))
                 this.StartFlow();
         }
+
+        if (resume && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip("進み具合（クエスト・所持品）はゲームから読み直すので、止めたところから続きます");
 
         ImGui.SameLine();
         using (ImRaii.Disabled(!runner.IsRunning))
@@ -118,6 +125,10 @@ public sealed class MainWindow : Window
             if (ImGui.Button("停止", new Vector2(100, 32)))
                 runner.RequestStop("停止ボタン");
         }
+
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip("一時停止にも使えます。止めると他のプラグインに頼んだこと（RSR・GBR・TextAdvance 等）を戻します。"
+                             + "もう一度「続きから再開」を押せば、進み具合をゲームから読み直して続きから進みます");
 
         ImGui.SameLine();
         ImGui.BeginGroup();
@@ -134,7 +145,18 @@ public sealed class MainWindow : Window
         {
             ImGui.TextColored(Grey, "停止中");
             if (runner.LastResult.Length > 0)
-                ImGui.TextUnformatted($"前回: {runner.LastResult}");
+            {
+                // 結果の分類で色を分ける（取引結果不明・失敗・後始末確認待ちは目立たせる）
+                var color = runner.LastOutcome switch
+                {
+                    RunOutcome.PurchaseUnknown or RunOutcome.Failed => Red,
+                    RunOutcome.CleanupPending or RunOutcome.DoneWithExclusions => Yellow,
+                    _ => Green,
+                };
+                ImGui.TextColored(color, $"前回: {runner.LastResult}");
+                if (runner.LastNextAction.Length > 0)
+                    ImGui.TextWrapped($"次にすること：{runner.LastNextAction}");
+            }
         }
 
         ImGui.EndGroup();
@@ -493,6 +515,16 @@ public sealed class MainWindow : Window
 
             ImGui.TextColored(Grey, "既定は 0（使わない）。「はい」で続けると、さらにこの額を払ったところでまた確かめます");
 
+            var excess = (int)Math.Min(this.config.ConfirmExcessAboveGil, 999_999_999);
+            ImGui.SetNextItemWidth(160);
+            if (ImGui.InputInt("必要な数より多く買う分（余り）の額がこれを超えたら確かめる（ギル）", ref excess, 10_000, 100_000))
+            {
+                this.config.ConfirmExcessAboveGil = Math.Clamp(excess, 0, 999_999_999);
+                this.config.Save();
+            }
+
+            ImGui.TextColored(Grey, "既定は 100,000。0 で確かめない。大きいまとまりしか出品が無いとき、余りの分の無駄に気づくための確認です");
+
             ImGui.Separator();
             ImGui.TextUnformatted("製作");
             var retry = this.config.MaxRetryRounds;
@@ -504,6 +536,16 @@ public sealed class MainWindow : Window
             }
 
             ImGui.TextColored(Grey, "既定は 3（1〜10）。品目ごとに数え、届いたら何を見直せばよいかを出して止めます");
+
+            var consumables = this.config.UseArtisanConsumables;
+            if (ImGui.Checkbox("ジョブクエの製作で Artisan の既定の食事・薬を使う", ref consumables))
+            {
+                this.config.UseArtisanConsumables = consumables;
+                this.config.Save();
+            }
+
+            ImGui.TextColored(Grey, "既定は OFF。Artisan はレシピごとの設定が無いと既定の食事・薬を使うので、高価な消耗品を Lv1〜60 の製作で使わないよう、"
+                                    + "こちらが頼む製作の間だけ使わない指定にして、終わったら戻します。HQ 指定の品が HQ にならないときは ON にすると出やすくなります");
         }
 
         if (running)

@@ -74,6 +74,7 @@ public sealed class Runner
     private readonly TaskContext ctx;
     private AutoTask? root;
     private string? stopReason;
+    private bool stopByUser;
 
     public Runner(TaskContext ctx)
     {
@@ -93,6 +94,15 @@ public sealed class Runner
 
     /// <summary>最後に終わったときの結果（画面表示用）。</summary>
     public string LastResult { get; private set; } = string.Empty;
+
+    /// <summary>最後に終わったときの結果の分類。まだ一度も終わっていなければ null。</summary>
+    public RunOutcome? LastOutcome { get; private set; }
+
+    /// <summary>最後に終わったときに、次に利用者がすること（無ければ空）。</summary>
+    public string LastNextAction { get; private set; } = string.Empty;
+
+    /// <summary>終わったときの事実を集める（Services が設定する。無ければ「残りなし」とみなす）。</summary>
+    public Func<RunFacts>? Facts { get; set; }
 
     /// <summary>
     /// 新しく始めてはいけない理由（無ければ null）。前回止めたときの後始末（例：Artisan が遅れて製作を始めないかの見張り）が
@@ -122,19 +132,24 @@ public sealed class Runner
         }
 
         this.stopReason = null;
+        this.stopByUser = false;
         this.root = task;
         this.LastResult = string.Empty;
+        var runId = RunIds.BeginRun();
         this.Started?.Invoke(task);
-        this.ctx.Log.Write("実行", $"開始: {task.Name}");
+        this.ctx.Log.Write("実行", $"開始: {task.Name}（実行 {runId}・AutoJobQuest {RunIds.Version}）");
     }
 
     /// <summary>止める。次のフレームで後始末をして終わる。</summary>
-    public void RequestStop(string reason)
+    /// <param name="reason">止める理由（記録と画面に出す）。</param>
+    /// <param name="byUser">利用者の操作で止めたか（停止ボタン・コマンド・確認で「いいえ」）。false は例外などで止めたとき（結果は「失敗」）。</param>
+    public void RequestStop(string reason, bool byUser = true)
     {
         if (this.root == null)
             return;
 
         this.stopReason = reason;
+        this.stopByUser = byUser;
     }
 
     /// <summary>
@@ -146,7 +161,7 @@ public sealed class Runner
         if (this.root == null)
             return;
 
-        this.Finish($"止めました（{reason}）", false);
+        this.Finish($"止めました（{reason}）", false, userStopped: true);
     }
 
     public void Tick()
@@ -156,7 +171,8 @@ public sealed class Runner
 
         if (this.stopReason != null)
         {
-            this.Finish($"止めました（{this.stopReason}）", false);
+            // 例外などで止めたとき（利用者の操作でない）は「失敗」として扱う（失敗の報告も書き出す）
+            this.Finish($"止めました（{this.stopReason}）", !this.stopByUser, userStopped: this.stopByUser);
             return;
         }
 
@@ -184,7 +200,7 @@ public sealed class Runner
         }
     }
 
-    private void Finish(string result, bool failed)
+    private void Finish(string result, bool failed, bool userStopped = false)
     {
         // 失敗の写しは後始末の前に取る（後始末で状態が変わるため）
         if (failed)
@@ -220,12 +236,34 @@ public sealed class Runner
         }
 
         this.ctx.Confirm.Withdraw();
+
+        // 結果を分ける。後始末の後に集めるので、戻せなかったものがここに出る
+        RunFacts facts;
+        try
+        {
+            facts = this.Facts?.Invoke() ?? new RunFacts(false, []);
+        }
+        catch (Exception ex)
+        {
+            this.ctx.Log.Warn("実行", $"終わったときの状態を集められませんでした: {ex.Message}");
+            facts = new RunFacts(false, ["状態を集められなかった"]);
+        }
+
+        var excluded = task is IOutcomeHint hint && hint.HasExclusions;
+        var outcome = RunOutcomes.Classify(failed, userStopped, excluded, facts);
+        var next = RunOutcomes.NextAction(outcome, facts);
+        this.LastOutcome = outcome;
+        this.LastNextAction = next;
+        result = $"【{RunOutcomes.Label(outcome)}】{result}";
         this.LastResult = result;
-        this.ctx.Log.Write("実行", result);
+        this.ctx.Log.Write("実行", $"{result}（停止理由コード {RunOutcomes.Code(outcome)}・実行 {RunIds.RunId}）");
+        if (next.Length > 0)
+            this.ctx.Log.Write("実行", $"次にすること：{next}");
         Svc.Chat.Print($"[AutoJobQuest] {result}");
         if (!failed)
             this.Finished?.Invoke(result, false);
         else
             DebugLog.Current?.EndRun(result);
+        RunIds.EndRun();
     }
 }

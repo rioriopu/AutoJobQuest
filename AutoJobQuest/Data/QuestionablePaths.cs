@@ -17,6 +17,19 @@ namespace AutoJobQuest.Data;
 public sealed record QuestionableCraftStep(int Sequence, uint? ItemId, int ItemCount, bool Hq, bool SkipIfHeld);
 
 /// <summary>
+/// Questionable の経路の手順1件（どの種類の手順でも）。Questionable の Craft 手順を飛ばして残りをこちらで行うときと、
+/// 同じ段で複数の相手に渡すクエストの残りの相手へこちらで渡しに行くときに使う。
+/// </summary>
+/// <param name="Sequence">クエストの段。</param>
+/// <param name="Index">段の中の手順の番号（Questionable の GetCurrentStepData().Step と同じ数え方：0 始まり）。</param>
+/// <param name="Type">手順の種類（InteractionType の文字列：Interact・CompleteQuest・Craft・PurchaseItem・WalkTo・WaitForManualProgress 等）。</param>
+/// <param name="DataId">相手（NPC 等）の ID。無ければ null。</param>
+/// <param name="Territory">手順のエリア。</param>
+/// <param name="Position">手順の位置。無ければ null。</param>
+/// <param name="ItemId">手順の品（Craft・PurchaseItem 等）。無ければ null。</param>
+public sealed record QuestionableStep(int Sequence, int Index, string Type, uint? DataId, uint Territory, System.Numerics.Vector3? Position, uint? ItemId);
+
+/// <summary>
 /// Questionable の経路データ（pluginConfigs\Questionable\PathData\bundle.zip）から、ジョブクエの「Craft」手順を読む
 /// （120本の Craft 手順は計174）。読むだけで、Questionable には何も頼まない。
 ///
@@ -36,6 +49,7 @@ public static class QuestionablePaths
     private static string? loadedPath;
     private static DateTime loadedStamp;
     private static Dictionary<ushort, List<QuestionableCraftStep>> cache = [];
+    private static Dictionary<ushort, List<QuestionableStep>> stepCache = [];
     private static Dictionary<ushort, string> entries = [];
 
     /// <summary>経路データの場所。</summary>
@@ -44,6 +58,20 @@ public static class QuestionablePaths
 
     /// <summary>そのクエスト（Questionable の番号＝行 ID − 65536）の Craft 手順。経路データが読めない・経路が無ければ null。</summary>
     public static IReadOnlyList<QuestionableCraftStep>? CraftSteps(ushort shortId) => CraftSteps(BundlePath, shortId);
+
+    /// <summary>そのクエストの全手順（段・手順の順）。経路データが読めない・経路が無ければ null。</summary>
+    public static IReadOnlyList<QuestionableStep>? Steps(ushort shortId) => Steps(BundlePath, shortId);
+
+    /// <summary>上と同じ。経路データの場所を渡す（試験用）。</summary>
+    public static IReadOnlyList<QuestionableStep>? Steps(string bundlePath, ushort shortId)
+    {
+        lock (Gate)
+        {
+            if (CraftSteps(bundlePath, shortId) == null)
+                return null;
+            return stepCache.TryGetValue(shortId, out var list) ? list : null;
+        }
+    }
 
     /// <summary>上と同じ。経路データの場所を渡す（試験用）。</summary>
     public static IReadOnlyList<QuestionableCraftStep>? CraftSteps(string bundlePath, ushort shortId)
@@ -69,6 +97,7 @@ public static class QuestionablePaths
 
                     entries = map;
                     cache = [];
+                    stepCache = [];
                     loadedPath = bundlePath;
                     loadedStamp = stamp;
                 }
@@ -82,6 +111,7 @@ public static class QuestionablePaths
                 using var stream = z.GetEntry(name)!.Open();
                 using var doc = JsonDocument.Parse(stream);
                 var list = new List<QuestionableCraftStep>();
+                var all = new List<QuestionableStep>();
                 if (doc.RootElement.TryGetProperty("QuestSequence", out var seqs))
                 {
                     foreach (var seq in seqs.EnumerateArray())
@@ -89,8 +119,10 @@ public static class QuestionablePaths
                         var sequence = seq.TryGetProperty("Sequence", out var sv) && sv.ValueKind == JsonValueKind.Number ? sv.GetInt32() : -1;
                         if (!seq.TryGetProperty("Steps", out var steps))
                             continue;
+                        var index = 0;
                         foreach (var st in steps.EnumerateArray())
                         {
+                            all.Add(ReadStep(sequence, index++, st));
                             if (!st.TryGetProperty("InteractionType", out var it) || it.GetString() != "Craft")
                                 continue;
                             uint? item = st.TryGetProperty("ItemId", out var iv) && iv.ValueKind == JsonValueKind.Number ? iv.GetUInt32() : null;
@@ -105,6 +137,7 @@ public static class QuestionablePaths
                 }
 
                 cache[shortId] = list;
+                stepCache[shortId] = all;
                 return list;
             }
             catch (Exception ex)
@@ -114,4 +147,25 @@ public static class QuestionablePaths
             }
         }
     }
+
+    private static QuestionableStep ReadStep(int sequence, int index, JsonElement st)
+    {
+        var type = st.TryGetProperty("InteractionType", out var it) && it.ValueKind == JsonValueKind.String ? it.GetString() ?? string.Empty : string.Empty;
+        uint? data = st.TryGetProperty("DataId", out var dv) && dv.ValueKind == JsonValueKind.Number ? dv.GetUInt32() : null;
+        var terr = st.TryGetProperty("TerritoryId", out var tv) && tv.ValueKind == JsonValueKind.Number ? tv.GetUInt32() : 0u;
+        uint? item = st.TryGetProperty("ItemId", out var iv) && iv.ValueKind == JsonValueKind.Number ? iv.GetUInt32() : null;
+        System.Numerics.Vector3? pos = null;
+        if (st.TryGetProperty("Position", out var pv) && pv.ValueKind == JsonValueKind.Object
+            && pv.TryGetProperty("X", out var x) && pv.TryGetProperty("Y", out var y) && pv.TryGetProperty("Z", out var z))
+            pos = new System.Numerics.Vector3(x.GetSingle(), y.GetSingle(), z.GetSingle());
+        return new QuestionableStep(sequence, index, type, data, terr, pos, item);
+    }
+
+    /// <summary>
+    /// その段で「作る品の指定の無い Craft 手順」の番号（無ければ null）。この手順は在庫に関係なく Artisan の既製リストを動かす
+    /// （Questionable の Craft.cs：ItemId の有無に関係なく最初に既製リストを呼ぶ。止められるのは手順の前の「持っていれば飛ばす」だけで、
+    /// ItemId が無いと必ず無効。Questionable の設定・IPC・コマンドで飛ばす手段は無い）。
+    /// </summary>
+    public static int? PremadeCraftIndex(IReadOnlyList<QuestionableStep> steps, int sequence)
+        => steps.FirstOrDefault(s => s.Sequence == sequence && s.Type == "Craft" && s.ItemId == null) is { } c ? c.Index : null;
 }

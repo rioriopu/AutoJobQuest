@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Dalamud.Interface.Windowing;
 using AutoJobQuest.Core;
 using AutoJobQuest.Data;
@@ -32,6 +33,7 @@ public sealed class Services : IDisposable
     private static readonly TimeSpan ArtisanWatchLength = TimeSpan.FromSeconds(30);
     private DateTime nextLeftoverTry = DateTime.MinValue;
     private DateTime nextRsrLeftoverTry = DateTime.MinValue;
+    private DateTime nextConsumableTry = DateTime.MinValue;
     private DateTime nextHeartbeat = DateTime.MinValue;
 
     public Services(Configuration config, RunLog log)
@@ -69,6 +71,20 @@ public sealed class Services : IDisposable
         {
             this.Debug.BeginRun(task.Name);
             this.Debug.Block("実行", "開始時の状態", StateSnapshot.Capture(this.Ctx, this.Runner));
+        };
+        // 終わったときの事実（結果の分類）。後始末の後に集める
+        this.Runner.Facts = () =>
+        {
+            var pending = new List<string>();
+            if (this.Ctx.AfterStop.Count > 0)
+                pending.AddRange(this.Ctx.AfterStop.Select(a => a.Name));
+            if (this.Ctx.Rotation.RestorePending)
+                pending.Add("RSR のモード・範囲攻撃の設定");
+            if (this.Ctx.Gbr.HasLeftovers)
+                pending.Add("GBR の設定・自動採集リスト");
+            if (this.Config.ArtisanTempConsumableRecipes.Count > 0)
+                pending.Add($"Artisan の食事・薬の一時指定（{this.Config.ArtisanTempConsumableRecipes.Count} レシピ）");
+            return new RunFacts(this.Config.PendingPurchase != null, pending);
         };
         this.Runner.Finished = (result, failed) =>
         {
@@ -136,6 +152,16 @@ public sealed class Services : IDisposable
             }
         }
 
+        // こちらが一時的に「使わない」にした Artisan の食事・薬が戻っていなければ、止まっていて Artisan も空いている間に戻す（10秒おき）
+        if (!this.Runner.IsRunning && this.Config.ArtisanTempConsumableRecipes.Count > 0 && DateTime.UtcNow >= this.nextConsumableTry
+            && this.Ctx.Artisan.IsLoaded && this.Ctx.Artisan.IsBusy() == false)
+        {
+            this.nextConsumableTry = DateTime.UtcNow.AddSeconds(10);
+            var n = this.Ctx.Artisan.RestoreLeftoverConsumables(this.Config);
+            if (n > 0)
+                this.Log.Write("Artisan", $"一時的に「使わない」にしていた食事・薬の指定を {n} レシピ分戻しました");
+        }
+
         this.Ctx.YesAlready.KeepSuppressed();
         this.Runner.Tick();
 
@@ -187,7 +213,7 @@ public sealed class Services : IDisposable
     public void OnUnhandled(Exception ex)
     {
         this.Debug.Exception("例外", "フレーム処理で拾えなかった例外", ex);
-        this.Runner.RequestStop($"例外: {ex.GetType().Name}");
+        this.Runner.RequestStop($"例外: {ex.GetType().Name}", byUser: false);
     }
 
     /// <summary>今の状態をファイルに書き出す（画面のボタンから）。</summary>

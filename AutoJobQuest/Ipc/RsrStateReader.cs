@@ -101,6 +101,43 @@ public static class RsrStateReader
         }
     }
 
+    /// <summary>
+    /// RSR の真偽の設定（ConditionBoolean の Value）を読む。読めなければ null。
+    /// RSR の設定の [ConditionBool] の欄は、Service.Config に同じ名前の ConditionBoolean のプロパティとして出る
+    /// （RSR の Configuration/Configs.cs・ConditionBoolean.cs。IPC の設定コマンド「Settings 名前 値」も同じプロパティを書き換える：
+    /// RSCommands_OtherCommand.cs の UpdateSetting）。読むだけで、書き換えは IPC で行う。
+    /// </summary>
+    public static bool? ReadBool(string name)
+    {
+        try
+        {
+            var plugin = FindPluginInstance(InternalName);
+            if (plugin == null)
+            {
+                LastError = "RSR が読み込まれていません";
+                return null;
+            }
+
+            var alc = AssemblyLoadContext.GetLoadContext(plugin.GetType().Assembly);
+            var basic = alc?.Assemblies.FirstOrDefault(a => a.GetName().Name == "RotationSolver.Basic");
+            var service = basic?.GetType("RotationSolver.Basic.Service", throwOnError: false);
+            var config = service?.GetProperty("Config", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null);
+            var cb = config?.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(config);
+            var value = cb?.GetType().GetProperty("Value", BindingFlags.Public | BindingFlags.Instance)?.GetValue(cb);
+            if (value is bool b)
+                return b;
+
+            LastError = $"RSR の設定 {name}（Service.Config.{name}.Value）が見つかりません（RSR の版が変わった可能性）";
+            return null;
+        }
+        catch (Exception ex)
+        {
+            LastError = $"RSR の設定 {name} を読めません: {ex.GetType().Name}: {ex.Message}";
+            Core.DebugLog.Current?.Line("IPC", LastError);
+            return null;
+        }
+    }
+
     /// <summary>範囲攻撃の設定の名前（RSR の AoEType の名前。IPC の設定コマンドにもこの名前で渡す）。</summary>
     public static string AoeName(byte value) => value switch
     {
@@ -143,8 +180,8 @@ public static class RsrStateReader
         _ => $"不明({mode})",
     };
 
-    /// <summary>読み込まれているプラグインの本体（見つからなければ null）。GbrReflection と同じ経路。</summary>
-    private static object? FindPluginInstance(string internalName)
+    /// <summary>読み込まれているプラグインの本体（見つからなければ null）。GbrReflection と同じ経路。Artisan の内部を読むとき（ArtisanHqEstimate）も使う。</summary>
+    internal static object? FindPluginInstance(string internalName)
     {
         var dalamud = Svc.PluginInterface.GetType().Assembly;
         var service = dalamud.GetType("Dalamud.Service`1", throwOnError: true)!;

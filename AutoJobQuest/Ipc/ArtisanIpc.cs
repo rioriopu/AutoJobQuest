@@ -1,3 +1,5 @@
+using System.Linq;
+
 namespace AutoJobQuest.Ipc;
 
 /// <summary>
@@ -47,6 +49,59 @@ public sealed class ArtisanIpc : IpcGate
     public bool SetStopRequest(bool stop)
         => this.TraceThen($"SetStopRequest({stop})") && this.TryAction("SetStopRequest",
             () => this.Func<bool, object>("Artisan.SetStopRequest").InvokeAction(stop));
+
+    /// <summary>
+    /// Artisan の RecipeConfig の「使わない」の値（CraftingLogic\RecipeConfig.cs：Default=0・Disabled=1）。
+    /// 一時指定（Temp…）に入れると、そのレシピでは食事・薬を使わない（FoodEnabled/PotionEnabled が false）。
+    /// </summary>
+    public const uint ConsumableDisabled = 1;
+
+    /// <summary>
+    /// そのレシピの食事・薬を一時的に「使わない」にする（IPC ChangeFood・ChangePotion の temporary=true。
+    /// Artisan の一時指定は [NonSerialized] で保存されない。IPC.cs の ChangeFood・ChangePotion）。両方送れたら true。
+    /// </summary>
+    public bool DisableConsumablesTemporarily(uint recipeId)
+    {
+        this.Trace($"ChangeFood/ChangePotion(レシピ {recipeId}, 使わない, 一時)");
+        var food = this.TryAction("ChangeFood",
+            () => this.Func<uint, uint, bool, bool, object>("Artisan.ChangeFood").InvokeAction(recipeId, ConsumableDisabled, false, true));
+        var potion = this.TryAction("ChangePotion",
+            () => this.Func<uint, uint, bool, bool, object>("Artisan.ChangePotion").InvokeAction(recipeId, ConsumableDisabled, false, true));
+        return food && potion;
+    }
+
+    /// <summary>一時的な食事・薬の指定を元に戻す（IPC SetTempFoodBackToNormal・SetTempPotionBackToNormal）。両方送れたら true。</summary>
+    public bool RestoreConsumables(uint recipeId)
+    {
+        this.Trace($"SetTempFoodBackToNormal/SetTempPotionBackToNormal(レシピ {recipeId})");
+        var food = this.TryAction("SetTempFoodBackToNormal",
+            () => this.Func<uint, object>("Artisan.SetTempFoodBackToNormal").InvokeAction(recipeId));
+        var potion = this.TryAction("SetTempPotionBackToNormal",
+            () => this.Func<uint, object>("Artisan.SetTempPotionBackToNormal").InvokeAction(recipeId));
+        return food && potion;
+    }
+
+    /// <summary>
+    /// 控えに残っている一時指定をすべて戻す（戻せたものは控えから消す）。戻せたレシピの数を返す。
+    /// Artisan が読み込まれていなければ何もしない（Artisan を読み込み直せば一時指定は消えるが、読み込み直したかは分からないので控えは残す）。
+    /// </summary>
+    public int RestoreLeftoverConsumables(Configuration config)
+    {
+        if (config.ArtisanTempConsumableRecipes.Count == 0 || !this.IsLoaded)
+            return 0;
+        var done = 0;
+        foreach (var recipeId in config.ArtisanTempConsumableRecipes.ToList())
+        {
+            if (!this.RestoreConsumables(recipeId))
+                continue;
+            config.ArtisanTempConsumableRecipes.Remove(recipeId);
+            done++;
+        }
+
+        if (done > 0)
+            config.Save();
+        return done;
+    }
 
     /// <summary>Endurance を止める（こちらが CraftItem で始めた製作を止めるときだけ使う）。</summary>
     public bool SetEndurance(bool on)

@@ -248,6 +248,7 @@ public sealed unsafe class ReduceTask : AutoTask
         }
 
         this.closingSince = DateTime.MinValue;
+        this.resultWaitSince = null;
 
         // 騎乗中は精選できない（GBR も騎乗中は精選しない：AutoGather.Purify.cs:15）
         if (GameUi.Mounted)
@@ -296,6 +297,7 @@ public sealed unsafe class ReduceTask : AutoTask
         if (this.TryGetOwnResult(ctx, out var result))
             return this.CloseResult(result);
         this.closingSince = DateTime.MinValue;
+        this.resultWaitSince = null;
 
         var sourceNow = Inventory.HeldCollectables().GetValueOrDefault(this.reducingItem);
         var wantedNow = this.Owned;
@@ -343,11 +345,36 @@ public sealed unsafe class ReduceTask : AutoTask
         return !this.resultOpenAtReduce && GameUi.IsReady("PurifyResult", out result);
     }
 
-    /// <summary>自分の結果の窓を閉じる（0.5 秒おき）。上限を過ぎても閉じられなければ止める。</summary>
+    /// <summary>
+    /// 自分の結果の窓を閉じる（0.5 秒おき）。上限を過ぎても閉じられなければ止める。
+    /// 閉じるのは、結果が表示され（AddonPurifyResult の ResultsMode が 0 でない）、ゲームの処理中の印（Occupied39）が下りてから
+    /// （YesAlready・GBR と同じ。以前は窓を見つけるとすぐ閉じにいき、結果の表示の前に閉じる合図を撃ちえた。
+    /// そのとき何が起きるかは、どこにも記録が無い）。10秒待っても表示されなければ、これまでどおり閉じる。
+    /// </summary>
     private TaskResult CloseResult(FFXIVClientStructs.FFXIV.Component.GUI.AtkUnitBase* result)
     {
         if (this.closingSince == DateTime.MinValue)
+        {
+            var shown = ResultShown(result) && !Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.Occupied39];
+            if (!shown)
+            {
+                this.resultWaitSince ??= DateTime.UtcNow;
+                if (DateTime.UtcNow - this.resultWaitSince.Value < TimeSpan.FromSeconds(10))
+                {
+                    this.Status = "精選の結果が表示されるのを待っています";
+                    return TaskResult.Running;
+                }
+
+                DebugLog.Current?.Line("精選", "精選の結果が10秒たっても表示されないので、そのまま閉じます");
+            }
+
+            // 自分の精選の結果か（エージェントの結果の品。記録に残す：精選の結果は元の品ごとに数種類ありうる）
+            var agent = FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentPurify.Instance();
+            if (agent != null)
+                DebugLog.Current?.Line("精選", $"精選の結果：{CraftPlanner.ItemName(agent->ResultItemId)}（ResultItemId {agent->ResultItemId}）");
+            this.resultWaitSince = null;
             this.closingSince = DateTime.UtcNow;
+        }
         else if (DateTime.UtcNow - this.closingSince > CloseLimit)
             return this.Fail($"精選の結果の窓を {CloseLimit.TotalSeconds:0} 秒たっても閉じられませんでした。手で閉じてからやり直してください");
 
@@ -358,6 +385,18 @@ public sealed unsafe class ReduceTask : AutoTask
         if (!GameUi.ClickButton(result, PurifyResultCloseNode))
             GameUi.Fire(result, true, -1);
         return TaskResult.Running;
+    }
+
+    // 結果が表示されるのを待ち始めた時刻
+    private DateTime? resultWaitSince;
+
+    /// <summary>精選の結果の窓に結果が表示されているか（ResultsMode が 0 でない。読めなければ true＝待たない）。</summary>
+    private static bool ResultShown(FFXIVClientStructs.FFXIV.Component.GUI.AtkUnitBase* result)
+    {
+        if (result->AtkValuesCount <= 13 || result->AtkValues == null)
+            return true;
+        var rm = ((FFXIVClientStructs.FFXIV.Client.UI.AddonPurifyResult*)result)->TypedAtkValues->ResultsMode;
+        return rm.Int != 0;
     }
 
     /// <summary>

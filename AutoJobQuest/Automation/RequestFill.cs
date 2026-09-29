@@ -17,8 +17,8 @@ public readonly record struct MateriaRef(ushort Id, byte Grade);
 public sealed record RequestSlot(uint ItemId, int Quantity, bool WantHq, int WantMateria, bool WantCollectible, int MinCollectibility)
 {
     /// <summary>
-    /// 求めるマテリアの種類（0 でないものだけ）。値の意味（Materia シートの行と等級か）は実機で確かめていないので、
-    /// 選ぶときの「優先」にだけ使い、合う候補が無ければ数だけで選ぶ。
+    /// 求めるマテリアの種類（0 でないものだけ）。値は「Materia シートの行」と「0 始まりの等級」で、ゲームは優先ではなく必須の条件として
+    /// 候補を絞る（合わない品は候補にも数にも入らない：ゲーム本体の逆アセンブルで確定）。
     /// </summary>
     public IReadOnlyList<MateriaRef> WantMateriaTypes { get; init; } = [];
 }
@@ -28,6 +28,11 @@ public sealed record TurnInItem(uint BaseItemId, bool Hq, int Materia, bool Coll
 {
     /// <summary>付いているマテリアの種類。</summary>
     public IReadOnlyList<MateriaRef> MateriaTypes { get; init; } = [];
+
+    /// <summary>入れ物（InventoryType）と枠の番号（入れた後に、受け渡しの枠がこの品を指しているかを確かめるため。分からなければ -1）。</summary>
+    public int Container { get; init; } = -1;
+
+    public int SlotIndex { get; init; } = -1;
 }
 
 /// <summary>
@@ -53,8 +58,23 @@ public interface IRequestWindow
 
     RequestSlot GetRequest(int slot);
 
-    /// <summary>いま選ばれている欄（選ばれていなければ -1）。</summary>
+    /// <summary>
+    /// いま選ばれている欄（選ばれていなければ -1）。ゲームはこの値を「入れた」ときと窓を作ったときにしか -1 に戻さない
+    /// （候補0件で選んだ・候補の小窓を閉じた・窓を開き直した、では前の値が残る）。
+    /// </summary>
     int SelectedSlot { get; }
+
+    /// <summary>
+    /// 候補の小窓（ContextIconMenu）がこの納品窓の上に開いているか（利用者や他のプラグインが欄を選んで、候補を選んでいる途中）。
+    /// 偽物の窓では既定で false。
+    /// </summary>
+    bool OptionMenuOpen => false;
+
+    /// <summary>
+    /// 受け渡しの枠（HandIn の欄 <paramref name="slot"/>）が、その品を指しているか（入れたかの確かめ。読めなければ null）。
+    /// 偽物の窓では既定で null（確かめない）。
+    /// </summary>
+    bool? SlotFilledWith(int slot, TurnInItem item) => null;
 
     void SelectSlot(int slot);
 
@@ -145,6 +165,12 @@ public sealed class RequestFiller
     private DateTime putAt = DateTime.MinValue;
     private readonly List<string> picked = [];
 
+    // 欄を選んでから見たフレームの数（候補は選んだその場で出る。0件なら1フレーム待って止める）
+    private int framesSinceSelect;
+
+    // 欄ごとに入れた品（渡す前に、受け渡しの枠が全部その品を指しているかを確かめる）
+    private readonly Dictionary<int, TurnInItem> putItems = [];
+
     // この窓に入れた品（ゲームは渡すまでカバンから消さないので、後の欄の見積もりではこちらで引く）
     private readonly List<(TurnInKey Key, int Quantity)> used = [];
 
@@ -193,6 +219,8 @@ public sealed class RequestFiller
         this.putAt = DateTime.MinValue;
         this.picked.Clear();
         this.used.Clear();
+        this.putItems.Clear();
+        this.framesSinceSelect = 0;
         this.CountsBeforeSubmit.Clear();
         this.Touched = false;
         this.HasSubmitted = false;
@@ -248,7 +276,9 @@ public sealed class RequestFiller
             {
                 this.finished = true;
                 var req = reqs[failedSlot];
-                detail = $"納品窓の {failedSlot + 1} 番目（{Describe(req)}×{Math.Max(1, req.Quantity)}）に合う品が、ほかの欄の分を除くと {have} 個しかありません";
+                detail = Math.Max(1, req.Quantity) > 1
+                    ? $"納品窓の {failedSlot + 1} 番目（{Describe(req)}×{req.Quantity}）に、1つの山で {req.Quantity} 個以上の品が、ほかの欄の分を除くと見つかりません（合う品の一番大きい山 {have} 個。ゲームは山をまたいで数えない）"
+                    : $"納品窓の {failedSlot + 1} 番目（{Describe(req)}）に合う品が、ほかの欄の分を除くと {have} 個しかありません";
                 return Outcome.Failed;
             }
 
@@ -293,9 +323,11 @@ public sealed class RequestFiller
             if (this.nextSlot >= count)
                 break;
 
-            // 他の操作が欄を選んでいる途中なら触らない（こちらが選んだ欄なら続ける）。
-            // 解除されたら、こちらの欄を選び直す（以前は「選んだ」のまま候補を待ち続けて、5秒で止まった）
-            if (window.SelectedSlot >= 0 && window.SelectedSlot != this.selectedByUs)
+            // 他の操作が欄を選んで、候補を選んでいる途中（候補の小窓がこの窓の上に開いている）なら触らない。
+            // 選ばれた欄の番号だけが残っていても、それはゲームが -1 に戻さない古い値のことがある（候補0件で選んだ・小窓を閉じた等）。
+            // そのときは待たずに、こちらの欄を選び直す（選び直すとゲームは前の小窓を閉じてから開き直す。
+            // 以前は古い値が残っているだけで「他の操作が選択中」として待ち続け、30分の上限まで止まりえた）
+            if (window.SelectedSlot >= 0 && window.SelectedSlot != this.selectedByUs && window.OptionMenuOpen)
             {
                 this.selectedByUs = -1;
                 return Outcome.Busy;
@@ -303,22 +335,39 @@ public sealed class RequestFiller
 
             var slot = this.nextSlot;
             var req = window.GetRequest(slot);
-            if (this.selectedByUs != slot)
+            if (this.selectedByUs != slot || window.SelectedSlot != slot)
             {
                 window.SelectSlot(slot);
                 this.selectedByUs = slot;
                 this.selectedAt = this.clock();
+                this.framesSinceSelect = 0;
                 this.Touched = true;
             }
+            else
+            {
+                this.framesSinceSelect++;
+            }
 
-            // 候補がまだ出ていなければ、次のフレームで続ける（上限を過ぎたら止める）
-            if (window.SelectedSlot != slot || window.OptionCount <= 0)
+            // 候補はゲームが欄を選んだその場で作る。0件は「条件に合う山が無い」で、待っても出てこない。
+            // 1フレームだけ待ってから、理由を出して止める。欄の選択そのものが通っていない（番号が違う）ときだけ、上限まで待つ
+            if (window.SelectedSlot != slot)
             {
                 if (this.clock() - this.selectedAt < OptionWaitLimit)
                     return Outcome.Waiting;
 
                 this.finished = true;
-                detail = $"納品窓の {slot + 1} 番目（{Describe(req)}）を選びましたが、{OptionWaitLimit.TotalSeconds:0}秒たっても候補が出ません";
+                detail = $"納品窓の {slot + 1} 番目（{Describe(req)}）を選べませんでした（{OptionWaitLimit.TotalSeconds:0}秒）";
+                return Outcome.Failed;
+            }
+
+            if (window.OptionCount <= 0)
+            {
+                if (this.framesSinceSelect < 1)
+                    return Outcome.Waiting;
+
+                this.finished = true;
+                detail = $"納品窓の {slot + 1} 番目（{Describe(req)}×{Math.Max(1, req.Quantity)}）に、ゲームが出す候補が0件です"
+                         + "（ゲームは「1つの山で求める数以上」「HQ 指定なら HQ」「求めるマテリアの種類と等級」に合う山だけを候補に出す。山が分かれている・品質やマテリアが違う可能性）";
                 return Outcome.Failed;
             }
 
@@ -336,6 +385,17 @@ public sealed class RequestFiller
 
             var chosen = window.GetOption(option)!;
             window.PutOption(option);
+
+            // 入れたか確かめる：受け渡しの枠がその品を指しているか（選択が -1 に戻ったことは成功の印にならない。入れる操作が失敗しても戻る）。
+            // 指していなければ次へ進まず、渡さずに止める
+            if (window.SlotFilledWith(slot, chosen) == false)
+            {
+                this.finished = true;
+                detail = $"納品窓の {slot + 1} 番目（{Describe(req)}）に入れましたが、受け渡しの枠が選んだ品を指していません（渡さずに止めます）";
+                return Outcome.Failed;
+            }
+
+            this.putItems[slot] = chosen;
             this.used.Add((KeyOf(chosen), Math.Min(Math.Max(1, req.Quantity), Math.Max(1, chosen.Quantity))));
             this.picked.Add($"{CraftPlanner.ItemName(req.ItemId)}：{why}");
             this.selectedByUs = -1;
@@ -346,6 +406,17 @@ public sealed class RequestFiller
             {
                 this.putPending = slot;
                 this.putAt = this.clock();
+            }
+        }
+
+        // 渡す前に、全部の欄の受け渡しの枠が入れた品を指しているか確かめる（1つでも外れていれば渡さない）
+        foreach (var (slot, item) in this.putItems)
+        {
+            if (window.SlotFilledWith(slot, item) == false)
+            {
+                this.finished = true;
+                detail = $"渡す前に確かめたら、納品窓の {slot + 1} 番目の受け渡しの枠が入れた品を指していません（渡さずに止めます）";
+                return Outcome.Failed;
             }
         }
 
@@ -370,11 +441,15 @@ public sealed class RequestFiller
            + (req.WantMateria > 0 ? $" マテリア{req.WantMateria}" : string.Empty)
            + (req.WantCollectible ? $" 収集価値{req.MinCollectibility}以上" : string.Empty);
 
-    /// <summary>その品が欄の条件（HQ・マテリアの数・収集価値）に合うか（品番は呼び出し側で確かめる）。</summary>
+    /// <summary>
+    /// その品が欄の条件に合うか（品番は呼び出し側で確かめる）。ゲームが候補に出す条件と同じにする：
+    /// HQ 指定なら HQ、マテリアの数と種類・等級（必須）、収集品を求める欄は収集品で収集価値以上・求めない欄は収集品を除く。
+    /// </summary>
     public static bool Matches(RequestSlot req, TurnInItem it)
         => (!req.WantHq || it.Hq)
            && it.Materia >= req.WantMateria
-           && (!req.WantCollectible || (it.Collectable && it.Collectability >= req.MinCollectibility));
+           && MateriaTypesMatch(req, it)
+           && (req.WantCollectible ? it.Collectable && it.Collectability >= req.MinCollectibility : !it.Collectable);
 
     /// <summary>求めるマテリアの種類（0 でないもの）が、その品に全部付いているか。求める種類が無ければ true。</summary>
     public static bool MateriaTypesMatch(RequestSlot req, TurnInItem it)
@@ -397,7 +472,9 @@ public sealed class RequestFiller
     /// <summary>
     /// 全部の欄を、ほかの欄の分を除いても満たせるか（同じ品を求める欄が複数あるとき、1つの品を2つの欄に数えない）。
     /// 条件の厳しい欄（収集品・HQ・マテリアの数が多い）から先に、条件を満たす品のうち価値の低いもの（NQ・マテリアの少ないもの）を取り置く。
-    /// 満たせなければ、その欄の番号と、その欄に残っていた数を返す。
+    /// 【ゲームの規則に合わせた】1つの欄に N 個を求めるとき、ゲームは「1つの山で N 個以上」の山しか候補に出さない
+    /// （山をまたいで足さない。HQ 指定の無い欄でも NQ と HQ を合算しない）。そこで取り置きも、1つの山から N 個を取る。
+    /// 満たせなければ、その欄の番号と、その欄に使える一番大きい山の数を返す。
     /// </summary>
     public static bool Reserve(IReadOnlyList<RequestSlot> reqs, IReadOnlyList<TurnInItem> owned, out int failedSlot, out int have)
     {
@@ -418,22 +495,15 @@ public sealed class RequestFiller
                 .ThenBy(j => owned[j].Materia)
                 .ThenBy(j => owned[j].Collectability)
                 .ToList();
-            var total = candidates.Sum(j => left[j]);
-            if (total < need)
+            var stack = candidates.FirstOrDefault(j => left[j] >= need, -1);
+            if (stack < 0)
             {
                 failedSlot = i;
-                have = total;
+                have = candidates.Count == 0 ? 0 : candidates.Max(j => left[j]);
                 return false;
             }
 
-            foreach (var j in candidates)
-            {
-                var take = Math.Min(need, left[j]);
-                left[j] -= take;
-                need -= take;
-                if (need == 0)
-                    break;
-            }
+            left[stack] -= need;
         }
 
         failedSlot = -1;
@@ -482,16 +552,16 @@ public sealed class RequestFiller
     /// 候補の中から条件に合う品の番号を選ぶ。無ければ -1。why に選んだ理由（無ければ候補の中身）。
     /// 条件に合う候補のうち、次の順でよいものを選ぶ（同じなら候補の並びの先のもの）：
     ///  0) 後の欄を満たせなくなる候補を避ける（<paramref name="keepsRest"/>。後の欄が無ければ見ない）
-    ///  1) 1つの山で求める数に届く（重ねられる品で、山が分かれているとき）
-    ///  2) マテリアの種類が求めるものと合う（求める種類が読めたときだけ。合う候補が無ければ数だけで選ぶ）
-    ///  3) マテリアを求めない欄なら、マテリアの付いていない品（利用者がマテリアを付けた品を渡さない）
-    ///  4) HQ 指定が無ければ NQ（HQ は後の HQ 指定のために残す）
+    ///  1) 1つの山で求める数に届く（重ねられる品で、山が分かれているとき。実物のゲームは届く山しか候補に出さない）
+    ///  2) マテリアを求めない欄なら、マテリアの付いていない品（利用者がマテリアを付けた品を渡さない）
+    ///  3) HQ 指定が無ければ NQ（HQ は後の HQ 指定のために残す。ゲームの候補の並びは HQ が先なので、先頭を選ぶと HQ が入る）
+    /// マテリアの種類と等級は <see cref="Matches"/> で必須にしている（ゲームも合わない品を候補に出さない）。
     /// 利用者のギアセットの品（マテリアまで一致する品：<see cref="IRequestWindow.IsProtected"/>）は選ばない。それしか合わなければ -1。
     /// </summary>
     public static int Choose(RequestSlot req, IRequestWindow window, out string why, Func<TurnInItem, bool>? keepsRest = null)
     {
         var best = -1;
-        var bestScore = (Keeps: 0, Enough: 0, Type: 0, Plain: 0, Nq: 0);
+        var bestScore = (Keeps: 0, Enough: 0, Plain: 0, Nq: 0);
         TurnInItem? chosen = null;
         var seen = new List<string>();
         var n = window.OptionCount;
@@ -511,10 +581,10 @@ public sealed class RequestFiller
                 continue;
             }
 
+            // マテリアの種類は Matches で必須にした（ゲームも合わない品を候補に出さない）ので、ここでは比べない
             var score = (
                 Keeps: keepsRest == null || keepsRest(it) ? 1 : 0,
                 Enough: it.Quantity >= Math.Max(1, req.Quantity) ? 1 : 0,
-                Type: MateriaTypesMatch(req, it) ? 1 : 0,
                 Plain: req.WantMateria > 0 || it.Materia == 0 ? 1 : 0,
                 Nq: !req.WantHq && !it.Hq ? 1 : 0);
             if (best < 0 || score.CompareTo(bestScore) > 0)
@@ -537,7 +607,7 @@ public sealed class RequestFiller
         if (bestScore.Enough == 0)
             notes.Add($"1つの山では {req.Quantity} 個に届かない");
         if (req.WantMateriaTypes.Any(m => m.Id != 0))
-            notes.Add(bestScore.Type == 1 ? "マテリアの種類が一致" : "マテリアの種類が一致する候補が無いので数だけで選んだ");
+            notes.Add("マテリアの種類が一致");
         if (bestScore.Plain == 0)
             notes.Add("マテリアの付いていない品が無いため、マテリア付きの品");
         if (!req.WantHq && chosen.Hq)
@@ -613,6 +683,29 @@ public sealed unsafe class GameRequestWindow : IRequestWindow
     }
 
     public int SelectedSlot => Agent->SelectedTurnInSlot;
+
+    public bool OptionMenuOpen
+    {
+        get
+        {
+            // 候補の小窓が見えていて、その「ふさいでいる親」が納品窓なら、誰かが候補を選んでいる途中
+            var menu = GameUi.Addon("ContextIconMenu");
+            var request = GameUi.Addon("Request");
+            return menu != null && request != null && menu->BlockedParentId == request->Id;
+        }
+    }
+
+    public bool? SlotFilledWith(int slot, TurnInItem item)
+    {
+        if (item.Container < 0 || item.SlotIndex < 0)
+            return null;
+        var im = InventoryManager.Instance();
+        var c = im == null ? null : im->GetInventoryContainer(InventoryType.HandIn);
+        if (c == null || !c->IsLoaded || slot >= c->Size)
+            return null;
+        var s = c->GetInventorySlot(slot);
+        return s != null && s->IsSymbolic && s->LinkedInventoryType == (ushort)item.Container && s->LinkedItemSlot == (ushort)item.SlotIndex;
+    }
 
     public void SelectSlot(int slot) => Agent->SelectTurnInSlot((ushort)slot);
 
@@ -698,7 +791,7 @@ public sealed unsafe class GameRequestWindow : IRequestWindow
     {
         var count = it->GetMateriaCount();
 
-        // マテリアの種類は「優先」にだけ使う。読む関数（位置で呼ぶ）が見つからなければ空にして、数だけで選ぶ
+        // マテリアの種類（ゲームは必須の条件として候補を絞る）。読む関数（位置で呼ぶ）が見つからなければ空にする
         var types = new List<MateriaRef>();
         try
         {
@@ -719,6 +812,8 @@ public sealed unsafe class GameRequestWindow : IRequestWindow
             it->Quantity)
         {
             MateriaTypes = types,
+            Container = (int)it->Container,
+            SlotIndex = it->Slot,
         };
     }
 }

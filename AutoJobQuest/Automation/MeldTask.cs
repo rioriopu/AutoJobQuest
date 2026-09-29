@@ -54,6 +54,10 @@ public sealed unsafe class MeldTask : AutoTask
     private uint materiaItemId;
     private uint targetLevelItem;
     private bool openedByUs;
+
+    // 装着の画面を開けない理由（最後に見たもの）と、降りる操作を送った時刻（送りすぎない抑え。進む判断は騎乗の状態で行う）
+    private string openBlocked = "まだ試していない";
+    private DateTime lastDismount = DateTime.MinValue;
     private byte materiaCountBefore;
     private long materiaStockBefore;
     private uint targetItemIdBefore;
@@ -101,16 +105,47 @@ public sealed unsafe class MeldTask : AutoTask
                 if (Agent->IsAgentActive())
                     return this.Fail("マテリア装着の画面が開いています（こちらが開いたものではないので使いません）。閉じてからやり直してください");
 
-                if (!GameUi.PlayerFree())
+                if (this.TimedOut(TimeSpan.FromSeconds(60)))
+                    return this.Fail($"マテリア装着の画面を60秒たっても開けませんでした（最後の理由：{this.openBlocked}）");
+
+                // 騎乗中なら降りる（騎乗中は装着の画面を開けない見込み。PlayerFree は騎乗を見ない）
+                if (GameUi.Mounted)
                 {
-                    this.Status = "動ける状態になるのを待っています";
-                    if (this.TimedOut(TimeSpan.FromSeconds(60)))
-                        return this.Fail("キャラクターが動ける状態にならないため、装着の画面を開けません");
+                    this.openBlocked = "騎乗中";
+                    this.Status = "装着の前に降ります";
+                    if (DateTime.UtcNow - this.lastDismount >= TimeSpan.FromSeconds(2))
+                    {
+                        this.lastDismount = DateTime.UtcNow;
+                        GameUi.UseGeneralAction(23); // 降りる（GeneralAction 23）
+                    }
+
                     return TaskResult.Running;
                 }
 
+                if (!GameUi.PlayerFree())
+                {
+                    this.openBlocked = "動ける状態でない";
+                    this.Status = "動ける状態になるのを待っています";
+                    return TaskResult.Running;
+                }
+
+                // ゲームが装着の操作を「いま使える」と答えるまで待つ（GetActionStatus が 0。断られるのを先に避ける）
+                var status = GameUi.GeneralActionStatus(GeneralActionMateriaMelding);
+                if (status != 0)
+                {
+                    this.openBlocked = $"ゲームが今は使えないと答えた（{status}）";
+                    this.Status = "マテリア装着が使えるようになるのを待っています";
+                    return TaskResult.Running;
+                }
+
+                // 開く操作が一時的に断られても、その場で失敗にしない（以前は1回の拒否で止めていた）。上の60秒まで状態を見て開き直す
                 if (!GameUi.UseGeneralAction(GeneralActionMateriaMelding))
-                    return this.Fail("マテリア装着の画面を開けませんでした");
+                {
+                    this.openBlocked = "開く操作が断られた";
+                    this.Status = "マテリア装着の画面を開き直します";
+                    return TaskResult.Running;
+                }
+
                 this.openedByUs = true;
                 this.Next(MeldStep.WaitOpen);
                 return TaskResult.Running;

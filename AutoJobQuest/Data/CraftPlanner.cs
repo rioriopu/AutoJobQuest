@@ -5,7 +5,14 @@ using Lumina.Excel.Sheets;
 
 namespace AutoJobQuest.Data;
 
-/// <summary>製作1件（レシピ×回数）。</summary>
+/// <summary>
+/// 製作1件（レシピ×回数）。
+/// <paramref name="Reserve"/> が true のものは「納品用の取り置き」：HQ 指定で納品する中間素材を、それを材料に使う
+/// 親の製作がすべて終わった後に作る分（親の製作で Artisan が HQ を材料に使っても、
+/// 納品用の HQ が減らないようにする）。回数は作る直前に手持ちから数え直す（<see cref="ReserveCrafts"/>）。
+/// <paramref name="HqTarget"/> はその品の HQ 指定の納品の数（計画全体）、<paramref name="TurnInTarget"/> は
+/// その品を直接納品する数（HQ 指定と品質を問わない分の合計。材料として使う分は含まない）。
+/// </summary>
 public sealed record PlannedCraft(
     uint RecipeId,
     uint ItemId,
@@ -15,7 +22,25 @@ public sealed record PlannedCraft(
     int Yield,
     bool WantHq,
     int Depth,
-    uint SecretRecipeBookId);
+    uint SecretRecipeBookId,
+    bool Reserve = false,
+    int HqTarget = 0,
+    int TurnInTarget = 0)
+{
+    /// <summary>
+    /// 取り置きの分を、いまの手持ちで数え直した製作回数（取り置きでなければ計画の回数のまま）。
+    /// 親の製作がすべて終わった後なので、この後に材料として使われることは無い。
+    /// </summary>
+    public int ReserveCrafts(IInventoryView inv)
+    {
+        if (!this.Reserve)
+            return this.Crafts;
+        var needHq = Math.Max(0, this.HqTarget - inv.CountHq(this.ItemId));
+        var needAll = Math.Max(0, this.TurnInTarget - inv.CountHq(this.ItemId) - inv.CountNq(this.ItemId));
+        var need = Math.Max(needHq, needAll);
+        return (need + Math.Max(1, this.Yield) - 1) / Math.Max(1, this.Yield);
+    }
+}
 
 /// <summary>製作計画の結果。</summary>
 public sealed class CraftPlan
@@ -54,6 +79,16 @@ public interface IInventoryView
 /// Artisan の「親ごとに切り上げ」より余りが出ない。親→子の順（トポロジカル順）に流す。
 ///
 /// 【HQ】HQ 指定の納品物は HQ の所持だけを数える。NQ で持っていても作り直す。
+///
+/// 【HQ 指定の中間素材】HQ で納品する品が、別の納品物の材料にもなるとき、
+/// 親の製作で Artisan がどちらの品質を材料に使うかに頼らない。回数を2つに分ける：
+///  ・材料の分：親の製作が使う数だけ、親より先に作る（手持ちで足りれば作らない）。
+///  ・取り置きの分（Reserve）：親の製作がすべて終わった後に、納品の数（HQ の数と、品質を問わない数）まで作る。
+///    Artisan の CraftItem は、親の製作の材料に手持ちの HQ を先に使う（推定・強い：材料欄ごとに NQ の合図を101回 → HQ の合図を
+///    101回送り、最後に HQ を押し切る。Artisan の CraftingList.cs の SetIngredients・issue #28/#107 の報告）。
+///    なので材料を集める量は「親が手持ちの HQ を先に使う」ふつうの場合で見積もる（多めに作る＝手作業で作った参照リストと同じ考え）。
+///    作る回数は作る直前に手持ちで数え直す（もし NQ が先に使われていれば、その分は作らない）。親の製作がどちらの品質を
+///    使っても、後から作った取り置きは親に使われないので壊れない。
 /// </summary>
 public sealed class CraftPlanner
 {
@@ -156,7 +191,10 @@ public sealed class CraftPlanner
             }
         }
 
-        var craftsOf = new Dictionary<uint, int>();  // recipeId -> 回数
+        var craftsOf = new Dictionary<uint, int>();   // recipeId -> 回数（材料の分・分けない品はその品の全部）
+        var reserveOf = new Dictionary<uint, int>();  // recipeId -> 取り置きの分の回数（親の製作の後に作る）
+        var parentDemand = new Dictionary<uint, int>();  // 品 -> 親の製作が材料として使う数
+        var turnInAny = new Dictionary<uint, int>(anyDemand);  // 品 -> 直接納品する数（品質を問わない分。材料の分を足す前に写す）
         var done = new HashSet<uint>();
         var progress = true;
         while (progress)
@@ -172,17 +210,24 @@ public sealed class CraftPlanner
                 done.Add(item);
                 progress = true;
 
-                var need = NetNeed(item, anyDemand, hqDemand, inv);
-                if (need <= 0)
-                    continue;
-
                 var r = recipeOf[item];
                 var yield = Math.Max(1, (int)r.AmountResult);
-                var crafts = (need + yield - 1) / yield;
-                craftsOf[r.RowId] = crafts;
+                var (crafts, reserve) = SplitCrafts(
+                    hqDemand.GetValueOrDefault(item), turnInAny.GetValueOrDefault(item), parentDemand.GetValueOrDefault(item),
+                    inv.CountHq(item), inv.CountNq(item), yield, NetNeed(item, anyDemand, hqDemand, inv));
+                if (crafts + reserve <= 0)
+                    continue;
+
+                if (crafts > 0)
+                    craftsOf[r.RowId] = crafts;
+                if (reserve > 0)
+                    reserveOf[r.RowId] = reserve;
 
                 foreach (var (ing, amount) in Ingredients(r))
-                    anyDemand[ing] = anyDemand.GetValueOrDefault(ing) + crafts * amount;
+                {
+                    anyDemand[ing] = anyDemand.GetValueOrDefault(ing) + (crafts + reserve) * amount;
+                    parentDemand[ing] = parentDemand.GetValueOrDefault(ing) + (crafts + reserve) * amount;
+                }
             }
         }
 
@@ -205,16 +250,19 @@ public sealed class CraftPlanner
                 plan.RawShortfall[item] = shortfall;
         }
 
-        // 4) 並べる（Artisan の SortList と同じ：深さ→難易度→ジョブ→RowId）
+        // 4) 並べる（Artisan の SortList と同じ：深さ→難易度→ジョブ→RowId）。
+        // 取り置きの分は、材料の分のすべての後に、深い（親に近い）ものから並べる
+        // （取り置きの品が別の取り置きの品の材料になるときも、材料にする側を先に作り終える）
+        var allRecipes = craftsOf.Keys.Union(reserveOf.Keys).ToList();
         var depthOf = new Dictionary<uint, int>();
-        foreach (var rid in craftsOf.Keys)
+        foreach (var rid in allRecipes)
         {
             var r = this.recipes.GetRow(rid);
             var max = 0;
             foreach (var (ing, _) in Ingredients(r))
             {
                 var d = 0;
-                CountDepth(ing, craftsOf, ref d, 0);
+                CountDepth(ing, allRecipes, ref d, 0);
                 if (d > max)
                     max = d;
             }
@@ -223,25 +271,44 @@ public sealed class CraftPlanner
         }
 
         var hqItems = hqDemand.Where(x => x.Value > 0).Select(x => x.Key).ToHashSet();
-        foreach (var rid in craftsOf.Keys
-                     .OrderBy(x => depthOf[x])
-                     .ThenBy(x => Difficulty(this.recipes.GetRow(x)))
-                     .ThenBy(x => this.recipes.GetRow(x).CraftType.RowId)
-                     .ThenBy(x => x))
+        var ordered = craftsOf.Keys
+            .OrderBy(x => depthOf[x])
+            .ThenBy(x => Difficulty(this.recipes.GetRow(x)))
+            .ThenBy(x => this.recipes.GetRow(x).CraftType.RowId)
+            .ThenBy(x => x)
+            .Select(x => (Rid: x, Reserve: false))
+            .Concat(reserveOf.Keys
+                .OrderByDescending(x => depthOf[x])
+                .ThenBy(x => Difficulty(this.recipes.GetRow(x)))
+                .ThenBy(x => this.recipes.GetRow(x).CraftType.RowId)
+                .ThenBy(x => x)
+                .Select(x => (Rid: x, Reserve: true)));
+        foreach (var (rid, isReserve) in ordered)
         {
             var r = this.recipes.GetRow(rid);
+            var item = r.ItemResult.RowId;
+
+            // HQ 指定：取り置きの分があれば、HQ を狙うのは取り置きの分だけ（材料の分は親に使われる）
+            var wantHq = hqItems.Contains(item) && (isReserve || !reserveOf.ContainsKey(rid));
             var pc = new PlannedCraft(
                 rid,
-                r.ItemResult.RowId,
+                item,
                 Jobs.CraftTypeToClassJob(r.CraftType.RowId),
                 r.RecipeLevelTable.ValueNullable?.ClassJobLevel ?? 0,
-                craftsOf[rid],
+                isReserve ? reserveOf[rid] : craftsOf[rid],
                 Math.Max(1, (int)r.AmountResult),
-                hqItems.Contains(r.ItemResult.RowId),
+                wantHq,
                 depthOf[rid],
-                r.SecretRecipeBook.RowId);
+                r.SecretRecipeBook.RowId,
+                isReserve,
+                hqDemand.GetValueOrDefault(item),
+                turnInAny.GetValueOrDefault(item) + hqDemand.GetValueOrDefault(item));
 
             plan.Crafts.Add(pc);
+
+            // 同じレシピが材料の分と取り置きの分の2つに分かれても、秘伝書・マイスターの注意は1回だけ出す
+            if (isReserve && craftsOf.ContainsKey(rid))
+                continue;
 
             if (pc.SecretRecipeBookId != 0 && !isBookUnlocked(pc.SecretRecipeBookId))
                 plan.LockedBySecretBook.Add(pc);
@@ -251,6 +318,37 @@ public sealed class CraftPlanner
         }
 
         return plan;
+    }
+
+    /// <summary>
+    /// 1品の製作回数を「材料の分」と「取り置きの分」に分ける。分けるのは、HQ 指定の納品があり、
+    /// しかも親の製作がその品を材料に使うときだけ。それ以外は今までどおり（<paramref name="netNeed"/> から回数を出す）。
+    ///
+    /// 分けるとき、親の製作は手持ちの HQ から先に使う（Artisan の CraftItem のふつうの動き：推定・強い）と見て数える：
+    ///  ・材料の分 ＝ 親が使う数 − 手持ち（品質を問わない）。親の製作に材料が足りるだけ作る。
+    ///  ・親の後に残る HQ ＝ 手持ちの HQ − 親が使う数（親が HQ を先に使うとき）。
+    ///  ・取り置きの分 ＝ max（HQ の納品 − 残る HQ、直接の納品の合計 − 親の後に残る数）。
+    /// </summary>
+    /// <param name="hq">HQ 指定の納品の数。</param>
+    /// <param name="turnIn">品質を問わない直接の納品の数（材料として使う分は含まない）。</param>
+    /// <param name="parent">親の製作が材料として使う数。</param>
+    /// <param name="ownedHq">手持ちの HQ。</param>
+    /// <param name="ownedNq">手持ちの NQ。</param>
+    /// <param name="yield">1回でできる数。</param>
+    /// <param name="netNeed">分けないときの「まだ要る数」。</param>
+    public static (int Crafts, int Reserve) SplitCrafts(int hq, int turnIn, int parent, int ownedHq, int ownedNq, int yield, int netNeed)
+    {
+        yield = Math.Max(1, yield);
+        if (hq <= 0 || parent <= 0)
+            return (netNeed <= 0 ? 0 : (netNeed + yield - 1) / yield, 0);
+
+        var ownedAll = ownedHq + ownedNq;
+        var forParents = Math.Max(0, parent - ownedAll);
+        var crafts = (forParents + yield - 1) / yield;
+        var leftAll = ownedAll + crafts * yield - parent;
+        var leftHq = Math.Max(0, ownedHq - parent);
+        var needReserve = Math.Max(Math.Max(0, hq - leftHq), Math.Max(0, turnIn + hq - leftAll));
+        return (crafts, (needReserve + yield - 1) / yield);
     }
 
     /// <summary>需要から所持数を引いた「まだ要る数」。HQ 指定分は HQ の所持だけで満たす。</summary>
@@ -269,12 +367,12 @@ public sealed class CraftPlanner
         return Math.Max(netHq, netAll);
     }
 
-    private void CountDepth(uint item, Dictionary<uint, int> craftsOf, ref int depth, int guard)
+    private void CountDepth(uint item, IReadOnlyCollection<uint> recipeIds, ref int depth, int guard)
     {
         if (guard > 20)
             return;
 
-        foreach (var rid in craftsOf.Keys)
+        foreach (var rid in recipeIds)
         {
             var r = this.recipes.GetRow(rid);
             if (r.ItemResult.RowId != item)
@@ -282,7 +380,7 @@ public sealed class CraftPlanner
 
             depth++;
             foreach (var (sub, _) in Ingredients(r))
-                this.CountDepth(sub, craftsOf, ref depth, guard + 1);
+                this.CountDepth(sub, recipeIds, ref depth, guard + 1);
             return;
         }
     }
