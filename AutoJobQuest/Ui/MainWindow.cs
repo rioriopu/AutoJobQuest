@@ -692,15 +692,25 @@ public sealed class MainWindow : Window
 
             ImGui.Separator();
             ImGui.TextUnformatted("製作");
+            var hqRetry = this.config.HqRetryRounds;
+            ImGui.SetNextItemWidth(160);
+            if (ImGui.InputInt("HQ 指定の品が NQ になったとき、止めずに作り直す回数", ref hqRetry, 1, 1))
+            {
+                this.config.HqRetryRounds = Math.Clamp(hqRetry, 0, 10);
+                this.config.Save();
+            }
+
+            ImGui.TextColored(Grey, "既定は 0（その場で止めて、チャットで知らせます。NQ を作ると素材を失うため）。作り直すと、そのたびに素材を集め直します");
+
             var retry = this.config.MaxRetryRounds;
             ImGui.SetNextItemWidth(160);
-            if (ImGui.InputInt("HQ ができなかったとき、同じ品を何回まで作り直すか", ref retry, 1, 1))
+            if (ImGui.InputInt("素材集め・製作を立て直す周回の上限の基準", ref retry, 1, 1))
             {
                 this.config.MaxRetryRounds = Math.Clamp(retry, 1, 10);
                 this.config.Save();
             }
 
-            ImGui.TextColored(Grey, "既定は 3（1〜10）。品目ごとに数え、届いたら何を見直せばよいかを出して止めます");
+            ImGui.TextColored(Grey, "既定は 3（1〜10）。集めても足りないときは この数＋2 周、作っても足りないときは この数＋4 周で、理由を出して止めます");
 
             var questRetry = this.config.QuestCraftRetryRounds;
             ImGui.SetNextItemWidth(160);

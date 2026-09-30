@@ -413,7 +413,7 @@ public static class PlanBuilder
 
     /// <summary>
     /// 受注後に作る品（Lv61〜70 の製作職）の、作り直しの予備の回数（そのクリスタルを先に用意する）。
-    /// 設定の MaxRetryRounds（HQ にならなかったときに作り直す回数の上限）から Configuration が入れる。
+    /// 設定の QuestCraftRetryRounds（受注後に作る品が HQ にならなかったときに作り直す回数の上限）から Configuration が入れる。
     /// </summary>
     public static int QuestCraftSpare { get; set; } = 10;
 
@@ -727,6 +727,8 @@ public static class PlanBuilder
     /// <summary>秘伝書を読んだか。</summary>
     public static unsafe bool IsBookUnlocked(uint secretRecipeBookId)
     {
+        if (Automation.GameMemory.Test is { } test)
+            return test.IsBookUnlocked(secretRecipeBookId);
         try
         {
             var ps = PlayerState.Instance();

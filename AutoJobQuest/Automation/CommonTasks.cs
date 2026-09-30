@@ -526,7 +526,7 @@ public sealed class EquipJobTask : AutoTask
         if (idx < 0)
             return this.Fail($"{Jobs.Name(this.classJob)} のギアセットがありません");
 
-        this.lastResult = RaptureGearsetModule.Instance()->EquipGearset(idx);
+        this.lastResult = GameMemory.EquipGearset(idx);
         this.requests++;
         if (this.lastResult != 0)
             ctx.Log.Write("着替え", $"ゲームが着替えを断りました（ギアセット {idx + 1}・EquipGearset の戻り値 {this.lastResult}）。{EquipRetry.RefusedSpacing.TotalSeconds:0} 秒後に頼み直します");

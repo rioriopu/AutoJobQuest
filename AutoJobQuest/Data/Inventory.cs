@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using FFXIVClientStructs.FFXIV.Client.Game;
 
 namespace AutoJobQuest.Data;
@@ -41,6 +42,9 @@ public sealed unsafe class Inventory : IInventoryView
     /// （本番の作業〔CraftOneTask 等〕を偽物の持ち物で通しで動かすため）。
     /// </summary>
     public static Func<IReadOnlyDictionary<(uint Item, bool Hq), int>>? TestSource { get; set; }
+
+    /// <summary>検証の仕組み用：偽物の持ち物のときの鞄の空き枠の数（<see cref="TestSource"/> と組で使う）。</summary>
+    public static Func<int> TestFreeBagSlots { get; set; } = () => 100;
 
     /// <summary>
     /// 実行の始めに手持ち（鞄・アーマリー）にあったギアセットの品の数（品, HQ か）→ 数。設定されていれば、守る数はこれを上限にする
@@ -180,6 +184,8 @@ public sealed unsafe class Inventory : IInventoryView
     /// <summary>カバンの空き枠の数。</summary>
     public static int FreeBagSlots()
     {
+        if (TestSource != null)
+            return TestFreeBagSlots();
         var im = InventoryManager.Instance();
         if (im == null)
             return 0;
@@ -214,6 +220,8 @@ public sealed unsafe class Inventory : IInventoryView
     /// <summary>クリスタル欄にあるその品の数（上限を超えて引き出さないため）。</summary>
     public static int CrystalCount(uint itemId)
     {
+        if (TestSource is { } source)
+            return source().Where(kv => kv.Key.Item == itemId).Sum(kv => kv.Value);
         var im = InventoryManager.Instance();
         if (im == null)
             return 0;
@@ -237,6 +245,8 @@ public sealed unsafe class Inventory : IInventoryView
     /// </summary>
     public static int StackRoom(uint itemId, bool hq, int stackSize)
     {
+        if (TestSource != null)
+            return 0; // 検証の仕組み：同じ品の山には積まず、新しい枠を使うとみる
         var im = InventoryManager.Instance();
         if (im == null)
             return 0;
@@ -265,6 +275,8 @@ public sealed unsafe class Inventory : IInventoryView
     /// </summary>
     public static bool HasMelded(uint itemId, bool hqOnly, uint? materiaItemId)
     {
+        if (TestSource != null)
+            return false;
         var im = InventoryManager.Instance();
         if (im == null)
             return false;

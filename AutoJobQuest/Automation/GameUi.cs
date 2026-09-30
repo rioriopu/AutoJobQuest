@@ -10,10 +10,41 @@ using FFXIVClientStructs.FFXIV.Component.GUI;
 namespace AutoJobQuest.Automation;
 
 /// <summary>
+/// 検証の仕組み用：ゲームの画面の偽物（受注・納品の作業と呼び鈴の引き出しを、偽物のゲームで通しで動かすため）。
+/// 画面は番号（アドレスの代わり。中身は読まない）で表す。本番では使わない。
+/// </summary>
+public interface IGameUiTestBackend
+{
+    /// <summary>その名前の画面が出ていれば番号、出ていなければ 0。</summary>
+    nint Addon(string name);
+
+    /// <summary>その名前の画面が操作できる状態か。</summary>
+    bool IsReady(string name);
+
+    void Fire(nint addon, bool updateState, object[] values);
+
+    /// <summary>選択肢（SelectString・SelectIconString）の項目と、その画面の番号。出ていなければ null。</summary>
+    List<string>? MenuEntries(out nint addon);
+
+    bool AdvanceTalk();
+
+    bool PlayerFree();
+
+    bool Interact(Dalamud.Game.ClientState.Objects.Types.IGameObject obj);
+
+    void Close(nint addon);
+}
+
+/// <summary>
 /// ゲーム画面（アドオン）とキャラクターの状態を見る小物。
 /// </summary>
 public static unsafe class GameUi
 {
+    /// <summary>
+    /// 検証の仕組み用：設定すると、ゲームの画面の代わりにこれを使う。本番では null のまま（今までと同じ処理を通る）。
+    /// </summary>
+    public static IGameUiTestBackend? TestBackend { get; set; }
+
     /// <summary>
     /// ショップ・マーケットボード系の画面の名前。
     /// これらが開いている間は、移動・テレポなどの介入を一切しない。
@@ -29,6 +60,8 @@ public static unsafe class GameUi
     /// <summary>アドオンを名前で探す。表示中でなければ null。</summary>
     public static AtkUnitBase* Addon(string name)
     {
+        if (TestBackend is { } test)
+            return (AtkUnitBase*)test.Addon(name);
         var mgr = RaptureAtkUnitManager.Instance();
         if (mgr == null)
             return null;
@@ -40,7 +73,22 @@ public static unsafe class GameUi
     public static bool IsReady(string name, out AtkUnitBase* addon)
     {
         addon = Addon(name);
+        if (TestBackend is { } test)
+            return addon != null && test.IsReady(name);
         return addon != null && addon->IsReady && addon->IsFullyLoaded();
+    }
+
+    /// <summary>画面を閉じる（Close(true)）。</summary>
+    public static void Close(AtkUnitBase* addon)
+    {
+        if (TestBackend is { } test)
+        {
+            test.Close((nint)addon);
+            return;
+        }
+
+        if (addon != null)
+            addon->Close(true);
     }
 
     public static bool IsVisible(string name) => Addon(name) != null;
@@ -79,6 +127,12 @@ public static unsafe class GameUi
     /// </summary>
     public static void Fire(AtkUnitBase* addon, bool updateState, params object[] values)
     {
+        if (TestBackend is { } test)
+        {
+            test.Fire((nint)addon, updateState, values);
+            return;
+        }
+
         if (addon == null)
         {
             Core.DebugLog.Current?.Line("操作", $"コールバック送信先の画面がありません（値: {string.Join(", ", values)}）");
@@ -133,6 +187,8 @@ public static unsafe class GameUi
     /// <summary>自分のキャラクターが自由に動ける状態か（会話・カットシーン・エリア移動・詠唱中でない）。</summary>
     public static bool PlayerFree()
     {
+        if (TestBackend is { } test)
+            return test.PlayerFree();
         if (!Me.Available)
             return false;
 
@@ -164,6 +220,8 @@ public static unsafe class GameUi
     /// </summary>
     public static bool Interact(Dalamud.Game.ClientState.Objects.Types.IGameObject obj, bool checkLineOfSight = false)
     {
+        if (TestBackend is { } test)
+            return test.Interact(obj);
         var ts = TargetSystem.Instance();
         if (ts == null)
             return false;
@@ -188,6 +246,8 @@ public static unsafe class GameUi
     /// </summary>
     public static bool AdvanceTalk()
     {
+        if (TestBackend is { } test)
+            return test.AdvanceTalk();
         if (!IsReady("Talk", out var addon))
             return false;
 
@@ -271,6 +331,13 @@ public static unsafe class GameUi
     public static List<string>? MenuEntries(out AtkUnitBase* addon)
     {
         addon = null;
+        if (TestBackend is { } test)
+        {
+            var entries = test.MenuEntries(out var handle);
+            addon = (AtkUnitBase*)handle;
+            return entries;
+        }
+
         if (IsReady("SelectString", out var s))
         {
             addon = s;

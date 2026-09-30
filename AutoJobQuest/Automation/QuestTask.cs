@@ -119,7 +119,7 @@ public sealed unsafe class QuestTask : AutoTask
 
     public override string Name => $"クエスト: {Jobs.Name(this.quest.ClassJobId)} {this.quest}";
 
-    private bool IsComplete => QuestManager.IsQuestComplete(this.quest.RowId);
+    private bool IsComplete => GameMemory.IsQuestComplete(this.quest.RowId);
 
     protected override TaskResult OnStart(TaskContext ctx)
     {
@@ -129,7 +129,7 @@ public sealed unsafe class QuestTask : AutoTask
         // 納品物がそろっているか。途中の段で渡すクエストは、今の段によってはもう要らない・手持ちで進める
         // （渡した後に止めて再開したとき、無い品を理由に止まらないように）
         var inv = Inventory.Snapshot();
-        var seq = QuestManager.GetQuestSequence(this.quest.RowId);
+        var seq = GameMemory.QuestSequence(this.quest.RowId);
         var needs = QuestItemNeeds.Decide(this.quest.Items, seq, this.quest.FirstItemSeq, this.quest.LastItemSeq, this.quest.Handovers,
             todo => QuestTodo.IsChecked(this.quest.RowId, todo), (item, hq) => hq ? inv.CountHq(item) : inv.CountAll(item));
         var stage = needs.Stage;
@@ -258,8 +258,7 @@ public sealed unsafe class QuestTask : AutoTask
         if (!this.started && !this.gearsetSetupChecked)
         {
             this.gearsetSetupChecked = true;
-            var qm = QuestManager.Instance();
-            if (qm != null && !qm->IsQuestAccepted(this.quest.RowId) && this.paths != null && QuestTakeOver.GearsetSetupAccept(this.paths) is { } accept)
+            if (GameMemory.QuestAccepted(this.quest.RowId) == false && this.paths != null && QuestTakeOver.GearsetSetupAccept(this.paths) is { } accept)
             {
                 ctx.Log.Write("クエスト", $"{this.quest} の受注前の段には、新しいクラス向けの準備（道具の装備・ギアセットの作成と上書き）があります。"
                                      + $"Lv70 の職では要らず、ギアセットを書き換えるので、受注だけこちらで行います（{NpcStepTask.NpcName(accept.DataId)} に話しかける）");
@@ -480,11 +479,11 @@ public sealed unsafe class QuestTask : AutoTask
         if (this.submittedAt is { } at)
         {
             var inv = Inventory.Snapshot();
-            var dropped = this.countsBeforeSubmit.Where(kv => GameRequestWindow.Instance.CountOwned(kv.Key) < kv.Value).ToList();
+            var dropped = this.countsBeforeSubmit.Where(kv => GameRequestWindow.Current.CountOwned(kv.Key) < kv.Value).ToList();
             if (dropped.Count > 0)
             {
                 this.submittedAt = null;
-                ctx.Log.Write("納品", $"納品を確かめました（{string.Join("、", dropped.Select(kv => $"{CraftPlanner.ItemName(kv.Key)} {kv.Value}→{GameRequestWindow.Instance.CountOwned(kv.Key)}"))}）");
+                ctx.Log.Write("納品", $"納品を確かめました（{string.Join("、", dropped.Select(kv => $"{CraftPlanner.ItemName(kv.Key)} {kv.Value}→{GameRequestWindow.Current.CountOwned(kv.Key)}"))}）");
             }
             else if (DateTime.UtcNow - at > TimeSpan.FromSeconds(15))
             {
@@ -519,7 +518,7 @@ public sealed unsafe class QuestTask : AutoTask
         if (!ctx.TextAdvance.VerifyTurnInControlNow())
             return $"TextAdvance の操作権を確認できないため、納品窓には入力せず止めました（{ctx.TextAdvance.LossReason ?? "理由を読めません"}）";
 
-        var result = this.filler.Tick(GameRequestWindow.Instance, (nint)request, openedAt, this.questItems, out var detail);
+        var result = this.filler.Tick(GameRequestWindow.Current, (nint)request, openedAt, this.questItems, out var detail);
         if (this.filler.MateriaNote is { } note && !this.materiaNoteLogged)
         {
             this.materiaNoteLogged = true;
@@ -530,7 +529,7 @@ public sealed unsafe class QuestTask : AutoTask
         {
             case RequestFiller.Outcome.Submitted:
                 this.submittedAt = DateTime.UtcNow;
-                this.submittedInSequence = QuestManager.GetQuestSequence(this.quest.RowId);
+                this.submittedInSequence = GameMemory.QuestSequence(this.quest.RowId);
                 this.countsBeforeSubmit = new Dictionary<uint, int>(this.filler.CountsBeforeSubmit);
                 ctx.Log.Write("納品", detail);
                 break;
@@ -803,7 +802,7 @@ public sealed unsafe class QuestTask : AutoTask
             && (nint)request == this.filler.Addon && openedAt == this.filler.AddonOpenedAt)
         {
             DebugLog.Current?.Line("操作", "止めたので、こちらが入力していた納品窓を閉じます");
-            request->Close(true);
+            GameUi.Close(request);
         }
 
         ctx.Ownership.Clear();

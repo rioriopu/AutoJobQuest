@@ -23,6 +23,8 @@ public static unsafe class QuestTodo
     /// </summary>
     public static bool? IsChecked(uint questRowId, byte todo)
     {
+        if (Automation.GameMemory.Test is { } test)
+            return test.TodoChecked(questRowId, todo);
         try
         {
             return IsCheckedCore(questRowId, todo);

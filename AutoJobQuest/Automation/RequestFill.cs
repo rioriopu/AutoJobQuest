@@ -627,6 +627,14 @@ public sealed unsafe class GameRequestWindow : IRequestWindow
 {
     public static readonly GameRequestWindow Instance = new();
 
+    /// <summary>
+    /// 検証の仕組み用：設定すると、ゲームの納品窓の代わりにこれを使う。本番では null のまま。
+    /// </summary>
+    public static IRequestWindow? TestWindow { get; set; }
+
+    /// <summary>いま使う納品窓（本番はゲームの納品窓）。</summary>
+    public static IRequestWindow Current => TestWindow ?? Instance;
+
     private static AgentNpcTrade* Agent => AgentNpcTrade.Instance();
 
     public bool Ready

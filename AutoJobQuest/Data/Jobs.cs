@@ -86,6 +86,8 @@ public static class Jobs
     /// <summary>そのジョブのレベル。読めなければ 0。</summary>
     public static unsafe int Level(uint classJobId)
     {
+        if (Automation.GameMemory.Test is { } test)
+            return test.JobLevel(classJobId);
         var sheet = Svc.Data.GetExcelSheet<ClassJob>();
         if (!sheet.TryGetRow(classJobId, out var row) || row.ExpArrayIndex < 0)
             return 0;
@@ -101,5 +103,5 @@ public static class Jobs
 
     /// <summary>いま就いているジョブ。</summary>
     public static uint CurrentClassJob
-        => Svc.Objects.LocalPlayer?.ClassJob.RowId ?? 0;
+        => Automation.GameMemory.Test is { } test ? test.CurrentClassJob : Svc.Objects.LocalPlayer?.ClassJob.RowId ?? 0;
 }

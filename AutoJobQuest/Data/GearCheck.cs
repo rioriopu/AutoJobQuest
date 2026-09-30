@@ -122,6 +122,8 @@ public static class GearCheck
     /// <summary>そのジョブの最初のギアセットの番号。無ければ -1。</summary>
     public static unsafe int FindGearset(uint classJobId)
     {
+        if (Automation.GameMemory.Test is { } test)
+            return test.FindGearset(classJobId);
         var m = RaptureGearsetModule.Instance();
         if (m == null)
             return -1;
@@ -163,6 +165,8 @@ public static class GearCheck
         var idx = FindGearset(classJobId);
         if (idx < 0)
             return null;
+        if (Automation.GameMemory.Test != null)
+            return []; // 検証の仕組み：ギアセットがあれば装備は足りているとみる
         var m = RaptureGearsetModule.Instance();
         var g = m == null ? null : m->GetGearset(idx);
         if (g == null)

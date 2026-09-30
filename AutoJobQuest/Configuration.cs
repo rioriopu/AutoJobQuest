@@ -84,10 +84,18 @@ public sealed class Configuration
     public PendingPurchaseRecord? PendingPurchase { get; set; }
 
     /// <summary>
-    /// 納品物のHQが要るのにNQしかできなかったとき、何回まで作り直すか。
-    /// 無限に作り直すと素材を食い潰すので上限を持つ。
+    /// 素材集め・製作を立て直す周回の上限の基準（集めても足りない：この数＋2 周、作っても足りない：この数＋4 周で止める。RoundPolicy）。
+    /// 無限に立て直すと素材とギルを食い潰すので上限を持つ。
+    /// 以前は HQ にならなかったときの作り直しの上限も兼ねていた（<see cref="HqRetryRounds"/> に分けた）。
     /// </summary>
     public int MaxRetryRounds { get; set; } = 3;
+
+    /// <summary>
+    /// HQ 指定の品が NQ になったとき、止めずに作り直す回数（既定 0＝その場で止めて、チャットで知らせる）。
+    /// NQ を誤って作っても、製作の失敗と同じく素材を失うため。
+    /// 受注後に作る品（Lv61〜70。材料はクエストがくれる）は別の設定（<see cref="QuestCraftRetryRounds"/>）。
+    /// </summary>
+    public int HqRetryRounds { get; set; }
 
     /// <summary>
     /// 受注後に作る品（Lv61〜70 の32品。材料はクエストがくれて、何度でももらい直せる）が HQ にならなかったとき、何回まで作り直すか（既定10）。
@@ -297,6 +305,8 @@ public sealed class Configuration
 
         // 選ばなかった製作職の装備の条件（作れる職の判定へ渡す）
         Data.CraftAbility.RequireGear = this.RequireGearForOtherCrafters;
+
+        this.HqRetryRounds = Math.Clamp(this.HqRetryRounds, 0, 10);
 
         // 古い設定ファイルで配列の長さが違うと、チェックボックスの描画で範囲外になる
         if (this.SelectedCrafters is not { Length: 11 })

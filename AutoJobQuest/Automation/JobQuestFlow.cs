@@ -138,7 +138,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         // ギアセットの品を守る数は、始めに手持ちにあった分まで
         Inventory.GearsetKeepCap = Inventory.GearsetKeepInBags();
         this.rounds = new RoundPolicy(ctx.Config.MaxRetryRounds + 2, ctx.Config.MaxRetryRounds + 4);
-        this.hqFailures = new HqFailureTally(ctx.Config.MaxRetryRounds);
+        this.hqFailures = new HqFailureTally(HqLimit(ctx.Config));
         PlanBuilder.QuestCraftSpare = Math.Max(0, ctx.Config.QuestCraftRetryRounds);
         Unlocks.UnlockStagePassed = false;
         ctx.Data.EnsureBuilding();
@@ -471,7 +471,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
 
         // 区切りごとにやり直すもの（周回の数・秘伝書の段・機能の解放の段・製作の打ち切り・HQ の失敗の数）
         this.rounds = new RoundPolicy(ctx.Config.MaxRetryRounds + 2, ctx.Config.MaxRetryRounds + 4);
-        this.hqFailures = new HqFailureTally(ctx.Config.MaxRetryRounds);
+        this.hqFailures = new HqFailureTally(HqLimit(ctx.Config));
         this.books = null;
         this.bookBuild = null;
         this.requiredBookItems = [];
@@ -1243,9 +1243,16 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         return task;
     }
 
+    /// <summary>HQ にならなかった回数がいくつに届いたら止めるか（設定の作り直す回数＋1。既定 0 なら1回目で止める）。</summary>
+    public static int HqLimit(Configuration config) => Math.Max(0, config.HqRetryRounds) + 1;
+
+    /// <summary>HQ 指定の品が NQ になって止めるときに、自分だけに見えるチャットへ出す文。</summary>
+    public const string HqChat = "HQ にならなかったので、装備品や食事、スキル回し等を見直して下さい";
+
     /// <summary>
     /// 製作の列が終わったら、HQ 指定の品が HQ にならなかった回数を品目ごとに数える。
-    /// 上限に届いた品があれば、何を見直せばよいか（必要な品・レシピ・装備の数値・Artisan の設定・NQ になった回数）を出して止める。
+    /// 上限（設定の HqRetryRounds＋1。既定は1回目）に届いた品があれば、何を見直せばよいか（必要な品・レシピ・装備の数値・Artisan の設定・NQ になった回数）を
+    /// 出して止め、自分だけに見えるチャットでも知らせる（製作の失敗と同じ扱い）。
     /// </summary>
     private string? TallyHqFailures(TaskContext ctx)
     {
@@ -1260,6 +1267,8 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
                 continue;
             }
 
+            if (stop == null)
+                Svc.Chat.Print($"[AutoJobQuest] {HqChat}（{CraftPlanner.ItemName(t.Craft.ItemId)}）");
             var job = t.Craft.ClassJobId;
             var gear = GearCheck.ReadGearset(job);
             var baseline = ctx.Data.GearBaselines?.GetValueOrDefault(job) ?? (0, 0);

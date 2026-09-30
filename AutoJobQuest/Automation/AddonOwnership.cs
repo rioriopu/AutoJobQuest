@@ -36,10 +36,22 @@ public sealed unsafe class AddonOwnership : IDisposable
     // 納品窓では同じ窓を別の窓と取り違えるので、2つを分けて持つ
     private readonly Dictionary<nint, (DateTime OpenedAt, DateTime Touched)> owned = [];
     private bool registered;
+    private readonly bool testOnly;
 
     /// <summary>画面の開閉の知らせを受け取れているか（false なら、自分が開いた画面を見分けられない。事前点検で止める）。</summary>
     public bool Registered => this.registered;
     private bool claiming;
+
+    /// <summary>
+    /// 検証の仕組み用：ゲームの知らせを登録しない記録（画面が開いた知らせは <see cref="TestOpened"/> で送る）。
+    /// </summary>
+    public static AddonOwnership ForTest() => new(testOnly: true);
+
+    private AddonOwnership(bool testOnly)
+    {
+        this.testOnly = testOnly;
+        this.registered = true;
+    }
 
     public AddonOwnership()
     {
@@ -67,12 +79,17 @@ public sealed unsafe class AddonOwnership : IDisposable
         }
     }
 
-    private void OnPostSetup(AddonEvent type, AddonArgs args)
+    private void OnPostSetup(AddonEvent type, AddonArgs args) => this.Opened(args.Addon.Address);
+
+    /// <summary>検証の仕組み用：画面が開いた（PostSetup）知らせ。</summary>
+    public void TestOpened(nint address) => this.Opened(address);
+
+    private void Opened(nint address)
     {
         if (!this.claiming)
             return;
         var now = DateTime.UtcNow;
-        this.owned[args.Addon.Address] = (now, now);
+        this.owned[address] = (now, now);
     }
 
     private void OnPreFinalize(AddonEvent type, AddonArgs args) => this.owned.Remove(args.Addon.Address);
@@ -138,7 +155,7 @@ public sealed unsafe class AddonOwnership : IDisposable
 
     public void Dispose()
     {
-        if (!this.registered)
+        if (!this.registered || this.testOnly)
             return;
 
         try

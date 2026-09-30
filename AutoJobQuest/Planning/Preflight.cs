@@ -534,7 +534,10 @@ public static class Preflight
             yield return new PreflightItem(Severity.Warn,
                 $"HQ 指定の品のうち、いまのギアセットの能力値では HQ になりにくいものがあります（見込み {Ipc.ArtisanHqEstimate.WarnBelow:0}% 未満）："
                 + string.Join("、", low.Select(r => $"{CraftPlanner.ItemName(r.ItemId)} {r.Percent:0}%（{r.Stats}）"))
-                + $"。HQ にならないと作り直し、同じ品で {Math.Max(1, ctx.Config.MaxRetryRounds)} 回 HQ にならないと止まります。CP を上げる装備・マテリアを検討してください"
+                + (ctx.Config.HqRetryRounds <= 0
+                    ? "。HQ にならなければ、その場で止まります（素材を失わないため。作り直す回数は設定タブで変えられます）"
+                    : $"。HQ にならないと {ctx.Config.HqRetryRounds} 回まで作り直し、それでも HQ にならないと止まります")
+                + "。CP を上げる装備・マテリアを検討してください"
                 + "（Artisan の計算を借り、状態と成否を乱数で振って求めた見込み。レベルはレシピの職レベルまで上がったとして計算）");
         else if (results.Any(r => r.Percent != null))
             yield return new PreflightItem(Severity.Ok, $"HQ 指定の品 {results.Count(r => r.Percent != null)} 件は、いまのギアセットの能力値で HQ の見込みが {Ipc.ArtisanHqEstimate.WarnBelow:0}% 以上です");

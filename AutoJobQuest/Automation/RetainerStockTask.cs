@@ -82,7 +82,8 @@ public sealed unsafe class RetainerStockTask : AutoTask
     /// <summary>着いたとみる高さの差（MoveToTask と同じ見方にそろえる）。</summary>
     private const float BellHeightTolerance = 8f;
 
-    private static readonly InventoryType[] Pages =
+    /// <summary>リテイナーの持ち物の入れ物（通常の7ページとクリスタル）。</summary>
+    public static readonly InventoryType[] Pages =
     [
         InventoryType.RetainerPage1, InventoryType.RetainerPage2, InventoryType.RetainerPage3, InventoryType.RetainerPage4,
         InventoryType.RetainerPage5, InventoryType.RetainerPage6, InventoryType.RetainerPage7, InventoryType.RetainerCrystals,
@@ -253,12 +254,8 @@ public sealed unsafe class RetainerStockTask : AutoTask
         if (this.bellOpened && this.AdvanceOwnTalk(ctx))
             return TaskResult.Running;
 
-        if (this.phase is Phase.Inventory or Phase.Context or Phase.Numeric or Phase.Verify)
-        {
-            var manager = RetainerManager.Instance();
-            if (manager == null || manager->LastSelectedRetainerId != this.current)
-                return this.Fail("操作中のリテイナーが変わったため止めました");
-        }
+        if (this.phase is (Phase.Inventory or Phase.Context or Phase.Numeric or Phase.Verify) && GameMemory.LastSelectedRetainer != this.current)
+            return this.Fail("操作中のリテイナーが変わったため止めました");
 
         this.Status = $"{(this.withdrawing ? "引き出し" : "在庫の読み取り")}：{PhaseLabel(this.phase)}（残り {this.queue.Count} 人）";
         return this.phase switch
@@ -438,18 +435,16 @@ public sealed unsafe class RetainerStockTask : AutoTask
     {
         if (!this.ListReady(ctx, out var list))
             return TaskResult.Running;
-        var manager = RetainerManager.Instance();
-        if (manager == null || !manager->IsReady)
+        if (!GameMemory.RetainersReady)
             return TaskResult.Running;
 
         if (!this.listed)
         {
             this.listed = true;
-            for (uint i = 0; i < manager->Retainers.Length; i++)
+            foreach (var r in GameMemory.Retainers())
             {
-                var r = manager->GetRetainerBySortedIndex(i);
-                if (r != null && r->RetainerId != 0 && r->Available)
-                    this.queue.Add(r->RetainerId);
+                if (r.Available)
+                    this.queue.Add(r.Id);
             }
 
             ctx.Log.Write("リテイナー", $"リテイナー {this.queue.Count} 人の持ち物を読みます");
@@ -482,7 +477,7 @@ public sealed unsafe class RetainerStockTask : AutoTask
         if (!this.ListReady(ctx, out var list))
             return TaskResult.Running;
         var name = RetainerName(this.current);
-        var index = name == null ? -1 : RetainerListIndex(list, name);
+        var index = name == null ? -1 : GameMemory.RetainerListIndex(list, name);
         if (index < 0)
         {
             ctx.Log.Warn("リテイナー", $"リテイナー（{name ?? this.current.ToString()}）を一覧に見つけられないので飛ばします");
@@ -494,62 +489,19 @@ public sealed unsafe class RetainerStockTask : AutoTask
         // ECommons の AddonMaster.RetainerList.Entry.Select と同じ（2, 一覧の番号, 型なし, 型なし）
         this.windows!.ForgetInventory();
         this.MarkAct();
-        var args = stackalloc AtkValue[4];
-        for (var n = 0; n < 4; n++)
-            args[n] = default;
-        args[0].SetInt(2);
-        args[1].SetUInt((uint)index);
-        list->FireCallback(4, args, true);
+        GameMemory.SelectRetainer(list, index);
         this.Next(Phase.Menu);
         return TaskResult.Running;
     }
 
     /// <summary>リテイナーの名前（RetainerManager から）。</summary>
     private static string? RetainerName(ulong id)
-    {
-        var manager = RetainerManager.Instance();
-        if (manager == null)
-            return null;
-        for (uint i = 0; i < manager->Retainers.Length; i++)
-        {
-            var r = manager->GetRetainerBySortedIndex(i);
-            if (r != null && r->RetainerId == id)
-                return r->NameString;
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// 一覧の窓での番号（名前で探す。並びを RetainerManager の並びと決めつけない）。
-    /// 一覧の値は 3 番目から1人10個ずつ（名前・…・選べるか＝8番目）：ECommons の ReaderRetainerList と同じ。
-    /// </summary>
-    private static int RetainerListIndex(AtkUnitBase* list, string name)
-    {
-        for (var i = 0; i < 10; i++)
-        {
-            var at = 3 + (i * 10);
-            if (at + 8 >= list->AtkValuesCount)
-                break;
-            var v = list->AtkValues[at];
-            if (v.Type == 0)
-                break;
-            if (v.Type is not (AtkValueType.String or AtkValueType.ManagedString or AtkValueType.ConstString) || v.String.Value == null)
-                continue;
-            var shown = Dalamud.Memory.MemoryHelper.ReadSeStringNullTerminated((nint)v.String.Value).TextValue;
-            if (shown != name)
-                continue;
-            var active = list->AtkValues[at + 8];
-            return active.Type == AtkValueType.Bool && active.Byte == 0 ? -1 : i;
-        }
-
-        return -1;
-    }
+        => GameMemory.Retainers().Where(r => r.Id == id).Select(r => r.Name).FirstOrDefault();
 
     /// <summary>リテイナーのメニュー（SelectString）で、Addon の文言が先頭に来る項目を1つだけ選ぶ。</summary>
     private TaskResult TickMenu(TaskContext ctx, uint addonRow, Phase then)
     {
-        if (this.phase == Phase.Menu && RetainerManager.Instance()->LastSelectedRetainerId != this.current)
+        if (this.phase == Phase.Menu && GameMemory.LastSelectedRetainer != this.current)
             return TaskResult.Running;
         if (GameUi.MenuEntries(out var menu) is not { } entries || !this.Fresh("SelectString", out var owned) || owned != menu)
             return TaskResult.Running;
@@ -587,9 +539,9 @@ public sealed unsafe class RetainerStockTask : AutoTask
     private TaskResult TickInventory(TaskContext ctx)
     {
         // 持ち物の窓は、同じリテイナーの間は最初に認めた窓を認め続ける
-        if (!AgentRetainer.Instance()->IsAgentActive() || !this.windows!.InventoryOpen(this.current))
+        if (!GameMemory.RetainerInventoryActive || !this.windows!.InventoryOpen(this.current))
             return TaskResult.Running;
-        var slots = ReadSlots();
+        var slots = GameMemory.RetainerSlots();
         if (slots == null)
             return TaskResult.Running;
 
@@ -625,7 +577,7 @@ public sealed unsafe class RetainerStockTask : AutoTask
         this.numericSent = false;
         this.MarkAct();
         this.firedAt = DateTime.UtcNow;
-        AgentInventoryContext.Instance()->OpenForItemSlot(want.Container, want.Slot, 0, AgentRetainer.Instance()->GetAddonId());
+        GameMemory.OpenRetainerItemMenu(want.Container, want.Slot);
         this.Next(Phase.Context);
         return TaskResult.Running;
     }
@@ -640,11 +592,7 @@ public sealed unsafe class RetainerStockTask : AutoTask
             return TaskResult.Running;
 
         var p = this.pending!;
-        var context = AgentInventoryContext.Instance();
-        var labels = new List<string>();
-        foreach (var value in context->EventParams)
-            if (value.Type == AtkValueType.String && value.String.Value != null)
-                labels.Add(Dalamud.Memory.MemoryHelper.ReadSeStringNullTerminated((nint)value.String.Value).TextValue);
+        var labels = GameMemory.ContextMenuLabels();
 
         // 全部取るなら「リテイナーから受け取る」（98）、一部なら「個数指定」（773）。クリスタルには個数指定が出ない
         // （Artisan と同じ）。望んだほうが無ければもう一方にする
@@ -654,9 +602,9 @@ public sealed unsafe class RetainerStockTask : AutoTask
         var idx = MenuChoice.Exact(labels, useAll ? all : some);
         if (idx < 0)
             idx = MenuChoice.Exact(labels, useAll ? some : all);
-        if (idx < 0 || context->IsContextItemDisabled(idx))
+        if (idx < 0 || GameMemory.ContextMenuItemDisabled(idx))
         {
-            menu->Close(true);
+            GameUi.Close(menu);
             return this.Fail($"右クリックのメニューで「受け取る」を一意に選べません：{string.Join(" / ", labels)}");
         }
 
@@ -690,7 +638,7 @@ public sealed unsafe class RetainerStockTask : AutoTask
     private TaskResult TickVerify(TaskContext ctx)
     {
         var p = this.pending!;
-        var slots = ReadSlots();
+        var slots = GameMemory.RetainerSlots();
         if (slots == null)
             return TaskResult.Running;
         var now = slots.FirstOrDefault(x => x.Container == p.Container && x.Slot == p.Slot);
@@ -716,13 +664,12 @@ public sealed unsafe class RetainerStockTask : AutoTask
 
     private TaskResult TickCloseInventory()
     {
-        var agent = AgentRetainer.Instance();
-        if (agent->IsAgentActive())
+        if (GameMemory.RetainerInventoryActive)
         {
             if (DateTime.UtcNow - this.windows!.ActedAt > TimeSpan.FromMilliseconds(600))
             {
                 this.MarkAct();
-                agent->Hide();
+                GameMemory.HideRetainerInventory();
             }
 
             return TaskResult.Running;
@@ -826,42 +773,7 @@ public sealed unsafe class RetainerStockTask : AutoTask
         return TaskResult.Done;
     }
 
-    // ---- 読み取り ----
-
-    /// <summary>
-    /// 開いているリテイナーの持ち物。通常の7ページが読めていなければ null（まだ読み込み中）。
-    /// クリスタルの欄は読み込み済みと報告しないことがあるので、読めた枠だけを数える。
-    /// 収集品・マテリアの付いた品・リンクだけの枠は数えない。
-    /// </summary>
-    private static List<RetainerSlot>? ReadSlots()
-    {
-        var result = new List<RetainerSlot>();
-        var im = InventoryManager.Instance();
-        if (im == null)
-            return null;
-        foreach (var page in Pages)
-        {
-            var c = im->GetInventoryContainer(page);
-            if (c == null || c->Size <= 0)
-            {
-                if (page == InventoryType.RetainerCrystals)
-                    continue;
-                return null;
-            }
-
-            if (!c->IsLoaded && page != InventoryType.RetainerCrystals)
-                return null;
-            for (var i = 0; i < c->Size; i++)
-            {
-                var s = c->GetInventorySlot(i);
-                if (s == null || s->ItemId == 0 || s->Quantity <= 0 || s->IsSymbolic || s->IsCollectable() || s->GetMateriaCount() > 0)
-                    continue;
-                result.Add(new(page, i, s->ItemId, (s->Flags & InventoryItem.ItemFlags.HighQuality) != 0, s->Quantity));
-            }
-        }
-
-        return result;
-    }
+    // ---- 読み取り（リテイナーの持ち物は GameMemory.RetainerSlots）----
 
     /// <summary>
     /// 引き出しの確かめに使う手持ちの数。ギアセットの引き算をしない生の数で数える（引き算をすると、
@@ -999,22 +911,21 @@ public sealed unsafe class RetainerStockTask : AutoTask
             }
 
             // 利用者が別のリテイナーを呼んだら、利用者の操作とみて押さない
-            var manager = RetainerManager.Instance();
-            if (manager != null && manager->LastSelectedRetainerId != 0 && manager->LastSelectedRetainerId != retainer)
+            var last = GameMemory.LastSelectedRetainer;
+            if (last is { } selected && selected != 0 && selected != retainer)
             {
                 Core.DebugLog.Current?.Line("リテイナー", "止めた後に別のリテイナーが呼ばれたので、呼び鈴の後始末をやめました（利用者の操作とみなします）");
                 return true;
             }
 
-            var agent = AgentRetainer.Instance();
-            if (agent != null && agent->IsAgentActive())
+            if (GameMemory.RetainerInventoryActive)
             {
                 // 「アイテムの受け渡し」を押した直後に止めると、持ち物の窓は止めた後に開く。自分が呼んだリテイナーなら1回だけ閉じる
-                if (inventoryMayOpen && !hidInventory && manager != null && manager->LastSelectedRetainerId == retainer && DateTime.UtcNow - started < TimeSpan.FromSeconds(10))
+                if (inventoryMayOpen && !hidInventory && last == retainer && DateTime.UtcNow - started < TimeSpan.FromSeconds(10))
                 {
                     hidInventory = true;
                     lastPress = DateTime.UtcNow;
-                    agent->Hide();
+                    GameMemory.HideRetainerInventory();
                 }
 
                 return false;
@@ -1030,7 +941,7 @@ public sealed unsafe class RetainerStockTask : AutoTask
             if (GameUi.MenuEntries(out var menu) is { } entries)
             {
                 var index = MenuChoice.ByAddonPrefix(entries, prefix);
-                if (retainer == 0 || manager == null || manager->LastSelectedRetainerId != retainer || index < 0)
+                if (retainer == 0 || last != retainer || index < 0)
                     return false;
                 lastPress = DateTime.UtcNow;
                 GameUi.Fire(menu, true, index);
@@ -1055,9 +966,7 @@ public sealed unsafe class RetainerStockTask : AutoTask
     private bool SourceUnchanged()
     {
         var p = this.pending!;
-        var context = AgentInventoryContext.Instance();
-        if (context == null || context->TargetInventoryId != p.Container || context->TargetInventorySlotId != p.Slot
-            || context->OwnerAddonId != AgentRetainer.Instance()->GetAddonId())
+        if (!GameMemory.ContextMenuTargets(p.Container, p.Slot))
             return false;
         return this.SourceStillThere();
     }
@@ -1065,7 +974,7 @@ public sealed unsafe class RetainerStockTask : AutoTask
     private bool SourceStillThere()
     {
         var p = this.pending!;
-        var now = ReadSlots()?.FirstOrDefault(x => x.Container == p.Container && x.Slot == p.Slot);
+        var now = GameMemory.RetainerSlots()?.FirstOrDefault(x => x.Container == p.Container && x.Slot == p.Slot);
         return now != null && now.Item == p.Item && now.Hq == p.Hq && now.Count == this.beforeSource && BagCount(p) == this.beforeBag;
     }
 
@@ -1078,12 +987,11 @@ public sealed unsafe class RetainerStockTask : AutoTask
         {
             // 自分が開いた窓だけを、内側から外側の順に閉じる
             if (this.firedAt != DateTime.MinValue && GameUi.IsReady("InputNumeric", out var numeric) && this.phase is Phase.Numeric or Phase.Verify)
-                numeric->Close(true);
+                GameUi.Close(numeric);
             if (this.phase == Phase.Context && GameUi.IsReady("ContextMenu", out var menu) && this.windows?.WasOpenAtAct("ContextMenu") == false)
-                menu->Close(true);
-            var agent = AgentRetainer.Instance();
-            if (agent != null && agent->IsAgentActive())
-                agent->Hide();
+                GameUi.Close(menu);
+            if (GameMemory.RetainerInventoryActive)
+                GameMemory.HideRetainerInventory();
             if (ctx.Ownership.TryGetOwnedSince("RetainerList", this.bellAt, out var list)
                 || (Svc.Condition[ConditionFlag.OccupiedSummoningBell] && GameUi.IsReady("RetainerList", out list)))
                 GameUi.Fire(list, true, -1);

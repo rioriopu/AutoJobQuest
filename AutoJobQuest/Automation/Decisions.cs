@@ -867,7 +867,7 @@ public static class PurchaseOutcome
 /// <summary>
 /// HQ 指定の品が HQ にならなかった回数を、品目ごとに数える（以前は製作の残り回数の合計だけで
 /// 「進まない周回」を数えていたので、ほかの品が進んでいる間は、同じ品の HQ 失敗の繰り返しが見えなかった）。
-/// 上限は設定の「HQ ができなかったとき何回まで作り直すか」（MaxRetryRounds）。
+/// 上限は設定の「HQ 指定の品が NQ になったとき、止めずに作り直す回数」（HqRetryRounds）＋1（既定は1回目で止める）。
 /// </summary>
 public sealed class HqFailureTally
 {

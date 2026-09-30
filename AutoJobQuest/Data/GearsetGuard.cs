@@ -92,6 +92,8 @@ public static class GearsetGuard
     /// </summary>
     public static bool GearsetEquipped(int gearset)
     {
+        if (Automation.GameMemory.Test is { } test)
+            return test.GearsetEquipped(gearset);
         var equipped = EquippedCounts();
         var owned = Inventory.Snapshot(subtractGearsets: false);
         return AllEquipped(Read().Where(p => p.Gearset == gearset).Select(p => (p.ItemId, p.Hq)),

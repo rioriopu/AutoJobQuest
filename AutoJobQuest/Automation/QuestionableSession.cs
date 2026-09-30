@@ -851,8 +851,7 @@ public sealed unsafe class QuestionableStarter
     {
         fail = null;
         status = string.Empty;
-        var qm = QuestManager.Instance();
-        var accepted = qm != null && qm->IsQuestAccepted(this.questRowId);
+        var accepted = GameMemory.QuestAccepted(this.questRowId) == true;
 
         // 1) 受けられる職に着替える。受注済みでも合わせる（クラス・ジョブのクエストは受注した職でしか進まない。
         //    以前は受注前だけ着替えたので、止めて再開すると素材集め・製作で職が変わったまま頼み、Questionable の採集の手順が例外で止まった）
@@ -973,8 +972,7 @@ public sealed unsafe class QuestionableStarter
         }
 
         // 上限でも受注済みのクエストは進められる。
-        var journal = QuestManager.Instance();
-        if (!accepted && journal != null && journal->NumAcceptedQuests >= journal->NormalQuests.Length)
+        if (!accepted && GameMemory.JournalFull)
         {
             fail = $"「{this.label}」を新しく受注する空きがありません。ジャーナルの空きを作って再開してください";
             return TaskResult.Failed;
