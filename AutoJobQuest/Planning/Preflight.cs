@@ -58,6 +58,17 @@ public static class Preflight
                + (lines.Count > max ? $"\n・ほか {lines.Count - max} 品目（計画タブにすべて出ています）" : string.Empty);
     }
 
+    /// <summary>
+    /// Questionable の設定にプロファイル（キャラクターごとの設定）が本当にあるか。
+    /// 設定ファイルの辞書には型の情報（"$type"）が必ず入るので、それだけなら無いとみる（以前は中身が空なのに注意が出ていた）。
+    /// </summary>
+    public static bool HasQuestionableProfiles(JsonElement root)
+    {
+        static bool Any(JsonElement root, string name)
+            => root.TryGetProperty(name, out var e) && e.ValueKind == JsonValueKind.Object && e.EnumerateObject().Any(x => x.Name != "$type");
+        return Any(root, "Profiles") || Any(root, "CharacterProfiles");
+    }
+
     /// <summary>必須プラグイン（InternalName, 表示名, 用途）。</summary>
     public static readonly (string Internal, string Display, string Why)[] RequiredPlugins =
     [
@@ -470,9 +481,7 @@ public static class Preflight
             if (root.TryGetProperty("General", out var gen) && gen.TryGetProperty("ConfigureTextAdvance", out var ta) && ta.ValueKind == JsonValueKind.False)
                 yield return new PreflightItem(Severity.Warn, "Questionable の「TextAdvance を設定する」が OFF です。前提のクエストの会話送り・受注・完了が、TextAdvance 本体の設定のまま動きます");
 
-            var profiles = (root.TryGetProperty("Profiles", out var pf) && pf.ValueKind == JsonValueKind.Object && pf.EnumerateObject().Any())
-                           || (root.TryGetProperty("CharacterProfiles", out var cp) && cp.ValueKind == JsonValueKind.Object && cp.EnumerateObject().Any());
-            if (profiles)
+            if (HasQuestionableProfiles(root))
                 yield return new PreflightItem(Severity.Warn, "Questionable にキャラクターごとの設定（プロファイル）があります。ここで確かめたのは基本の設定なので、プロファイルの値が違えばそちらが使われます");
         }
 
