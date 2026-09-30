@@ -31,6 +31,7 @@ public sealed class ConfirmService
             this.Title = title;
             this.Question = question;
             this.Answer = null;
+            DebugLog.Current?.Block("確認", $"確認窓を出しました（{this.serial}）：{title}", question);
             return this.serial;
         }
     }
@@ -50,6 +51,7 @@ public sealed class ConfirmService
             if (this.Question == null)
                 return;
             this.Answer = yes;
+            DebugLog.Current?.Line("確認", $"確認窓（{this.serial}）「{this.Title}」に「{(yes ? "はい" : "いいえ")}」が選ばれました");
             this.Question = null;
         }
     }

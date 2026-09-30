@@ -98,6 +98,12 @@ public sealed class Configuration
     public int HqRetryRounds { get; set; }
 
     /// <summary>
+    /// 手で行う手順で、刺突漁でしか取れない魚（魚影の魚：漁師 Lv68 の大方士）を集めるとき、GBR と AutoHook で自動で集めるか
+    /// （既定 true）。false なら、手で行うよう知らせて待つ。
+    /// </summary>
+    public bool AutoSpearfish { get; set; } = true;
+
+    /// <summary>
     /// 受注後に作る品（Lv61〜70 の32品。材料はクエストがくれて、何度でももらい直せる）が HQ にならなかったとき、何回まで作り直すか（既定10）。
     /// 失うのは1回ごとのクリスタルだけなので、ほかの製作の上限（<see cref="MaxRetryRounds"/>）とは分ける。クリスタルの予備も、この回数分を先に用意する。
     /// </summary>

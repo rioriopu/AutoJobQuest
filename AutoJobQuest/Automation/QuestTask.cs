@@ -85,6 +85,14 @@ public sealed unsafe class QuestTask : AutoTask
     private TimeSpan manualWaitTotal;
     private bool manualWaitNotified;
 
+    // 手で行う手順の刺突漁を、こちらが自動で行っている（漁師 Lv68 の大方士）。その時間も上限に数えない
+    private SpearfishTask? spearfish;
+    private bool spearfishTried;
+    private DateTime? spearfishSince;
+    private TimeSpan spearfishTotal;
+    private int instructionSeq;
+    private int instructionStep;
+
     /// <summary>手で行う手順を待つ上限。</summary>
     private static readonly TimeSpan ManualWaitLimit = TimeSpan.FromMinutes(60);
 
@@ -232,8 +240,9 @@ public sealed unsafe class QuestTask : AutoTask
         // 上限：採集・釣りの手順があるクエストは長くする（時間限定の採集点で最長 ET10時間＝約29分待つ）。
         // 手で行う手順を待った時間は数えない
         var waited = this.manualWaitTotal + (this.manualWaitSince is { } ws ? DateTime.UtcNow - ws : TimeSpan.Zero);
+        var spearWaited = this.spearfishTotal + (this.spearfishSince is { } ss ? DateTime.UtcNow - ss : TimeSpan.Zero);
         var limit = TimeSpan.FromMinutes(this.paths?.Any(s => s.Type is "Gather" or "Fish") == true ? 90 : 30);
-        if (this.Elapsed - waited > limit)
+        if (this.Elapsed - waited - spearWaited > limit)
             return this.Fail($"{limit.TotalMinutes:0}分たってもクエストが完了しません");
         if (waited > ManualWaitLimit)
             return this.Fail($"手で行う手順を {ManualWaitLimit.TotalMinutes:0} 分待っても進みませんでした。手順を終えてから再開してください");
@@ -244,6 +253,9 @@ public sealed unsafe class QuestTask : AutoTask
 
         if ((this.own != null || this.manualTurnIn || this.questCraft != null) && !ctx.TextAdvance.EnsureTurnInControl())
             return this.Fail($"TextAdvance の操作権を確保できないため、自前の会話・納品を止めました（{ctx.TextAdvance.LossReason ?? "理由を読めません"}）。操作権が空いてから再開してください");
+
+        if (this.spearfish != null)
+            return this.RunSpearfish(ctx);
 
         if (this.own != null)
             return this.RunOwnSteps(ctx);
@@ -313,6 +325,26 @@ public sealed unsafe class QuestTask : AutoTask
                 var handIn = this.paths?.Where(s => s.Sequence == stepData.Sequence && s.Index > stepData.Step && s.Type is "Interact" or "CompleteQuest")
                     .Select(s => s.DataId).FirstOrDefault(d => d != null);
                 var wanted = QuestTakeOver.InstructionItems(this.quest, stepData.Sequence);
+
+                // 刺突漁でしか取れない品（魚影の魚）なら、自動で刺突漁を行う（設定で切れる。1つのクエストで1回だけ試す）
+                var instructionStepData = this.paths?.FirstOrDefault(s => s.Sequence == stepData.Sequence && s.Index == stepData.Step && s.Type == "Instruction");
+                if (!this.spearfishTried && ctx.Config.AutoSpearfish && instructionStepData != null && GameUi.PlayerFree()
+                    && SpearfishTask.Want(wanted, id => Inventory.CountNow(id), ctx.Data.Sources) is { } spear)
+                {
+                    this.spearfishTried = true;
+                    ctx.Questionable.Stop(Plugin.InternalNameConst);
+                    this.instructionSeq = stepData.Sequence;
+                    this.instructionStep = stepData.Step;
+                    this.manualWaitTotal += DateTime.UtcNow - this.manualWaitSince.Value;
+                    this.manualWaitSince = null;
+                    this.spearfishSince = DateTime.UtcNow;
+                    this.spearfish = new SpearfishTask(this.quest, spear.ItemId, spear.Count, instructionStepData);
+                    ctx.Log.Write("クエスト", $"{Jobs.Name(this.quest.ClassJobId)} {this.quest} の手で行う手順（段 {stepData.Sequence}）の {CraftPlanner.ItemName(spear.ItemId)}×{spear.Count} は刺突漁でしか取れないので、"
+                                         + "Questionable を止めて、GBR と AutoHook で自動で集めます（そろったら、渡すところからこちらで続けます）");
+                    this.NextPhase("刺突漁を自動で行います");
+                    return TaskResult.Running;
+                }
+
                 if (!this.manualWaitNotified)
                 {
                     this.manualWaitNotified = true;
@@ -577,6 +609,45 @@ public sealed unsafe class QuestTask : AutoTask
     }
 
     /// <summary>受注後の品の製作（QuestCraftTask）を進める。終われば Questionable に戻す（製作手順は、作った品を見て飛ばす）。</summary>
+    /// <summary>
+    /// 自動の刺突漁を進める。そろったら、手で行う手順の後（渡すところ）からこちらで行う。
+    /// 集めきれなかったら、理由を出して手で行う形に戻す（Questionable に頼み直すと、手で行う手順で待つ）。
+    /// </summary>
+    private TaskResult RunSpearfish(TaskContext ctx)
+    {
+        var r = this.spearfish!.Step(ctx);
+        this.Status = this.spearfish.Status;
+        if (r == TaskResult.Running)
+            return TaskResult.Running;
+        this.spearfish.Cleanup(ctx);
+        var failed = r == TaskResult.Failed ? this.spearfish.FailReason : null;
+        this.spearfish = null;
+        if (this.spearfishSince is { } since)
+            this.spearfishTotal += DateTime.UtcNow - since;
+        this.spearfishSince = null;
+
+        var wanted = QuestTakeOver.InstructionItems(this.quest, this.instructionSeq);
+        var inv = Inventory.Snapshot();
+        var ready = wanted.Count > 0 && wanted.All(w => (w.Hq ? inv.CountHq(w.ItemId) : inv.CountAll(w.ItemId)) >= w.Count);
+        if (ready && this.paths != null
+            && QuestTakeOver.AfterInstruction(this.paths, this.instructionSeq, this.instructionStep, "Instruction", true) is { } rest)
+        {
+            this.own = new Queue<QuestionableStep>(rest);
+            this.ownFromSeq = this.instructionSeq;
+            ctx.Log.Write("クエスト", $"刺突漁で品がそろったので、段 {this.instructionSeq} の残り（{string.Join("→", rest.Select(x => $"{x.Type}（{NpcStepTask.NpcName(x.DataId)}）"))}）をこちらで行います");
+            this.NextPhase("刺突漁の後をこちらで行います");
+            return TaskResult.Running;
+        }
+
+        var msg = $"{Jobs.Name(this.quest.ClassJobId)} {this.quest} の刺突漁を自動では集めきれませんでした（{failed ?? "品がそろいません"}）。"
+                  + "Questionable の画面の手順を手で行ってください。品がそろったら、渡すところからこちらで続けます";
+        ctx.Log.Warn("クエスト", msg);
+        Svc.Chat.Print($"[AutoJobQuest] {msg}");
+        this.manualWaitNotified = true; // 手で行う知らせは上で出した
+        this.started = false;           // Questionable に頼み直す（手で行う手順で待つ）
+        return TaskResult.Running;
+    }
+
     private TaskResult RunQuestCraft(TaskContext ctx)
     {
         var r = this.questCraft!.Step(ctx);
@@ -777,6 +848,8 @@ public sealed unsafe class QuestTask : AutoTask
             Svc.Chat.Print($"[AutoJobQuest] {msg}");
         }
         this.questCraft?.Cleanup(ctx);
+        this.spearfish?.Cleanup(ctx);
+        this.spearfish = null;
         this.questCraft = null;
 
         // 自分が始めた進行（または別のクエストへ移ったのを見た進行）がまだ動いていれば止め、Questionable の優先リストを元に戻す

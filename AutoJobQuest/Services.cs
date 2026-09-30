@@ -28,6 +28,7 @@ public sealed class Services : IDisposable
     public DebugLog Debug { get; }
 
     private readonly Automation.AddonRecorder addonRecorder;
+    private readonly Automation.ChatRecorder chatRecorder;
 
     /// <summary>Artisan の見張りの長さ（止めたとき：CraftOneTask.Cleanup と同じ）。</summary>
     private static readonly TimeSpan ArtisanWatchLength = TimeSpan.FromSeconds(30);
@@ -126,6 +127,9 @@ public sealed class Services : IDisposable
         };
 
         this.addonRecorder = new Automation.AddonRecorder(() => this.Runner.IsRunning || this.Config.AlwaysRecordAddons);
+
+        // 実行の間のチャットとゲームの記録も残す（デバッグのため詳しい記録を残す）
+        this.chatRecorder = new Automation.ChatRecorder(() => this.Runner.IsRunning || this.Config.AlwaysRecordAddons);
     }
 
     /// <summary>
@@ -508,6 +512,7 @@ public sealed class Services : IDisposable
         // 停止要求の共有データ（YesAlready）は自分の要求を外して手放す（残すと相手が止まったままになる）。
         // 1つが例外で落ちても、残りの解除（フック・登録の外し忘れ）を必ず行う
         this.Safe("画面の記録", this.addonRecorder.Dispose);
+        this.Safe("チャットの記録", this.chatRecorder.Dispose);
 
         // 自分が取った TextAdvance の外部制御だけは手放す（残すと TextAdvance が利用者の設定を無視し続け、
         // Questionable も制御を取りに行けない）。自分が取っていなければ何もしない。

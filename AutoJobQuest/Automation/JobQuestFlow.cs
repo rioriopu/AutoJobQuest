@@ -362,6 +362,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         ctx.Log.Write("計画", $"残りのジョブクエ {plan.RemainingQuests.Count} 本／製作 {plan.Craft.Crafts.Sum(c => c.Crafts)} 回／足りない素材 {plan.Shortfalls.Count()} 品目");
         foreach (var w in plan.Warnings)
             ctx.Log.Warn("計画", w);
+        DebugLog.Current?.Block("計画", "計画の詳しい中身（事前点検の時点）", PlanDetail(plan));
 
         if (PreflightSession.PlanKey(plan) != PreflightSession.PlanKey(this.Plan(ctx)))
             return this.Fail("HQ 計算中に在庫・クエストの計画が変わりました。もう一度開始して点検し直してください");
@@ -495,6 +496,38 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         Unlocks.UnlockStagePassed = false;
         this.stage = Stage.Retainers;
         return TaskResult.Running;
+    }
+
+    /// <summary>
+    /// 計画の詳しい中身（記録用。しばらくはデバッグのため詳しい記録を残す）：
+    /// 残りのジョブクエ・進められないもの・製作職の状態（作れる職の判定の材料）・作る品（職・レシピのレベル）・作らずに買う品・集める素材と手段。
+    /// </summary>
+    public static string PlanDetail(JobQuestPlan plan)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"残りのジョブクエ（{plan.RemainingQuests.Count} 本）：{string.Join("、", plan.RemainingQuests.Select(q => $"{Jobs.Name(q.ClassJobId)} {q}"))}");
+        foreach (var b in plan.Blocked)
+            sb.AppendLine($"進められない：{Jobs.Name(b.Quest.ClassJobId)} {b.Quest}（{b.Kind}・{b.Reason}）");
+        foreach (var job in Jobs.Crafters)
+        {
+            var gearset = GearCheck.FindGearset(job);
+            var low = gearset >= 0 ? GearCheck.LowGearsetSlots(job) : null;
+            sb.AppendLine($"製作職：{Jobs.Name(job)} Lv{Jobs.Level(job)}・ギアセット {(gearset >= 0 ? (gearset + 1).ToString() : "無し")}"
+                          + (low is { Count: > 0 } ? $"・Lv{GearCheck.RequiredEquipLevel} 未満の欄 {string.Join("・", low)}" : string.Empty));
+        }
+
+        foreach (var c in plan.Craft.Crafts)
+            sb.AppendLine($"作る：{CraftPlanner.ItemName(c.ItemId)}×{c.Crafts}回（{Jobs.Name(c.ClassJobId)}・レシピ Lv{c.RecipeLevel}"
+                          + $"{(c.WantHq ? "・HQ" : string.Empty)}{(c.Reserve ? "・取り置き" : string.Empty)}{(c.SecretRecipeBookId != 0 ? $"・秘伝書 {c.SecretRecipeBookId}" : string.Empty)}）");
+        foreach (var (item, why) in plan.Craft.NotCraftable)
+            sb.AppendLine($"作らずに買う：{CraftPlanner.ItemName(item)}（{why}）");
+        foreach (var r in plan.Raw)
+            sb.AppendLine($"素材：{CraftPlanner.ItemName(r.ItemId)} 要る {r.Total}・足りない {r.Shortfall}・手段 {Ui.MainWindow.RouteName(r.Route)}"
+                          + (r.Fallbacks.Count > 0 ? $"（次に {string.Join("→", r.Fallbacks.Select(Ui.MainWindow.RouteName))}）" : string.Empty));
+        foreach (var m in plan.Materia)
+            sb.AppendLine($"マテリア：{CraftPlanner.ItemName(m.TargetItemId)} に {(m.MateriaItemId is { } mid ? CraftPlanner.ItemName(mid) : "任意のマテリア")}"
+                          + $"{(m.AlreadyMelded ? "（装着済み）" : string.Empty)}");
+        return sb.ToString();
     }
 
     // ------------------------------------------------------------------

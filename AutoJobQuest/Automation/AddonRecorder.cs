@@ -32,6 +32,9 @@ public sealed unsafe class AddonRecorder : IDisposable
         "MateriaAttach", "MateriaAttachDialog",
         "RecipeNote", "Synthesis", "SynthesisSimple",
         "Gathering", "GatheringMasterpiece", "PurifyItemSelector", "PurifyResult",
+
+        // 刺突漁・呼び鈴の窓（詳しい記録を残す）
+        "SpearFishing", "RetainerList", "InventoryRetainer", "InventoryRetainerLarge", "ContextMenu",
     ];
 
     private readonly Func<bool> shouldRecord;

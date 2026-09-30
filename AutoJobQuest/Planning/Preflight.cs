@@ -125,6 +125,27 @@ public static class Preflight
                     : new PreflightItem(Severity.Error, $"{display} が読み込まれていません（{why}に使います）"));
         }
 
+        // 手で行う手順の刺突漁（漁師 Lv68 の大方士）を自動で行うときの前提。
+        // 満たさなくても開始は止めない（そこで手で行うよう知らせて待つ）ので、注意にする
+        if (plan != null && ctx.Config.AutoSpearfish)
+        {
+            foreach (var (q, step, item) in SpearfishQuests(plan.RemainingQuests, QuestionablePaths.Steps, ctx.Data.Sources))
+            {
+                var why = new List<string>();
+                if (Automation.GameMemory.AetherCurrentsComplete(step.Territory) == false)
+                    why.Add($"「{AreaAccess.Name(step.Territory)}」の風脈がすべて開放されていない（漁場が水中で、GBR は飛べるエリアでだけ潜る）");
+                if (!ctx.AutoHook.IsLoaded)
+                    why.Add("AutoHook が読み込まれていない");
+                if (GatherAbilities.Usable(GatherAbilities.Gig) == false)
+                    why.Add($"刺突漁が使えない（{GatherAbilities.Requirement(GatherAbilities.Gig)}）");
+                list.Add(why.Count == 0
+                    ? new PreflightItem(Severity.Ok, $"{Jobs.Name(q.ClassJobId)} {q} の手で行う手順の {CraftPlanner.ItemName(item)} は、GBR と AutoHook で自動で刺突漁をします"
+                                                     + "（AutoHook に刺突漁のプリセットを1つ残します）")
+                    : new PreflightItem(Severity.Warn, $"{Jobs.Name(q.ClassJobId)} {q} の手で行う手順の {CraftPlanner.ItemName(item)} は、自動の刺突漁ができません"
+                                                       + $"（{string.Join("・", why)}）。そこで手で行うよう知らせて待ちます"));
+            }
+        }
+
         // GBR の NPC 購入は Allagan Tools か Allagan Item Search が要る
         if (!installed.Any(x => x.IsLoaded && x.InternalName is "InventoryTools" or "AllaganItemSearch"))
             list.Add(new PreflightItem(Severity.Warn, "Allagan Tools（または Allagan Item Search）が無いため、GBR の NPC 購入が使えません。NPC で買える素材は別の手段で集めます"));
@@ -575,6 +596,29 @@ public static class Preflight
     }
 
     /// <summary>経路に Questionable の釣りの手順があるクエスト（AutoHook が要る）。</summary>
+    /// <summary>
+    /// 手で行う手順（Instruction）で、刺突漁でしか取れない品をそろえるジョブクエ（クエスト・その手順・品）。自動の刺突漁の対象。
+    /// </summary>
+    public static List<(JobQuest Quest, QuestionableStep Step, uint Item)> SpearfishQuests(IEnumerable<JobQuest> quests, Func<ushort, IReadOnlyList<QuestionableStep>?> steps, SourceIndex? sources)
+    {
+        var list = new List<(JobQuest, QuestionableStep, uint)>();
+        if (sources == null)
+            return list;
+        foreach (var q in quests)
+        {
+            foreach (var st in steps(q.ShortId)?.Where(s => s.Type == "Instruction") ?? [])
+            {
+                var item = Automation.QuestTakeOver.InstructionItems(q, st.Sequence)
+                    .Select(w => w.ItemId)
+                    .FirstOrDefault(i => sources.Get(i) is { Spearfish: true, Fish: false });
+                if (item != 0)
+                    list.Add((q, st, item));
+            }
+        }
+
+        return list;
+    }
+
     public static List<JobQuest> QuestsWithFishing(IEnumerable<JobQuest> quests, Func<ushort, IReadOnlyList<QuestionableStep>?> steps)
         => quests.Where(q => steps(q.ShortId)?.Any(s => s.Type == "Fish") == true).ToList();
 

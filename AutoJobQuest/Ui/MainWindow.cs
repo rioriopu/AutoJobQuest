@@ -735,6 +735,16 @@ public sealed class MainWindow : Window
             ImGui.TextColored(Grey, "既定は ON。中間素材のレシピのレベルに届く職がいれば、素材を集めて作ります。届く職がいない・ギアセットが無い"
                                     + "（ON なら装備も足りない）ときは、作らずにマーケットボードで買います。選んだ職の装備は、この設定にかかわらず開始の条件です");
 
+            var spear = this.config.AutoSpearfish;
+            if (ImGui.Checkbox("漁師 Lv68 の刺突漁（魚影の大方士）を、GBR と AutoHook で自動で行う", ref spear))
+            {
+                this.config.AutoSpearfish = spear;
+                this.config.Save();
+            }
+
+            ImGui.TextColored(Grey, "既定は ON。ヤンサの風脈がすべて開放済みで、刺突漁が使えるときに動きます。AutoHook に刺突漁のプリセットを1つ残します"
+                                    + "（消す手段が無いため）。集めきれなければ、手で行うよう知らせて待ちます");
+
             var consumables = this.config.UseArtisanConsumables;
             if (ImGui.Checkbox("ジョブクエの製作で Artisan の既定の食事・薬を使う", ref consumables))
             {

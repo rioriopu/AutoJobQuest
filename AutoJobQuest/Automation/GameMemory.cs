@@ -1,5 +1,8 @@
 using System.Collections.Generic;
+using System.Linq;
 using FFXIVClientStructs.FFXIV.Client.Game;
+using FFXIVClientStructs.FFXIV.Client.Game.UI;
+using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using FFXIVClientStructs.FFXIV.Component.GUI;
@@ -57,6 +60,14 @@ public interface IGameMemoryTest
     List<string> ContextMenuLabels();
 
     bool ContextMenuItemDisabled(int index);
+
+    List<(int Size, int Speed, bool Inverse)>? SpearfishingFish();
+
+    uint TargetBaseId { get; }
+
+    bool? AetherCurrentsComplete(uint territory);
+
+    bool HasStatus(uint statusId);
 }
 
 /// <summary>
@@ -294,4 +305,44 @@ public static unsafe class GameMemory
     /// <summary>右クリックのメニューのその項目が選べない状態か。</summary>
     public static bool ContextMenuItemDisabled(int index)
         => Test is { } t ? t.ContextMenuItemDisabled(index) : AgentInventoryContext.Instance()->IsContextItemDisabled(index);
+
+    // ---- 刺突漁 ----
+
+    /// <summary>
+    /// 刺突の画面に出ている魚（大きさ・速さ・向き。下の段から）。画面が開いていなければ null。
+    /// 値はゲームの画面の値（ClientStructs の AddonSpearFishing.FishInfo：大きさ 1〜3、速さ 100〜600 の50刻み）。
+    /// </summary>
+    public static List<(int Size, int Speed, bool Inverse)>? SpearfishingFish()
+    {
+        if (Test is { } t)
+            return t.SpearfishingFish();
+        var addon = (AddonSpearFishing*)GameUi.Addon("SpearFishing");
+        if (addon == null)
+            return null;
+        var list = new List<(int, int, bool)>();
+        foreach (var f in addon->Fish)
+            if (f.Available)
+                list.Add(((int)f.Size, f.Speed, f.InverseDirection));
+        return list;
+    }
+
+    /// <summary>いまターゲットしている物の BaseId（採集点なら GatheringPoint の行）。無ければ 0。</summary>
+    public static uint TargetBaseId => Test is { } t ? t.TargetBaseId : Svc.Targets.Target?.BaseId ?? 0;
+
+    /// <summary>
+    /// そのエリアの風脈がすべて開放済みか（飛べる・潜れる。GBR の ShouldFly と同じ判定）。風脈の無いエリア・読めなければ null。
+    /// </summary>
+    public static bool? AetherCurrentsComplete(uint territory)
+    {
+        if (Test is { } t)
+            return t.AetherCurrentsComplete(territory);
+        if (!Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.TerritoryType>().TryGetRow(territory, out var row) || row.AetherCurrentCompFlgSet.RowId == 0)
+            return null;
+        var ps = PlayerState.Instance();
+        return ps == null ? null : ps->IsAetherCurrentZoneComplete(row.AetherCurrentCompFlgSet.RowId);
+    }
+
+    /// <summary>自分にその状態（Status の行）が付いているか。</summary>
+    public static bool HasStatus(uint statusId)
+        => Test is { } t ? t.HasStatus(statusId) : Svc.Objects.LocalPlayer?.StatusList.Any(s => s.StatusId == statusId) == true;
 }

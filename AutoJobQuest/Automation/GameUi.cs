@@ -471,6 +471,14 @@ public static unsafe class GameUi
     /// <summary>行動の後の硬直中か（ActionManager.AnimationLock が 0 より大きい。ECommons の Player.IsAnimationLocked と同じ）。</summary>
     public static bool AnimationLocked => ActionManager.Instance()->AnimationLock > 0;
 
+    /// <summary>行動（Action シート）を使う（自分に使う行動。刺突漁のファゾムなど）。</summary>
+    public static bool UseAction(uint id)
+    {
+        var ok = ActionManager.Instance()->UseAction(ActionType.Action, id);
+        Core.DebugLog.Current?.Line("操作", $"行動 {id} を使用 → {(ok ? "受け付け" : "拒否")}");
+        return ok;
+    }
+
     /// <summary>一般アクション（GeneralAction）を使う。</summary>
 
     public static bool UseGeneralAction(uint id)
