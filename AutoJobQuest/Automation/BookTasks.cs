@@ -23,6 +23,7 @@ public sealed class RunQuestTask : AutoTask
     private readonly string label;
     private bool started;
     private int restarts;
+    private DateTime restartNotBefore = DateTime.MinValue;
     private int notRunningFrames;
 
     // 頼むまでの準備（受注できる職への着替え・Questionable が止まるのを待つ・受注できるかの確かめ・優先リスト）と進行中の見張り。
@@ -63,13 +64,24 @@ public sealed class RunQuestTask : AutoTask
         if (this.starter.Watch(ctx) is { } watchFail)
             return this.Fail(watchFail);
 
-        // QuestTask と同じ：続けて3回 false を見たら止まったとみなす（時間ではなく状態で判断）
+        // QuestTask と同じ：続けて3回 false を見たら止まったとみなす（時間ではなく状態で判断）。
+        // 止まっていたら何度でも動かし直す（QuestionableKeepAlive。以前は3回やり直したら全体を止めていた）
         if (ctx.Questionable.IsRunning() == false)
         {
             if (++this.notRunningFrames >= 3)
             {
-                if (this.restarts++ >= 3)
-                    return this.Fail("Questionable が途中で止まりました");
+                if (DateTime.UtcNow < this.restartNotBefore)
+                {
+                    this.Status = $"Questionable が止まっています（{(this.restartNotBefore - DateTime.UtcNow).TotalSeconds:0} 秒後にもう一度動かします）";
+                    return TaskResult.Running;
+                }
+
+                this.restarts++;
+                this.restartNotBefore = DateTime.UtcNow + QuestionableKeepAlive.WaitAfter(this.restarts);
+                var msg = $"Questionable が止まっていたので、もう一度動かします（{this.restarts} 回目）";
+                ctx.Log.Warn("クエスト", msg);
+                if (QuestionableKeepAlive.Notify(this.restarts))
+                    Svc.Chat.Print($"[AutoJobQuest] {msg}");
                 this.started = false;
                 this.notRunningFrames = 0;
             }

@@ -1294,6 +1294,34 @@ public static class QuestPurchaseConfirm
 }
 
 /// <summary>
+/// Questionable の見張り（このプラグインが ON の間は Questionable を OFF のままにしない。勝手に OFF になったら ON に戻す）。
+/// クエストの作業中（こちらが自分で作業している間を除く）に Questionable が止まっていたら、何度でも動かし直す（以前は3回やり直したら全体を止めていた）。
+/// すぐ止まる状況で頼み続けないよう、動かし直すたびに間を空ける（すぐ → 5秒 → 10秒 → 20秒 → 40秒 → 以降1分おき）。
+/// 上限はクエスト全体の時間の上限（30分・釣りや採集のあるクエストは90分）だけ。
+/// 実機の記録では、Questionable がクエストの途中で自分から止まったことは無く、止まったのは完了のとき（1本ずつ頼むので正しい動き）と、
+/// こちらが止めたとき（停止ボタン・失敗の後片付け・こちらで行う作業の前）だけだった。
+/// </summary>
+public static class QuestionableKeepAlive
+{
+    /// <summary>間の単位（既定5秒。検証の仕組みでは短くする）。</summary>
+    public static TimeSpan Unit { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>n 回目（1 から）に動かし直した後、次に動かし直してよいまでの間。</summary>
+    public static TimeSpan WaitAfter(int restarts) => restarts switch
+    {
+        <= 0 => TimeSpan.Zero,
+        1 => Unit,
+        2 => Unit * 2,
+        3 => Unit * 4,
+        4 => Unit * 8,
+        _ => Unit * 12,
+    };
+
+    /// <summary>チャットにも知らせる回（1回目と5回ごと。毎回だとチャットが埋まる）。</summary>
+    public static bool Notify(int restarts) => restarts == 1 || (restarts > 0 && restarts % 5 == 0);
+}
+
+/// <summary>
 /// クエストの完了の直後の後片付けの判断（NpcLeftovers の説明）。
 /// 完了の後、NPC が続けて出す窓を閉じ、動ける状態がしばらく続いたら（NPC の会話が終わったとみなして）終える。
 /// </summary>

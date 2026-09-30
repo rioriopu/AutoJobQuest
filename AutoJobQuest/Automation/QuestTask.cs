@@ -39,6 +39,13 @@ public sealed unsafe class QuestTask : AutoTask
     private int restarts;
     private int notRunningFrames;
 
+    // Questionable の見張り：次に動かし直してよい時刻・最後に見た手順（止まったときの記録用）
+    private DateTime restartNotBefore = DateTime.MinValue;
+    private string lastStepText = "不明";
+
+    /// <summary>こちらが自分で作業する間の状態の表示に付ける言葉（Questionable が止まっている理由を見えるようにする）。</summary>
+    public const string OwnWorkNote = "（こちらで行う間は Questionable を止めています。終われば動かし直します）";
+
     // 報告を自前で行うとき
     private bool manualTurnIn;
     private MoveToTask? moving;
@@ -275,7 +282,8 @@ public sealed unsafe class QuestTask : AutoTask
         var craftWaited = this.questCraftTotal + (this.questCraftSince is { } cs ? DateTime.UtcNow - cs : TimeSpan.Zero);
         var limit = TimeSpan.FromMinutes(this.paths?.Any(s => s.Type is "Gather" or "Fish") == true ? 90 : 30);
         if (this.Elapsed - waited - spearWaited - craftWaited - this.weatherBuyTotal > limit)
-            return this.Fail($"{limit.TotalMinutes:0}分たってもクエストが完了しません");
+            return this.Fail($"{limit.TotalMinutes:0}分たってもクエストが完了しません"
+                             + (this.restarts > 0 ? $"（その間に Questionable を {this.restarts} 回動かし直しました。最後の手順 {this.lastStepText}）" : string.Empty));
         if (waited > ManualWaitLimit)
             return this.Fail($"手で行う手順を {ManualWaitLimit.TotalMinutes:0} 分待っても進みませんでした。手順を終えてから再開してください");
 
@@ -344,6 +352,7 @@ public sealed unsafe class QuestTask : AutoTask
         if (stepData != null && stepData.QuestId == QuestionableIpc.ToQuestId(this.quest.RowId))
         {
             this.Status = $"Questionable: 手順 {stepData.Sequence}-{stepData.Step} {stepData.InteractionType}";
+            this.lastStepText = $"{stepData.Sequence}-{stepData.Step} {stepData.InteractionType}";
 
             // Questionable が推奨装備に着替える手順（園芸師のジョブクエ17本）。完了したら、その職のギアセットに着直す
             if (stepData.InteractionType == "EquipRecommended" && !this.gearChangedByQuestionable)
@@ -501,15 +510,24 @@ public sealed unsafe class QuestTask : AutoTask
         // Questionable の IsRunning は「単体クエストの進行中（SingleQuestA/B）なら true」で、止まるか終わると false になる
         // （QuestionableIpc.cs:142）。クエストの完了は上で先に見ているので、false が続けば止まったとみなす。
         // 1フレームのずれを避けるため、続けて3回 false を見てから判断する（時間ではなく状態で判断する）
+        // 止まっていたら、何度でも動かし直す（QuestionableKeepAlive。以前は3回やり直したら全体を止めていた）
         var running = ctx.Questionable.IsRunning();
         if (running == false)
         {
             if (++this.notRunningFrames >= 3)
             {
-                if (this.restarts++ >= 3)
-                    return this.Fail("Questionable が途中で止まりました（3回やり直しても進みません）。Questionable の画面と /xllog の記録で、止まった理由を確かめてください");
+                if (DateTime.UtcNow < this.restartNotBefore)
+                {
+                    this.Status = $"Questionable が止まっています（{(this.restartNotBefore - DateTime.UtcNow).TotalSeconds:0} 秒後にもう一度動かします）";
+                    return TaskResult.Running;
+                }
 
-                ctx.Log.Warn("クエスト", "Questionable が止まったので、もう一度始めます");
+                this.restarts++;
+                this.restartNotBefore = DateTime.UtcNow + QuestionableKeepAlive.WaitAfter(this.restarts);
+                var msg = $"Questionable が止まっていたので、もう一度動かします（{this.restarts} 回目・止まったときの手順 {this.lastStepText}）";
+                ctx.Log.Warn("クエスト", msg);
+                if (QuestionableKeepAlive.Notify(this.restarts))
+                    Svc.Chat.Print($"[AutoJobQuest] {msg}");
                 this.started = false;
                 this.notRunningFrames = 0;
             }
@@ -724,7 +742,7 @@ public sealed unsafe class QuestTask : AutoTask
     private TaskResult RunWeatherBuy(TaskContext ctx)
     {
         var r = this.weatherBuy!.Step(ctx);
-        this.Status = this.weatherBuy.Status;
+        this.Status = this.weatherBuy.Status + OwnWorkNote;
         if (r == TaskResult.Running)
             return TaskResult.Running;
         var failed = r == TaskResult.Failed ? this.weatherBuy.FailReason : null;
@@ -1136,7 +1154,7 @@ public sealed unsafe class QuestTask : AutoTask
     private TaskResult RunSpearfish(TaskContext ctx)
     {
         var r = this.spearfish!.Step(ctx);
-        this.Status = this.spearfish.Status;
+        this.Status = this.spearfish.Status + OwnWorkNote;
         if (r == TaskResult.Running)
             return TaskResult.Running;
         this.spearfish.Cleanup(ctx);
@@ -1171,7 +1189,7 @@ public sealed unsafe class QuestTask : AutoTask
     private TaskResult RunQuestCraft(TaskContext ctx)
     {
         var r = this.questCraft!.Step(ctx);
-        this.Status = this.questCraft.Status;
+        this.Status = this.questCraft.Status + OwnWorkNote;
         if (r == TaskResult.Running)
             return TaskResult.Running;
         var failed = r == TaskResult.Failed ? this.questCraft.FailReason : null;
@@ -1198,7 +1216,7 @@ public sealed unsafe class QuestTask : AutoTask
         if (this.ownTask != null)
         {
             var r = this.ownTask.Step(ctx);
-            this.Status = this.ownTask.Status;
+            this.Status = this.ownTask.Status + OwnWorkNote;
             if (r == TaskResult.Running)
                 return TaskResult.Running;
             this.ownTask.Cleanup(ctx);
