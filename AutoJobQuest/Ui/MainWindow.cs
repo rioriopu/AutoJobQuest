@@ -114,12 +114,16 @@ public sealed class MainWindow : Window
     {
         var runner = this.services.Runner;
         var anySelected = this.config.SelectedCrafters.Any(x => x);
-        var blocker = runner.IsRunning
+        // 開始できない理由。開始条件がそろっていないことは、職の下の ✓／✗ の一覧で分かるので、上には文を出さない
+        // ログイン・止めた後の見張り・ゲームデータの読み込みなど、一覧に出ない理由だけを出す
+        var otherBlocker = runner.IsRunning
             ? null
             : this.config.OwnerContentId == 0
                 ? "キャラクターにログインしてから開始してください（設定はキャラクターごとに保存します）"
-                : runner.StartBlocker() ?? this.DataBlocker(anySelected)
-                  ?? (this.StartConditionList(anySelected) is { } conditions ? StartConditions.Blocker(conditions) : "開始条件を確かめています（ログイン後）");
+                : runner.StartBlocker() ?? this.DataBlocker(anySelected);
+        var blocker = runner.IsRunning
+            ? null
+            : otherBlocker ?? (this.StartConditionList(anySelected) is { } conditions ? StartConditions.Blocker(conditions) : "開始条件を確かめています（ログイン後）");
 
         // 一時停止：止めると他のプラグインに頼んだことを全部戻す（止めている間に Artisan・GBR・Questionable が
         // 勝手に動き続けないように）。進み具合は毎回ゲームから読み直すので、もう一度開始すれば続きから進む。
@@ -180,8 +184,8 @@ public sealed class MainWindow : Window
             ImGui.TextColored(Grey, "ジョブを1つ以上選んでください");
 
         ImGui.PushTextWrapPos(0);
-        if (blocker != null)
-            ImGui.TextColored(Yellow, blocker);
+        if (otherBlocker != null)
+            ImGui.TextColored(Yellow, otherBlocker);
         ImGui.TextColored(Yellow, Preflight.Premise);
 
         // 確かめ待ちの控え（復旧に使える形で出す）

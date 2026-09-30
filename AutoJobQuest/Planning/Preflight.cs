@@ -32,11 +32,7 @@ public sealed record PreflightItem(Severity Severity, string Text);
 public static class Preflight
 {
     /// <summary>画面に常に出す前提の文言。</summary>
-    public const string Premise =
-        "開始条件：選択した対象職はそれぞれ Lv70 以上。対象クエストは製作8職・採集3職の Lv70 までです。"
-        + "製作装備は、ショップで購入できる Lv60 装備（ノーマル品）以上を着けていること"
-        + "（主道具・副道具・頭・胴・手・脚・足）。満たしていない場合、動作は保証しません。"
-        + "チョコボかばんの中身は数えず、引き出しもしません。使いたい素材・完成品は、開始前にカバンかリテイナーへ移してください。";
+    public const string Premise = "使いたい素材・完成品はリテイナーに一旦預けて下さい。後ほど引出します。";
 
     /// <summary>
     /// 開始の確認の先頭に出す、マーケットボードの自動購入のリスクの文（開始ボタン → この文 → はい で始める）。
