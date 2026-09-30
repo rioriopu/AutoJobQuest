@@ -15,7 +15,11 @@ namespace AutoJobQuest.Data;
 /// <param name="Size">大きさ（AutoHook の SpearfishSize：1＝小・2＝中・3＝大。ゲームの刺突漁の画面の値と同じ）。</param>
 /// <param name="Speed">速さ（AutoHook の SpearfishSpeed：100〜600 の50刻み。ゲームの刺突漁の画面の値と同じ）。</param>
 /// <param name="Predators">前提の魚（品, 数）。</param>
-public sealed record AutoHookFish(uint ItemId, bool IsSpearFish, int Size, int Speed, IReadOnlyList<(uint ItemId, int Quantity)> Predators);
+public sealed record AutoHookFish(uint ItemId, bool IsSpearFish, int Size, int Speed, IReadOnlyList<(uint ItemId, int Quantity)> Predators)
+{
+    /// <summary>釣れる天気（ゲームデータ Weather の行。空ならいつでも）。例：雨乞魚（4905）は 7・15（導入版 6.0.2.3）。</summary>
+    public IReadOnlyList<uint> Weathers { get; init; } = [];
+}
 
 /// <summary>
 /// AutoHook のファイル（魚のデータ・設定）を読み、AutoHook に渡すプリセットの文字列を作る
@@ -84,7 +88,12 @@ public static class AutoHookData
                 f.TryGetProperty("IsSpearFish", out var sv) && sv.ValueKind == JsonValueKind.True,
                 f.TryGetProperty("Size", out var zv) && zv.ValueKind == JsonValueKind.Number ? zv.GetInt32() : 0,
                 f.TryGetProperty("Speed", out var spv) && spv.ValueKind == JsonValueKind.Number ? spv.GetInt32() : 0,
-                predators));
+                predators)
+            {
+                Weathers = f.TryGetProperty("Weathers", out var wv) && wv.ValueKind == JsonValueKind.Array
+                    ? wv.EnumerateArray().Where(w => w.ValueKind == JsonValueKind.Number && w.GetInt64() > 0).Select(w => (uint)w.GetInt64()).ToList()
+                    : [],
+            });
         }
 
         return result;

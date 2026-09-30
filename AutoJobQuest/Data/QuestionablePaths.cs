@@ -30,7 +30,10 @@ public sealed record QuestionableCraftStep(int Sequence, uint? ItemId, int ItemC
 /// <param name="BaitId">釣りの手順（Fish）で使う餌（ItemsToGather の FishingOptions.BaitId）。無ければ null。
 /// 導入版の経路データの釣りの手順31件すべてにあり、Questionable が AutoHook に渡すプリセットの「強制する餌」と一致する
 /// （経路のプリセット・Questionable 内蔵のプリセット・プリセットの自動生成のいずれも：全件ほどいて確かめた）。</param>
-public sealed record QuestionableStep(int Sequence, int Index, string Type, uint? DataId, uint Territory, System.Numerics.Vector3? Position, uint? ItemId, string? Comment = null, int? ItemCount = null, uint? BaitId = null);
+/// <param name="GatherItemId">採集・釣りの手順（Gather・Fish）で採る品（ItemsToGather の最初の品）。無ければ null。</param>
+/// <param name="GatherCount">その品の数（ItemsToGather の ItemCount）。無ければ null。</param>
+public sealed record QuestionableStep(int Sequence, int Index, string Type, uint? DataId, uint Territory, System.Numerics.Vector3? Position, uint? ItemId, string? Comment = null, int? ItemCount = null, uint? BaitId = null,
+    uint? GatherItemId = null, int? GatherCount = null);
 
 /// <summary>
 /// Questionable の経路データ（pluginConfigs\Questionable\PathData\bundle.zip）から、ジョブクエの「Craft」手順を読む
@@ -191,10 +194,22 @@ public static class QuestionablePaths
         var comment = st.TryGetProperty("Comment", out var cv) && cv.ValueKind == JsonValueKind.String ? cv.GetString() : null;
         int? count = st.TryGetProperty("ItemCount", out var cnt) && cnt.ValueKind == JsonValueKind.Number ? cnt.GetInt32() : null;
 
-        // 釣りの手順の餌（採る品のうち、最初に餌の指定があるもの）
+        // 釣りの手順の餌（採る品のうち、最初に餌の指定があるもの）・採る品と数（最初の品）
         uint? bait = null;
+        uint? gatherItem = null;
+        int? gatherCount = null;
         if (st.TryGetProperty("ItemsToGather", out var tg) && tg.ValueKind == JsonValueKind.Array)
         {
+            foreach (var g in tg.EnumerateArray())
+            {
+                if (g.ValueKind == JsonValueKind.Object && g.TryGetProperty("ItemId", out var gi) && gi.ValueKind == JsonValueKind.Number && gi.GetUInt32() > 0)
+                {
+                    gatherItem = gi.GetUInt32();
+                    gatherCount = g.TryGetProperty("ItemCount", out var gc) && gc.ValueKind == JsonValueKind.Number ? gc.GetInt32() : null;
+                    break;
+                }
+            }
+
             foreach (var g in tg.EnumerateArray())
             {
                 if (g.ValueKind == JsonValueKind.Object && g.TryGetProperty("FishingOptions", out var fo) && fo.ValueKind == JsonValueKind.Object
@@ -206,7 +221,7 @@ public static class QuestionablePaths
             }
         }
 
-        return new QuestionableStep(sequence, index, type, data, terr, pos, item, comment, count, bait);
+        return new QuestionableStep(sequence, index, type, data, terr, pos, item, comment, count, bait, gatherItem, gatherCount);
     }
 
     /// <summary>

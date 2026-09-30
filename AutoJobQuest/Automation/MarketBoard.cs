@@ -29,7 +29,8 @@ namespace AutoJobQuest.Automation;
 /// 買えなければ、その場で全体を止める（マテリア：代わりの手段は無いので、周回で買い直さない。
 /// 出品が0件なら、自分だけに見えるチャットに「マーケットボードに○○の出品がなかった為、動作を停止しました」を出す）。
 /// </param>
-public sealed record MarketNeed(List<uint> Candidates, int Need, string Label, int? TargetOwned = null, bool StopIfUnavailable = false);
+/// <param name="NqOnly">NQ の出品だけを買う（Questionable の採集・釣りの手順は NQ の数で「そろった」を見るため：GetInventoryItemCount の既定は NQ だけ）。</param>
+public sealed record MarketNeed(List<uint> Candidates, int Need, string Label, int? TargetOwned = null, bool StopIfUnavailable = false, bool NqOnly = false);
 
 /// <summary>
 /// マーケットボード（MB）の設置場所をゲームデータから引く。
@@ -1427,6 +1428,8 @@ public sealed unsafe class MarketBoardTask : AutoTask
             if (own.Contains(l.RetainerId) && !this.boughtListings.Contains(l.ListingId))
                 this.ownListings++;
             if (l.IsSellingAsSet || own.Contains(l.RetainerId) || this.boughtListings.Contains(l.ListingId) || this.rejectedListings.Contains(l.ListingId))
+                continue;
+            if (this.current?.NqOnly == true && l.IsHqItem)
                 continue;
 
             list.Add(new Offer(l.ListingId, (int)l.Quantity, l.UnitPrice, (long)l.UnitPrice * l.Quantity + l.TotalTax));

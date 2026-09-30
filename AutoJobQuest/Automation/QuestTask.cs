@@ -250,6 +250,12 @@ public sealed unsafe class QuestTask : AutoTask
         // Questionable の釣りの手順の前に、手順の指定の餌を付けておく（FishBaitPrep）
         this.HandleFishBait(ctx);
 
+        // 天気の限られた魚で、いまの天気で釣れないなら、Questionable を止めてマーケットボードで買う（WeatherFishBuy）
+        if (this.weatherBuy != null)
+            return this.RunWeatherBuy(ctx);
+        if (this.HandleWeatherFish(ctx))
+            return TaskResult.Running;
+
         // 納品窓が開いたら、条件（HQ・マテリア）に合う品をこちらで自動で入れて渡す（確認は出さない）。
         // TextAdvance は一覧の先頭を入れるので、NQ と HQ を両方持っていると NQ が入る恐れがあった
         if (this.HandleRequest(ctx) is { } requestFailure)
@@ -261,7 +267,7 @@ public sealed unsafe class QuestTask : AutoTask
         var spearWaited = this.spearfishTotal + (this.spearfishSince is { } ss ? DateTime.UtcNow - ss : TimeSpan.Zero);
         var craftWaited = this.questCraftTotal + (this.questCraftSince is { } cs ? DateTime.UtcNow - cs : TimeSpan.Zero);
         var limit = TimeSpan.FromMinutes(this.paths?.Any(s => s.Type is "Gather" or "Fish") == true ? 90 : 30);
-        if (this.Elapsed - waited - spearWaited - craftWaited > limit)
+        if (this.Elapsed - waited - spearWaited - craftWaited - this.weatherBuyTotal > limit)
             return this.Fail($"{limit.TotalMinutes:0}分たってもクエストが完了しません");
         if (waited > ManualWaitLimit)
             return this.Fail($"手で行う手順を {ManualWaitLimit.TotalMinutes:0} 分待っても進みませんでした。手順を終えてから再開してください");
@@ -614,6 +620,118 @@ public sealed unsafe class QuestTask : AutoTask
             ctx.Log.Debug("クエスト", $"購入の確認に OK を押しません（{verdict}）：{body.Replace("\n", " ")}"
                                      + $"（読んだ品 {parsed?.Item ?? "なし"}×{parsed?.Count}・{parsed?.Price} ギル／手順の品 {string.Join("、", expected.Select(e => $"{e.Item1}×{e.ItemCount}"))}）");
         }
+    }
+
+    // 天気の限られた魚の購入（HandleWeatherFish）：動かしている購入・試したか・始めた時刻・かかった時間・同じことを2度書かない控え
+    private AutoTask? weatherBuy;
+    private bool weatherBuyTried;
+    private DateTime? weatherBuySince;
+    private TimeSpan weatherBuyTotal;
+    private uint weatherBuyItem;
+    private int weatherBuyCount;
+    private string lastWeatherNote = string.Empty;
+
+    /// <summary>検証の仕組み用：設定すると、マーケットボードの購入の代わりにこれが作る作業を使う。本番では null のまま。</summary>
+    public static Func<MarketNeed, AutoTask>? TestMarketTask { get; set; }
+
+    /// <summary>
+    /// Questionable の今の手順から後に、同じ段の釣りの手順があり、その魚が天気の限られた魚なら、釣りの手順のエリアに着いたところで天気を見る
+    /// （WeatherFishBuy の説明）。天気が合わなければ、Questionable を止めて、足りない分（NQ）をマーケットボードで買う（1つのクエストで1回だけ）。
+    /// 天気が合っていれば何もしない（Questionable が釣る）。買いに行ったら true。
+    /// </summary>
+    private bool HandleWeatherFish(TaskContext ctx)
+    {
+        var step = ctx.Questionable.GetCurrentStepData();
+        if (step == null || ctx.Questionable.IsRunning() != true || step.QuestId != this.quest.ShortId.ToString() || GameUi.BetweenAreas)
+            return false;
+        if (QuestionablePaths.Steps(this.quest.ShortId) is not { } steps || WeatherFishBuy.FishAhead(steps, step.Sequence, step.Step) is not { } fish)
+            return false;
+
+        var item = fish.GatherItemId!.Value;
+        var count = fish.GatherCount!.Value;
+        var weathers = FishConditions.Weathers(item, ctx.AutoHook.LoadedVersion);
+        if (weathers is not { Count: > 0 })
+            return false;
+
+        var nq = Inventory.Snapshot().CountNq(item);
+        var inArea = GameWeather.CurrentTerritory == fish.Territory;
+        var weather = inArea ? GameWeather.CurrentIn(fish.Territory) : null;
+        var verdict = WeatherFishBuy.Decide(weathers, nq, count, inArea, weather, WeatherFishBuy.Marketable(item), this.weatherBuyTried);
+        var name = CraftPlanner.ItemName(item);
+        var want = string.Join("・", weathers.Select(GameWeather.Name));
+        var now = weather is { } w ? GameWeather.Name(w) : "不明";
+        var zone = AreaAccess.Name(fish.Territory);
+        switch (verdict)
+        {
+            case WeatherFishBuy.Verdict.Buy:
+                var need = count - nq;
+                ctx.Questionable.Stop(Plugin.InternalNameConst);
+                this.weatherBuyTried = true;
+                this.weatherBuySince = DateTime.UtcNow;
+                this.weatherBuyItem = item;
+                this.weatherBuyCount = count;
+                var order = new MarketNeed([item], need, name, Inventory.CountNow(item) + need, NqOnly: true);
+                this.weatherBuy = TestMarketTask?.Invoke(order) ?? new MarketBoardTask([order], ctx.MarketWatcher);
+                ctx.Log.Write("クエスト", $"{name} は天気が「{want}」のときしか釣れません。いまの{zone}の天気は「{now}」なので、Questionable を止めて、"
+                                       + $"足りない {need} 匹（NQ。持っている NQ {nq}／要る {count}）をマーケットボードで買います（天気が合わないときだけ買う）");
+                this.NextPhase($"天気が合わないので {name} をマーケットボードで買います");
+                return true;
+            case WeatherFishBuy.Verdict.InWeather:
+                this.NoteWeather(ctx, $"{item}:In:{weather}", $"{name} は天気が「{want}」のときに釣れます。いまの{zone}の天気は「{now}」なので、Questionable が釣ります");
+                return false;
+            case WeatherFishBuy.Verdict.CannotBuy:
+                this.NoteWeather(ctx, $"{item}:NoMarket", $"{name} は天気が「{want}」のときしか釣れず、いまの{zone}の天気は「{now}」ですが、マーケットで売買できない品なので、"
+                                                        + "天気が変わるのを待って Questionable が釣ります", warn: true);
+                return false;
+            case WeatherFishBuy.Verdict.AlreadyTried:
+                this.NoteWeather(ctx, $"{item}:Tried", $"{name} をマーケットボードで買いきれなかったので、天気が「{want}」に変わるのを待って Questionable が釣ります"
+                                                     + $"（いまの{zone}の天気は「{now}」・NQ {nq}／{count}）", warn: true);
+                return false;
+            case WeatherFishBuy.Verdict.WeatherUnknown:
+                this.NoteWeather(ctx, $"{item}:Unknown", $"{zone}の天気を読めないので、{name} は Questionable に釣りを任せます（釣れる天気：{want}）", warn: true);
+                return false;
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>天気の限られた魚の購入を進める。終わったら Questionable に頼み直す（魚がそろっていれば、Questionable は釣りの手順を飛ばす）。</summary>
+    private TaskResult RunWeatherBuy(TaskContext ctx)
+    {
+        var r = this.weatherBuy!.Step(ctx);
+        this.Status = this.weatherBuy.Status;
+        if (r == TaskResult.Running)
+            return TaskResult.Running;
+        var failed = r == TaskResult.Failed ? this.weatherBuy.FailReason : null;
+        this.weatherBuy.Cleanup(ctx);
+        this.weatherBuy = null;
+        if (this.weatherBuySince is { } since)
+            this.weatherBuyTotal += DateTime.UtcNow - since;
+        this.weatherBuySince = null;
+
+        // 購入の確認で「いいえ」が押された・マーケットが使えない等は、流れ全体の購入と同じく止める
+        if (failed != null)
+            return this.Fail($"{CraftPlanner.ItemName(this.weatherBuyItem)} をマーケットボードで買えませんでした：{failed}");
+
+        var nq = Inventory.Snapshot().CountNq(this.weatherBuyItem);
+        if (nq >= this.weatherBuyCount)
+            ctx.Log.Write("クエスト", $"{CraftPlanner.ItemName(this.weatherBuyItem)} がそろいました（NQ {nq}／{this.weatherBuyCount}）。Questionable に戻します（釣りの手順は、魚がそろっているので飛ばされます）");
+        else
+            ctx.Log.Warn("クエスト", $"{CraftPlanner.ItemName(this.weatherBuyItem)} をマーケットボードで買いきれませんでした（NQ {nq}／{this.weatherBuyCount}）。"
+                                    + "Questionable に戻し、天気が変わるのを待って釣ります");
+        this.started = false; // Questionable に頼み直す
+        return TaskResult.Running;
+    }
+
+    private void NoteWeather(TaskContext ctx, string key, string text, bool warn = false)
+    {
+        if (key == this.lastWeatherNote)
+            return;
+        this.lastWeatherNote = key;
+        if (warn)
+            ctx.Log.Warn("クエスト", text);
+        else
+            ctx.Log.Write("クエスト", text);
     }
 
     // 完了の後片付け：済んだか・始めた時刻・動ける状態になった時刻・最後に閉じた時刻・閉じた窓
