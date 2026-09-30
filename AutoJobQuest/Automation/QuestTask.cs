@@ -253,6 +253,10 @@ public sealed unsafe class QuestTask : AutoTask
         // 天気の限られた魚で、いまの天気で釣れないなら、Questionable を止めてマーケットボードで買う（WeatherFishBuy）
         if (this.weatherBuy != null)
             return this.RunWeatherBuy(ctx);
+
+        // 釣りの手順の魚がもうそろっているのに、Questionable がその手前にいるなら、残り（報告）をこちらで行う（QuestTakeOver.AfterFishReady）
+        if (this.HandleFishReady(ctx))
+            return TaskResult.Running;
         if (this.HandleWeatherFish(ctx))
             return TaskResult.Running;
 
@@ -629,10 +633,17 @@ public sealed unsafe class QuestTask : AutoTask
     private TimeSpan weatherBuyTotal;
     private uint weatherBuyItem;
     private int weatherBuyCount;
+    private QuestionableStep? weatherFishStep;
+    private int weatherStopStep;
+    private uint weatherStopTerritory;
+    private bool weatherReturning;
     private string lastWeatherNote = string.Empty;
 
     /// <summary>検証の仕組み用：設定すると、マーケットボードの購入の代わりにこれが作る作業を使う。本番では null のまま。</summary>
     public static Func<MarketNeed, AutoTask>? TestMarketTask { get; set; }
+
+    /// <summary>検証の仕組み用：設定すると、止めた時点のエリアへ戻るテレポの代わりにこれが作る作業を使う。本番では null のまま。</summary>
+    public static Func<uint, AutoTask>? TestReturnTask { get; set; }
 
     /// <summary>
     /// Questionable の今の手順から後に、同じ段の釣りの手順があり、その魚が天気の限られた魚なら、釣りの手順のエリアに着いたところで天気を見る
@@ -670,6 +681,9 @@ public sealed unsafe class QuestTask : AutoTask
                 this.weatherBuySince = DateTime.UtcNow;
                 this.weatherBuyItem = item;
                 this.weatherBuyCount = count;
+                this.weatherFishStep = fish;
+                this.weatherStopStep = step.Step;
+                this.weatherStopTerritory = GameWeather.CurrentTerritory;
                 var order = new MarketNeed([item], need, name, Inventory.CountNow(item) + need, NqOnly: true);
                 this.weatherBuy = TestMarketTask?.Invoke(order) ?? new MarketBoardTask([order], ctx.MarketWatcher);
                 ctx.Log.Write("クエスト", $"{name} は天気が「{want}」のときしか釣れません。いまの{zone}の天気は「{now}」なので、Questionable を止めて、"
@@ -695,7 +709,11 @@ public sealed unsafe class QuestTask : AutoTask
         }
     }
 
-    /// <summary>天気の限られた魚の購入を進める。終わったら Questionable に頼み直す（魚がそろっていれば、Questionable は釣りの手順を飛ばす）。</summary>
+    /// <summary>
+    /// 天気の限られた魚の購入を進める。そろったら、釣りの後の残りの手順（報告）をこちらで行う（Questionable は段の頭からやり直し、
+    /// 経路データの「餌を持っていればテレポを飛ばす」で、マーケットのある街から戻れずに待ち続けるため）。
+    /// こちらで行えない形なら、止めた時点のエリアへ戻ってから Questionable に頼み直す。買いきれなければ、同じく戻って頼み直す（天気を待って釣る）。
+    /// </summary>
     private TaskResult RunWeatherBuy(TaskContext ctx)
     {
         var r = this.weatherBuy!.Step(ctx);
@@ -708,19 +726,80 @@ public sealed unsafe class QuestTask : AutoTask
         if (this.weatherBuySince is { } since)
             this.weatherBuyTotal += DateTime.UtcNow - since;
         this.weatherBuySince = null;
+        var name = CraftPlanner.ItemName(this.weatherBuyItem);
+
+        // 戻りのテレポが終わった：Questionable に頼み直す
+        if (this.weatherReturning)
+        {
+            this.weatherReturning = false;
+            if (failed != null)
+                ctx.Log.Warn("クエスト", $"{AreaAccess.Name(this.weatherStopTerritory)} へ戻れませんでした（{failed}）。そのまま Questionable に頼み直します");
+            this.started = false;
+            return TaskResult.Running;
+        }
 
         // 購入の確認で「いいえ」が押された・マーケットが使えない等は、流れ全体の購入と同じく止める
         if (failed != null)
-            return this.Fail($"{CraftPlanner.ItemName(this.weatherBuyItem)} をマーケットボードで買えませんでした：{failed}");
+            return this.Fail($"{name} をマーケットボードで買えませんでした：{failed}");
 
         var nq = Inventory.Snapshot().CountNq(this.weatherBuyItem);
         if (nq >= this.weatherBuyCount)
-            ctx.Log.Write("クエスト", $"{CraftPlanner.ItemName(this.weatherBuyItem)} がそろいました（NQ {nq}／{this.weatherBuyCount}）。Questionable に戻します（釣りの手順は、魚がそろっているので飛ばされます）");
+        {
+            if (this.paths != null && this.weatherFishStep is { } fish
+                && QuestTakeOver.AfterFishReady(this.paths, fish.Sequence, this.weatherStopStep, true) is { } rest)
+            {
+                this.TakeOverAfterFish(ctx, fish, rest, nq);
+                return TaskResult.Running;
+            }
+
+            ctx.Log.Write("クエスト", $"{name} がそろいました（NQ {nq}／{this.weatherBuyCount}）。Questionable に戻します（釣りの手順は、魚がそろっているので飛ばされます）");
+        }
         else
-            ctx.Log.Warn("クエスト", $"{CraftPlanner.ItemName(this.weatherBuyItem)} をマーケットボードで買いきれませんでした（NQ {nq}／{this.weatherBuyCount}）。"
-                                    + "Questionable に戻し、天気が変わるのを待って釣ります");
+        {
+            ctx.Log.Warn("クエスト", $"{name} をマーケットボードで買いきれませんでした（NQ {nq}／{this.weatherBuyCount}）。Questionable に戻し、天気が変わるのを待って釣ります");
+        }
+
+        // マーケットのある街へ移っていたら、止めた時点のエリアへ戻ってから頼み直す（経路データはその辺りにいる前提で、テレポを飛ばすことがある）
+        if (this.weatherStopTerritory != 0 && GameWeather.CurrentTerritory != this.weatherStopTerritory)
+        {
+            ctx.Log.Write("クエスト", $"マーケットボードのある街へ移っていたので、{AreaAccess.Name(this.weatherStopTerritory)} へ戻ってから Questionable に頼み直します");
+            this.weatherReturning = true;
+            this.weatherBuySince = DateTime.UtcNow;
+            this.weatherBuy = TestReturnTask?.Invoke(this.weatherStopTerritory) ?? new TeleportTask(this.weatherStopTerritory);
+            return TaskResult.Running;
+        }
+
         this.started = false; // Questionable に頼み直す
         return TaskResult.Running;
+    }
+
+    /// <summary>
+    /// 釣りの手順の魚がもうそろっているのに、Questionable がまだその手前（同じ段の、店で買う・歩く手順）にいるなら、Questionable を止めて、
+    /// 残りの手順（報告）をこちらで行う（QuestTakeOver.AfterFishReady。止まった状態から始め直したときも、ここで先へ進める）。行ったら true。
+    /// </summary>
+    private bool HandleFishReady(TaskContext ctx)
+    {
+        var step = ctx.Questionable.GetCurrentStepData();
+        if (step == null || ctx.Questionable.IsRunning() != true || step.QuestId != this.quest.ShortId.ToString() || this.paths == null)
+            return false;
+        if (WeatherFishBuy.FishAhead(this.paths, step.Sequence, step.Step) is not { } fish)
+            return false;
+        var have = Inventory.CountNow(fish.GatherItemId!.Value);
+        if (QuestTakeOver.AfterFishReady(this.paths, step.Sequence, step.Step, have >= fish.GatherCount!.Value) is not { } rest)
+            return false;
+        ctx.Questionable.Stop(Plugin.InternalNameConst);
+        this.TakeOverAfterFish(ctx, fish, rest, have);
+        return true;
+    }
+
+    private void TakeOverAfterFish(TaskContext ctx, QuestionableStep fish, List<QuestionableStep> rest, int have)
+    {
+        this.own = new Queue<QuestionableStep>(rest);
+        this.ownFromSeq = fish.Sequence;
+        ctx.Log.Write("クエスト", $"{CraftPlanner.ItemName(fish.GatherItemId!.Value)} はもうそろっています（{have}／{fish.GatherCount}）。"
+                               + $"Questionable は段 {fish.Sequence} の頭（餌の購入・釣り場への移動）からやり直すので、"
+                               + $"釣りの後の残りの手順（{string.Join("→", rest.Select(x => $"{x.Type}（{NpcStepTask.NpcName(x.DataId)}）"))}）をこちらで行います");
+        this.NextPhase("釣りの後の手順をこちらで行います");
     }
 
     private void NoteWeather(TaskContext ctx, string key, string text, bool warn = false)

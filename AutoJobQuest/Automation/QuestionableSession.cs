@@ -236,6 +236,29 @@ public static class QuestTakeOver
     }
 
     /// <summary>
+    /// 釣りの手順の魚がもうそろっているのに、Questionable がまだその手前（同じ段の、店で買う・歩く手順）にいるなら、
+    /// 釣りの手順の後の残りの手順を返す（こちらで行う）。そうでなければ null（不具合の例：漁師 Lv40 で雨乞魚をマーケットボードで
+    /// 買った後、頼み直した Questionable が段の頭の「餌を買う」手順からやり直し、経路データの「餌を持っていればテレポを飛ばす」でテレポせず、
+    /// グリダニアに入るのを待ち続けた。キャラクターはリムサ・ロミンサのマーケットボードの前にいた）。
+    /// 釣りの手順より前に、クエストを進める手順（話しかける等）があれば返さない（飛ばすと段が進まないため）。
+    /// </summary>
+    /// <param name="steps">そのクエストの全手順（経路データ）。</param>
+    /// <param name="sequence">Questionable がいま進めている段。</param>
+    /// <param name="stepIndex">Questionable がいま進めている手順の番号。</param>
+    /// <param name="itemsReady">釣りの手順の魚が、必要数そろっているか。</param>
+    public static List<QuestionableStep>? AfterFishReady(IReadOnlyList<QuestionableStep> steps, int sequence, int stepIndex, bool itemsReady)
+    {
+        if (!itemsReady || WeatherFishBuy.FishAhead(steps, sequence, stepIndex) is not { } fish)
+            return null;
+        if (steps.Any(s => s.Sequence == sequence && s.Index >= stepIndex && s.Index < fish.Index && s.Type is not ("PurchaseItem" or "WalkTo" or "None")))
+            return null;
+        var rest = steps.Where(s => s.Sequence == sequence && s.Index > fish.Index).OrderBy(s => s.Index).ToList();
+        if (rest.Count == 0 || rest.Any(s => !OwnTypes.Contains(s.Type)) || !rest.Any(s => s.Type is "Interact" or "CompleteQuest"))
+            return null;
+        return rest;
+    }
+
+    /// <summary>
     /// 受注後の品の製作の段にいるのに、その品が（HQ が要るなら HQ で）足りないなら、その品（引き取って作る）。そうでなければ null。
     /// Questionable の製作の手順の「持っていれば飛ばす」は品質を見ない（NQ と HQ の合計で数える）。そのため NQ だけを持って製作の段に来ると、
     /// 製作の手順を飛ばして受け取る相手へ行き、相手は HQ が無いので応じず、30分の上限で止まっていた（こちらの引き取りは手順の種類が製作のときだけだった）。
