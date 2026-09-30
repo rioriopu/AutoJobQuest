@@ -230,8 +230,6 @@ public sealed class MainWindow : Window
 
     private void DrawJobSelection()
     {
-        ImGui.TextWrapped("選んだ職のジョブクエ（Lv70 まで）をまとめて進め、始めに呼び鈴でリテイナーから必要品をまとめて引き出します"
-                          + "（チョコボかばん・リテイナーの収集品・装備中・出品中・マテリア付きの品は使いません）。下の開始条件がすべて ✓ になると開始できます。");
         var sel = this.config.SelectedCrafters;
         var all = sel.All(x => x);
 
