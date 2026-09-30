@@ -1292,3 +1292,52 @@ public static class QuestPurchaseConfirm
         return Verdict.Press;
     }
 }
+
+/// <summary>
+/// Questionable の釣りの手順の前に、手順の指定の餌をこちらで付けておくかの判断（不具合の例：漁師 Lv15「キキルン族の思い出の味」で、
+/// 買ったラットの尾でなくピルバグのまま釣り続け、目当ての魚が釣れなかった）。
+/// Questionable は釣りの手順で、AutoHook を有効にし、プリセット（餌の強制切り替え）を渡し、/ahstart を同じフレームで送る（Fish.cs の Start）。
+/// AutoHook は無効の間は所持数の控えを数え直さない（FishingManager の毎フレームの処理が、無効なら更新の前に戻る）ので、
+/// 無効の間に買った餌を「カバンに無い」として替えずに釣り始める（記録：Failed to change bait for forced bait swap. Result: NotInInventory）。
+/// 強制切り替えは釣り始めの1回だけで、その後は同じ餌で投げ直し続ける。
+/// 付けている餌がすでに同じなら、AutoHook は所持数を見ずに進む（AlreadyEquipped を先に判定する）ので、先に付けておけば通る。
+/// </summary>
+public static class FishBaitPrep
+{
+    public enum Verdict
+    {
+        /// <summary>今の手順から後に、同じ段の釣りの手順（餌の指定つき）が無い。</summary>
+        NoFishStep,
+
+        /// <summary>もう手順の餌を付けている。</summary>
+        AlreadyEquipped,
+
+        /// <summary>手順の餌をまだ持っていない（Questionable が買う手順の前など）。</summary>
+        NotOwned,
+
+        /// <summary>付け替えられない状態（糸を垂らしている・詠唱中・戦闘中・エリア移動中・会話中など）。</summary>
+        Busy,
+
+        /// <summary>付ける。</summary>
+        Equip,
+    }
+
+    /// <summary>今の手順（段・番号）から後で、同じ段にある最初の釣りの手順の餌（無ければ null）。</summary>
+    public static uint? TargetBait(IReadOnlyList<QuestionableStep> steps, int sequence, int stepIndex)
+        => steps.Where(s => s.Sequence == sequence && s.Index >= stepIndex && s.Type == "Fish" && s.BaitId is > 0)
+                .OrderBy(s => s.Index)
+                .FirstOrDefault()?.BaitId;
+
+    public static Verdict Decide(uint? target, uint equipped, int owned, bool busy)
+    {
+        if (target is not { } t)
+            return Verdict.NoFishStep;
+        if (equipped == t)
+            return Verdict.AlreadyEquipped;
+        if (owned <= 0)
+            return Verdict.NotOwned;
+        if (busy)
+            return Verdict.Busy;
+        return Verdict.Equip;
+    }
+}

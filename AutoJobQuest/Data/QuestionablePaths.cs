@@ -27,7 +27,10 @@ public sealed record QuestionableCraftStep(int Sequence, uint? ItemId, int ItemC
 /// <param name="Territory">手順のエリア。</param>
 /// <param name="Position">手順の位置。無ければ null。</param>
 /// <param name="ItemId">手順の品（Craft・PurchaseItem 等）。無ければ null。</param>
-public sealed record QuestionableStep(int Sequence, int Index, string Type, uint? DataId, uint Territory, System.Numerics.Vector3? Position, uint? ItemId, string? Comment = null, int? ItemCount = null);
+/// <param name="BaitId">釣りの手順（Fish）で使う餌（ItemsToGather の FishingOptions.BaitId）。無ければ null。
+/// 導入版の経路データの釣りの手順31件すべてにあり、Questionable が AutoHook に渡すプリセットの「強制する餌」と一致する
+/// （経路のプリセット・Questionable 内蔵のプリセット・プリセットの自動生成のいずれも：全件ほどいて確かめた）。</param>
+public sealed record QuestionableStep(int Sequence, int Index, string Type, uint? DataId, uint Territory, System.Numerics.Vector3? Position, uint? ItemId, string? Comment = null, int? ItemCount = null, uint? BaitId = null);
 
 /// <summary>
 /// Questionable の経路データ（pluginConfigs\Questionable\PathData\bundle.zip）から、ジョブクエの「Craft」手順を読む
@@ -187,7 +190,23 @@ public static class QuestionablePaths
             pos = new System.Numerics.Vector3(x.GetSingle(), y.GetSingle(), z.GetSingle());
         var comment = st.TryGetProperty("Comment", out var cv) && cv.ValueKind == JsonValueKind.String ? cv.GetString() : null;
         int? count = st.TryGetProperty("ItemCount", out var cnt) && cnt.ValueKind == JsonValueKind.Number ? cnt.GetInt32() : null;
-        return new QuestionableStep(sequence, index, type, data, terr, pos, item, comment, count);
+
+        // 釣りの手順の餌（採る品のうち、最初に餌の指定があるもの）
+        uint? bait = null;
+        if (st.TryGetProperty("ItemsToGather", out var tg) && tg.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var g in tg.EnumerateArray())
+            {
+                if (g.ValueKind == JsonValueKind.Object && g.TryGetProperty("FishingOptions", out var fo) && fo.ValueKind == JsonValueKind.Object
+                    && fo.TryGetProperty("BaitId", out var bv) && bv.ValueKind == JsonValueKind.Number && bv.GetUInt32() > 0)
+                {
+                    bait = bv.GetUInt32();
+                    break;
+                }
+            }
+        }
+
+        return new QuestionableStep(sequence, index, type, data, terr, pos, item, comment, count, bait);
     }
 
     /// <summary>

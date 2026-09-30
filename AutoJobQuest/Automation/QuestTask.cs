@@ -239,6 +239,9 @@ public sealed unsafe class QuestTask : AutoTask
         // Questionable の購入の手順で出た購入の確認に、こちらで OK を押す（QuestPurchaseConfirm）
         this.HandlePurchaseConfirm(ctx);
 
+        // Questionable の釣りの手順の前に、手順の指定の餌を付けておく（FishBaitPrep）
+        this.HandleFishBait(ctx);
+
         // 納品窓が開いたら、条件（HQ・マテリア）に合う品をこちらで自動で入れて渡す（確認は出さない）。
         // TextAdvance は一覧の先頭を入れるので、NQ と HQ を両方持っていると NQ が入る恐れがあった
         if (this.HandleRequest(ctx) is { } requestFailure)
@@ -603,6 +606,99 @@ public sealed unsafe class QuestTask : AutoTask
             ctx.Log.Debug("クエスト", $"購入の確認に OK を押しません（{verdict}）：{body.Replace("\n", " ")}"
                                      + $"（読んだ品 {parsed?.Item ?? "なし"}×{parsed?.Count}・{parsed?.Price} ギル／手順の品 {string.Join("、", expected.Select(e => $"{e.Item1}×{e.ItemCount}"))}）");
         }
+    }
+
+    // 釣りの手順の餌：付けようとしている餌・付いたのを見たか・送った回数・最後に送った時刻・同じことを2度書かない控え
+    private uint baitTarget;
+    private bool baitSettled;
+    private int baitAttempts;
+    private DateTime baitSentAt = DateTime.MinValue;
+    private string lastBaitNote = string.Empty;
+
+    /// <summary>付けたのに変わらないとき、次に送るまでの間（付いたかは「今付けている餌」で見る。これは送り直しの間隔。検証の仕組みでは短くする）。</summary>
+    public static TimeSpan BaitRetry { get; set; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>同じ餌を送っても変わらないとき、諦めるまでの回数（投げ直しの合間ごとに1回ずつ試す）。</summary>
+    public const int BaitAttemptLimit = 20;
+
+    /// <summary>
+    /// Questionable の今の手順から後に同じ段の釣りの手順があれば、その手順の指定の餌を付けておく（理由は FishBaitPrep）。
+    /// 釣りの手順に入った後も、糸を垂らしていない合間（投げ直しの間）に付け替える（先に付けられずに釣り始めたときの立て直し）。
+    /// 付いたかは「今付けている餌」が変わったかで確かめる。上限まで送って変わらなければ、記録に残して送るのをやめる。
+    /// 手順の餌が付いているのを一度見たら、その餌についてはもう触らない（AutoHook のプリセットが途中で意図して替える餌と取り合わないため）。
+    /// </summary>
+    private void HandleFishBait(TaskContext ctx)
+    {
+        var step = ctx.Questionable.GetCurrentStepData();
+        if (step == null || ctx.Questionable.IsRunning() != true || step.QuestId != this.quest.ShortId.ToString())
+            return;
+
+        var steps = QuestionablePaths.Steps(this.quest.ShortId);
+        if (steps == null)
+            return;
+
+        var target = FishBaitPrep.TargetBait(steps, step.Sequence, step.Step);
+        if ((target ?? 0) != this.baitTarget)
+        {
+            this.baitTarget = target ?? 0;
+            this.baitSettled = false;
+            this.baitAttempts = 0;
+            this.baitSentAt = DateTime.MinValue;
+        }
+
+        // 釣りの手順が無ければ、ゲームの状態は読まない
+        if (target is not { } bait || this.baitSettled)
+            return;
+
+        var game = GameBait.Current;
+        var equipped = game.Equipped;
+        var owned = game.Owned(bait);
+        var verdict = FishBaitPrep.Decide(bait, equipped, owned, game.Busy);
+        var name = CraftPlanner.ItemName(bait);
+        switch (verdict)
+        {
+            case FishBaitPrep.Verdict.AlreadyEquipped:
+                // こちらが送って変わったときだけ書く（初めから付いていたときは書かない）
+                if (this.baitAttempts > 0)
+                    ctx.Log.Write("クエスト", $"釣りの手順の餌を付けました：{name}（{this.baitAttempts} 回目で変わった）");
+                this.baitSettled = true;
+                return;
+            case FishBaitPrep.Verdict.NotOwned:
+                this.NoteBait(ctx, $"{bait}:NotOwned", $"釣りの手順の餌（{name}）をまだ持っていません（Questionable が買う手順を待ちます）");
+                return;
+            case FishBaitPrep.Verdict.Equip:
+                break;
+            default:
+                return;
+        }
+
+        if (this.baitAttempts >= BaitAttemptLimit)
+        {
+            this.NoteBait(ctx, $"{bait}:GaveUp", $"釣りの手順の餌（{name}）を {BaitAttemptLimit} 回付けようとしましたが、付いている餌が変わりません"
+                                                + $"（いま {(equipped == 0 ? "なし" : CraftPlanner.ItemName(equipped))}。これ以上は送りません。釣れないときは手で {name} に替えてください）", warn: true);
+            return;
+        }
+
+        if (DateTime.UtcNow - this.baitSentAt < BaitRetry)
+            return;
+
+        if (this.baitAttempts == 0)
+            ctx.Log.Write("クエスト", $"釣りの手順の餌を付けます：{name}（Questionable の手順 {step.Sequence}-{step.Step} から後の釣りの指定。"
+                                   + $"いまの餌 {(equipped == 0 ? "なし" : CraftPlanner.ItemName(equipped))}・{name} を {owned} 個所持）");
+        game.Equip(bait);
+        this.baitAttempts++;
+        this.baitSentAt = DateTime.UtcNow;
+    }
+
+    private void NoteBait(TaskContext ctx, string key, string text, bool warn = false)
+    {
+        if (key == this.lastBaitNote)
+            return;
+        this.lastBaitNote = key;
+        if (warn)
+            ctx.Log.Warn("クエスト", text);
+        else
+            ctx.Log.Debug("クエスト", text);
     }
 
     private string? HandleRequest(TaskContext ctx)
