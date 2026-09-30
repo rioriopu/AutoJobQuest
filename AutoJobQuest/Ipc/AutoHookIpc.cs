@@ -15,6 +15,13 @@ public sealed class AutoHookIpc : IpcGate
         => this.TryInvoke("GetPluginState", () => this.Func<bool>("AutoHook.GetPluginState").InvokeFunc(), out var v) ? v : null;
 
     /// <summary>
+    /// AutoHook の有効／無効（AutoHook の AutoHookIPC.SetPluginState。Questionable の釣りの手順も同じ IPC で有効にし、終わると元に戻す）。
+    /// 有効のまま釣り場にいると、AutoHook は自分で竿を投げる（自動で釣りを始める設定のとき）。
+    /// </summary>
+    public bool SetPluginState(bool state)
+        => this.TraceThen($"SetPluginState({state})") && this.TryAction("SetPluginState", () => this.Func<bool, object>("AutoHook.SetPluginState").InvokeAction(state));
+
+    /// <summary>
     /// プリセットを取り込んで選ぶ（竿は "AH…_"、刺突漁は "AHSF…_"。刺突漁は取り込むと選ばれ、刺突の自動が ON になる：導入版 6.0.2.3 の AutoHookIPC.cs）。
     /// 刺突漁のプリセットを消す IPC は無いので、取り込んだ刺突漁のプリセットは AutoHook に残る（GBR も同じ）。
     /// </summary>

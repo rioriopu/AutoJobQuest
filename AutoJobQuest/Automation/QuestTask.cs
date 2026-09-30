@@ -252,7 +252,10 @@ public sealed unsafe class QuestTask : AutoTask
 
         // 天気の限られた魚で、いまの天気で釣れないなら、Questionable を止めてマーケットボードで買う（WeatherFishBuy）
         if (this.weatherBuy != null)
+        {
+            this.KeepFishingStopped();
             return this.RunWeatherBuy(ctx);
+        }
 
         // 釣りの手順の魚がもうそろっているのに、Questionable がその手前にいるなら、残り（報告）をこちらで行う（QuestTakeOver.AfterFishReady）
         if (this.HandleFishReady(ctx))
@@ -287,7 +290,10 @@ public sealed unsafe class QuestTask : AutoTask
             return this.RunSpearfish(ctx);
 
         if (this.own != null)
+        {
+            this.KeepFishingStopped();
             return this.RunOwnSteps(ctx);
+        }
 
         if (this.questCraft != null)
             return this.RunQuestCraft(ctx);
@@ -677,6 +683,7 @@ public sealed unsafe class QuestTask : AutoTask
             case WeatherFishBuy.Verdict.Buy:
                 var need = count - nq;
                 ctx.Questionable.Stop(Plugin.InternalNameConst);
+                this.PauseAutoFishing(ctx);
                 this.weatherBuyTried = true;
                 this.weatherBuySince = DateTime.UtcNow;
                 this.weatherBuyItem = item;
@@ -734,6 +741,7 @@ public sealed unsafe class QuestTask : AutoTask
             this.weatherReturning = false;
             if (failed != null)
                 ctx.Log.Warn("クエスト", $"{AreaAccess.Name(this.weatherStopTerritory)} へ戻れませんでした（{failed}）。そのまま Questionable に頼み直します");
+            this.RestoreAutoFishing(ctx);
             this.started = false;
             return TaskResult.Running;
         }
@@ -746,7 +754,7 @@ public sealed unsafe class QuestTask : AutoTask
         if (nq >= this.weatherBuyCount)
         {
             if (this.paths != null && this.weatherFishStep is { } fish
-                && QuestTakeOver.AfterFishReady(this.paths, fish.Sequence, this.weatherStopStep, true) is { } rest)
+                && QuestTakeOver.AfterFishReady(this.paths, fish.Sequence, this.weatherStopStep, true, includeFishStep: true) is { } rest)
             {
                 this.TakeOverAfterFish(ctx, fish, rest, nq);
                 return TaskResult.Running;
@@ -769,6 +777,7 @@ public sealed unsafe class QuestTask : AutoTask
             return TaskResult.Running;
         }
 
+        this.RestoreAutoFishing(ctx);
         this.started = false; // Questionable に頼み直す
         return TaskResult.Running;
     }
@@ -788,8 +797,53 @@ public sealed unsafe class QuestTask : AutoTask
         if (QuestTakeOver.AfterFishReady(this.paths, step.Sequence, step.Step, have >= fish.GatherCount!.Value) is not { } rest)
             return false;
         ctx.Questionable.Stop(Plugin.InternalNameConst);
+        this.PauseAutoFishing(ctx);
         this.TakeOverAfterFish(ctx, fish, rest, have);
         return true;
+    }
+
+    // こちらが Questionable を止めて自分で動く間の、自動の釣りの止め（不具合の例：漁師 Lv45 で Questionable を止めた後も、
+    // AutoHook が有効のまま残り、釣り場で自分で竿を投げ続けて、こちらの移動が始まらなかった。Questionable の釣りの手順は、終わると AutoHook を
+    // 「手順を始めたときの状態」に戻す。この実行では始めから有効だった）
+    private bool? autoHookBefore;
+    private DateTime quitSentAt = DateTime.MinValue;
+
+    /// <summary>釣りの構えを解く行動（Action 299「中断」。Questionable の EAction.FSHQuit と同じ）。</summary>
+    public const uint FishingQuitAction = 299;
+
+    /// <summary>検証の仕組み用：設定すると、行動を使う代わりにこれを呼ぶ。本番では null のまま。</summary>
+    public static Func<uint, bool>? TestUseAction { get; set; }
+
+    /// <summary>AutoHook が有効なら一時的に無効にする（元の状態は覚えておき、RestoreAutoFishing で戻す）。</summary>
+    private void PauseAutoFishing(TaskContext ctx)
+    {
+        if (this.autoHookBefore != null || ctx.AutoHook.GetPluginState() != true)
+            return;
+        this.autoHookBefore = true;
+        ctx.AutoHook.SetPluginState(false);
+        ctx.Log.Write("クエスト", "こちらで動く間は、AutoHook を一時的に無効にします（有効のままだと、釣り場で自分で竿を投げ続けるため。Questionable に戻すときに元に戻します）");
+    }
+
+    /// <summary>釣りの構え（採集の状態）のままなら、構えを解く（1秒おき。解けたかは状態で見る）。</summary>
+    private void KeepFishingStopped()
+    {
+        if (!Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.Gathering] || DateTime.UtcNow - this.quitSentAt < TimeSpan.FromSeconds(1))
+            return;
+        this.quitSentAt = DateTime.UtcNow;
+        if (TestUseAction is { } test)
+            test(FishingQuitAction);
+        else
+            GameUi.UseAction(FishingQuitAction);
+    }
+
+    /// <summary>一時的に無効にした AutoHook を元に戻す。</summary>
+    private void RestoreAutoFishing(TaskContext ctx)
+    {
+        if (this.autoHookBefore is not { } before)
+            return;
+        this.autoHookBefore = null;
+        ctx.AutoHook.SetPluginState(before);
+        ctx.Log.Write("クエスト", "一時的に無効にした AutoHook を元に戻しました");
     }
 
     private void TakeOverAfterFish(TaskContext ctx, QuestionableStep fish, List<QuestionableStep> rest, int have)
@@ -1194,6 +1248,7 @@ public sealed unsafe class QuestTask : AutoTask
         if (seq != this.ownFromSeq)
         {
             ctx.Log.Write("クエスト", $"段 {this.ownFromSeq} をこちらで終えました（今の段 {seq}）。続きを Questionable に任せます");
+            this.RestoreAutoFishing(ctx);
             this.started = false;
             this.notRunningFrames = 0;
             return TaskResult.Running;
@@ -1324,6 +1379,7 @@ public sealed unsafe class QuestTask : AutoTask
         // 自分が始めた進行（または別のクエストへ移ったのを見た進行）がまだ動いていれば止め、Questionable の優先リストを元に戻す
         this.starter.Cleanup(ctx);
 
+        this.RestoreAutoFishing(ctx);
         ctx.TextAdvance.ReleaseControl();
         ctx.YesAlready.Release();
 

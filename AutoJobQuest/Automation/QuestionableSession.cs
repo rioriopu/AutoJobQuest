@@ -241,14 +241,20 @@ public static class QuestTakeOver
     /// 買った後、頼み直した Questionable が段の頭の「餌を買う」手順からやり直し、経路データの「餌を持っていればテレポを飛ばす」でテレポせず、
     /// グリダニアに入るのを待ち続けた。キャラクターはリムサ・ロミンサのマーケットボードの前にいた）。
     /// 釣りの手順より前に、クエストを進める手順（話しかける等）があれば返さない（飛ばすと段が進まないため）。
+    /// Questionable が釣りの手順そのものにいるときは返さない（不具合の例：漁師 Lv45 で5匹目を釣った瞬間に引き継ぎ、
+    /// Questionable を止めた。Questionable は自分で釣りを終えて報告へ向かうので、手を出さない）。
+    /// ただし、こちらが天気の限られた魚を買いに行った後（<paramref name="includeFishStep"/>）は、釣りの手順で止めていても返す。
     /// </summary>
     /// <param name="steps">そのクエストの全手順（経路データ）。</param>
     /// <param name="sequence">Questionable がいま進めている段。</param>
     /// <param name="stepIndex">Questionable がいま進めている手順の番号。</param>
     /// <param name="itemsReady">釣りの手順の魚が、必要数そろっているか。</param>
-    public static List<QuestionableStep>? AfterFishReady(IReadOnlyList<QuestionableStep> steps, int sequence, int stepIndex, bool itemsReady)
+    /// <param name="includeFishStep">釣りの手順そのものにいても返すか（こちらが止めて買いに行った後）。</param>
+    public static List<QuestionableStep>? AfterFishReady(IReadOnlyList<QuestionableStep> steps, int sequence, int stepIndex, bool itemsReady, bool includeFishStep = false)
     {
         if (!itemsReady || WeatherFishBuy.FishAhead(steps, sequence, stepIndex) is not { } fish)
+            return null;
+        if (fish.Index == stepIndex && !includeFishStep)
             return null;
         if (steps.Any(s => s.Sequence == sequence && s.Index >= stepIndex && s.Index < fish.Index && s.Type is not ("PurchaseItem" or "WalkTo" or "None")))
             return null;
