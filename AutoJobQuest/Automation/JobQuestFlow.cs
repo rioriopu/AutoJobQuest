@@ -1436,6 +1436,23 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
             return TaskResult.Running;
         }
 
+        // 刺突漁が未解放なら、このジョブクエの前に解放のクエスト（「「刺突漁」で魚を狙え」）を Questionable で進める
+        // （自動で解放するクエストに入れる。漁師 Lv68「減少を食い止めろ」の大方士に要る）。
+        // 前提（漁師 Lv1 のクラスクエスト）は、上の同じ区分の前提として先に済んでいる
+        if (MainQuestGate.GigQuestMissing([next], ctx.Data.Sources!, GatherAbilities.Usable) is var gig and not 0
+            && !FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(gig))
+        {
+            var gigChain = Unlocks.ChainToRun(gig, out var gigBlocked);
+            if (gigBlocked != null)
+                return this.Fail($"刺突漁を解放するクエスト「{Unlocks.QuestName(gig)}」を進められません：{gigBlocked}");
+            if (gigChain.Count > 0)
+            {
+                ctx.Log.Write("クエスト", $"{next} の前に、刺突漁を解放するクエストを進めます：{string.Join(" → ", gigChain.Select(Unlocks.QuestName))}");
+                this.child = new RunQuestTask(gigChain[0], Unlocks.QuestName(gigChain[0]));
+                return TaskResult.Running;
+            }
+        }
+
         // 1本ずつ進め、終わるたびに計画を立て直す（Questionable が Artisan の既製リストで
         // 手持ちの材料を使うことがあるので、次のクエストの納品物が残っているかを毎回確かめてから始める）
         this.child = new QuestTask(next);

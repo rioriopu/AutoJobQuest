@@ -100,6 +100,16 @@ public static class MainQuestGate
     /// <param name="sources">入手元の索引（採集職の納品物の採集点のエリアを見る）。null なら見ない。</param>
     public static HashSet<uint> Missing(IEnumerable<JobQuest> quests, Func<uint, bool> isComplete, Func<uint, bool?>? areaReachable, SourceIndex? sources = null)
     {
+        var list = quests.ToList();
+        return MissingCore(list.Select(q => q.RowId).ToList(), list, isComplete, areaReachable, sources);
+    }
+
+    /// <summary>上と同じ（クエストの番号だけで調べる。機能の解放のクエストなど、ジョブクエでないもの用。エリアと採集点は見ない）。</summary>
+    public static HashSet<uint> Missing(IEnumerable<uint> questIds, Func<uint, bool> isComplete)
+        => MissingCore(questIds.ToList(), [], isComplete, null, null);
+
+    private static HashSet<uint> MissingCore(IReadOnlyList<uint> ids, IReadOnlyList<JobQuest> list, Func<uint, bool> isComplete, Func<uint, bool?>? areaReachable, SourceIndex? sources)
+    {
         var found = new HashSet<uint>();
         var seen = new HashSet<uint>();
         var sheet = Svc.Data.GetExcelSheet<Quest>();
@@ -144,9 +154,8 @@ public static class MainQuestGate
             }
         }
 
-        var list = quests.ToList();
-        foreach (var q in list)
-            Visit(q.RowId, SectionOf(q.RowId), 0);
+        foreach (var id in ids)
+            Visit(id, SectionOf(id), 0);
 
         // 採集職の納品物：採れるエリアがどれも行けなければ、その入口のメインクエストも要る
         if (areaReachable != null && sources != null)
@@ -189,7 +198,7 @@ public static class MainQuestGate
             .First();
     }
 
-    private static HashSet<uint> Ancestors(uint questId)
+    public static HashSet<uint> Ancestors(uint questId)
     {
         var seen = new HashSet<uint>();
         var stack = new Stack<uint>(PreviousOf(questId));
@@ -230,7 +239,10 @@ public static class MainQuestGate
             if (MostAdvanced(missing) is var msq and not 0)
                 lines.Add((msq, job));
 
-            if (sources != null && GigQuestMissing(quests, sources, abilityUsable) is var gig and not 0 && !isComplete(gig))
+            // 刺突漁の解放クエストは、自動で進められるなら止まらない（そのジョブクエの前にこちらで進める）
+            if (sources != null && GigQuestMissing(quests, sources, abilityUsable) is var gig and not 0 && !isComplete(gig)
+                && quests.FirstOrDefault(q => GigQuestMissing([q], sources, abilityUsable) != 0) is { } needsGig
+                && !Planning.PlanBuilder.GigUnlockRunnable(needsGig, gig, isComplete))
                 lines.Add((gig, job));
         }
 

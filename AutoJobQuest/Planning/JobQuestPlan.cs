@@ -143,8 +143,9 @@ public sealed record PrereqContext(
     {
         if (sources == null)
             return null;
-        if (MainQuestGate.GigQuestMissing([q], sources, abilityUsable) is var gig and not 0 && !isComplete(gig))
-            return (gig, $"銛でしか取れない納品物があり、刺突漁が使えません（クエスト「{Unlocks.QuestName(gig)}」が未完了）", BlockKind.Ability);
+        // 刺突漁の解放クエストは、自動で進められるなら止めない（そのジョブクエの前にこちらで進める）
+        if (MainQuestGate.GigQuestMissing([q], sources, abilityUsable) is var gig and not 0 && !isComplete(gig) && !PlanBuilder.GigUnlockRunnable(q, gig, isComplete))
+            return (gig, $"銛でしか取れない納品物があり、刺突漁が使えません（解放のクエスト「{Unlocks.QuestName(gig)}」の前提が未完了で、自動で進められません）", BlockKind.Ability);
         if (Jobs.IsGatherer(q.ClassJobId) && MainQuestGate.Missing([q], isComplete, areaReachable, sources) is { Count: > 0 } missing)
         {
             var m = MainQuestGate.MostAdvanced(missing);
@@ -430,6 +431,22 @@ public static class PlanBuilder
         if (!Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Item>().TryGetRow(n.ItemId, out var item) || item.StackSize <= 1 || !item.CanBeHq)
             return n;
         return n with { Hq = true, Evidence = n.Evidence + "（品質不問だが、NQ と HQ の山が分かれると納品窓で渡せないので HQ で用意する）" };
+    }
+
+    /// <summary>
+    /// 刺突漁を解放するクエスト（「「刺突漁」で魚を狙え」）を、そのジョブクエの前に自動で進められるか。
+    /// 解放クエストの前提が、完了済みか、そのジョブクエの前提の連鎖（同じ実行で先に進める、同じ区分のクエスト）に入っていれば進められる。
+    /// 解放クエスト 68458 の前提は「大海原に泳ぎ出せ！」（メインクエスト。開始条件の「いざ山岳地帯へ」の連鎖に入る）と
+    /// 「網元代行シシプ」（漁師 Lv1 のクラスクエスト。漁師のジョブクエの連鎖に入る）：ゲームデータで確認。
+    /// </summary>
+    public static bool GigUnlockRunnable(JobQuest q, uint gig, Func<uint, bool> isComplete)
+    {
+        var before = Unlocks.ChainCore(q.RowId, isComplete, out var questBlocked, out _);
+        if (questBlocked != null)
+            return false;
+        var willBeDone = before.ToHashSet();
+        Unlocks.ChainCore(gig, id => isComplete(id) || willBeDone.Contains(id), out var blocked, out _);
+        return blocked == null;
     }
 
     /// <summary>

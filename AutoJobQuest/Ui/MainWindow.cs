@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface;
 using Dalamud.Interface.Utility.Raii;
 using Dalamud.Interface.Windowing;
 using AutoJobQuest.Automation;
@@ -38,6 +39,9 @@ public sealed class MainWindow : Window
     private bool reportRequested = true;
     private string? lastWritten;
     private DateTime dataReadyAt = DateTime.MinValue;
+
+    // 必須プラグインの導入（「必須プラグイン」タブ）
+    private readonly Ipc.PluginInstaller installer = new();
 
     public MainWindow(Configuration config, RunLog log, Services services)
         : base("ジョブクエ自動化##AutoJobQuest")
@@ -85,6 +89,12 @@ public sealed class MainWindow : Window
                 this.DrawCharacterTab();
         }
 
+        using (var t = ImRaii.TabItem("必須プラグイン"))
+        {
+            if (t)
+                this.DrawPluginsTab();
+        }
+
         using (var t = ImRaii.TabItem("設定"))
         {
             if (t)
@@ -108,8 +118,8 @@ public sealed class MainWindow : Window
             ? null
             : this.config.OwnerContentId == 0
                 ? "キャラクターにログインしてから開始してください（設定はキャラクターごとに保存します）"
-                : runner.StartBlocker() ?? Jobs.StartProblem(this.config.SelectedCrafters, Jobs.Level) ?? GearCheck.GearProblem(this.config.SelectedCrafters)
-                  ?? this.DataBlocker(anySelected) ?? this.BagBlocker(anySelected);
+                : runner.StartBlocker() ?? this.DataBlocker(anySelected)
+                  ?? (this.StartConditionList(anySelected) is { } conditions ? StartConditions.Blocker(conditions) : "開始条件を確かめています（ログイン後）");
 
         // 一時停止：止めると他のプラグインに頼んだことを全部戻す（止めている間に Artisan・GBR・Questionable が
         // 勝手に動き続けないように）。進み具合は毎回ゲームから読み直すので、もう一度開始すれば続きから進む。
@@ -216,9 +226,8 @@ public sealed class MainWindow : Window
 
     private void DrawJobSelection()
     {
-        ImGui.TextWrapped("対象職はそれぞれLv70以上が必要です（ジョブクエは Lv70 まで）。選んだ職のジョブクエをまとめて進め、始めに呼び鈴でリテイナーから必要品をまとめて引き出します。"
-                          + "鞄の空きが足りなければ開始できません"
-                          + "（チョコボかばん・リテイナーの収集品・装備中・出品中・マテリア付きの品は使いません）。");
+        ImGui.TextWrapped("選んだ職のジョブクエ（Lv70 まで）をまとめて進め、始めに呼び鈴でリテイナーから必要品をまとめて引き出します"
+                          + "（チョコボかばん・リテイナーの収集品・装備中・出品中・マテリア付きの品は使いません）。下の開始条件がすべて ✓ になると開始できます。");
         var sel = this.config.SelectedCrafters;
         var all = sel.All(x => x);
 
@@ -260,6 +269,8 @@ public sealed class MainWindow : Window
                 }
             }
         }
+
+        this.DrawStartConditions();
 
         // 選んだジョブのうち、前提のクエスト（メインクエスト等）が未完了で進められないジョブクエ
         // （チェックを入れた時点で、どのクエストが未達か分かるように）
@@ -305,39 +316,161 @@ public sealed class MainWindow : Window
         return "ゲームデータを読み込んでいます（読み終わると開始できます）";
     }
 
-    // 選んだ職のジョブクエに要る鞄の空きが足りないか（チェックを変えたとき・5秒ごとに調べ直す）
-    private string? bagProblem;
-    private string bagKey = string.Empty;
-    private DateTime bagAt = DateTime.MinValue;
+    // 開始条件（職を選んだら、条件ごとに緑の ✓ か赤の ✗ を出し、全部そろうまで開始させない）。
+    // チェックを変えたとき・5秒ごとに調べ直す（鞄の見積もりは計画を立てるので重い）
+    private List<StartCondition>? startConditions;
+    private string startKey = string.Empty;
+    private DateTime startAt = DateTime.MinValue;
 
-    private string? BagBlocker(bool anySelected)
+    private List<StartCondition>? StartConditionList(bool anySelected)
     {
-        var data = this.Ctx.Data;
-        if (!anySelected || !data.IsReady || !Me.Available)
+        if (!Me.Available)
             return null;
-        var key = string.Concat(this.config.SelectedCrafters.Select(x => x ? '1' : '0')) + "|" + this.config.KeepFreeBagSlots;
-        if (key != this.bagKey || DateTime.UtcNow - this.bagAt > TimeSpan.FromSeconds(5))
+        var key = string.Concat(this.config.SelectedCrafters.Select(x => x ? '1' : '0')) + "|" + this.config.KeepFreeBagSlots + "|" + this.Ctx.Data.IsReady;
+        if (key == this.startKey && DateTime.UtcNow - this.startAt <= TimeSpan.FromSeconds(5) && this.startConditions != null)
+            return this.startConditions;
+
+        (int Need, int Free, int Keep)? bag = null;
+        var data = this.Ctx.Data;
+        if (anySelected && data.IsReady)
         {
             try
             {
                 var plan = PlanBuilder.Build(data, this.config.SelectedCrafters);
-                var need = BagEstimate.ForPlan(plan);
-                var free = Inventory.FreeBagSlots();
-                this.bagProblem = BagEstimate.Shortage(need, free, this.config.KeepFreeBagSlots) > 0
-                    ? BagEstimate.ShortageText(need, free, this.config.KeepFreeBagSlots)
-                    : null;
+                bag = (BagEstimate.ForPlan(plan), Inventory.FreeBagSlots(), this.config.KeepFreeBagSlots);
             }
             catch (Exception ex)
             {
                 this.log.Warn("計画", $"鞄の空きを見積もれませんでした: {ex.Message}");
-                this.bagProblem = null;
             }
-
-            this.bagKey = key;
-            this.bagAt = DateTime.UtcNow;
         }
 
-        return this.bagProblem;
+        try
+        {
+            this.startConditions = StartConditions.Evaluate(StartConditions.Read(this.config, data, bag));
+        }
+        catch (Exception ex)
+        {
+            this.log.Warn("点検", $"開始条件を読めませんでした: {ex.Message}");
+            this.startConditions = null;
+        }
+
+        this.startKey = key;
+        this.startAt = DateTime.UtcNow;
+        return this.startConditions;
+    }
+
+    /// <summary>開始条件を ✓（緑）・✗（赤）・？（灰：まだ分からない）で並べる。</summary>
+    private void DrawStartConditions()
+    {
+        if (!this.config.SelectedCrafters.Any(x => x))
+            return;
+        var list = this.StartConditionList(true);
+        if (list == null)
+        {
+            ImGui.TextColored(Grey, "開始条件：ログインすると確かめます");
+            return;
+        }
+
+        ImGui.TextUnformatted("開始条件：");
+        ImGui.PushTextWrapPos(0);
+        foreach (var c in list)
+        {
+            var (icon, color) = c.Ok switch
+            {
+                true => (FontAwesomeIcon.Check, Green),
+                false => (FontAwesomeIcon.Times, Red),
+                _ => (FontAwesomeIcon.Question, Grey),
+            };
+            using (ImRaii.PushFont(UiBuilder.IconFont))
+                ImGui.TextColored(color, icon.ToIconString());
+            ImGui.SameLine();
+            ImGui.TextColored(color, c.Label);
+            ImGui.Indent(24);
+            ImGui.TextColored(Grey, c.Detail);
+            ImGui.Unindent(24);
+        }
+
+        ImGui.PopTextWrapPos();
+    }
+
+    /// <summary>
+    /// 「必須プラグイン」タブ：導入の状態と、ワンクリックの導入。
+    /// 入れるのは利用者がボタンを押したときだけ。リポジトリが未登録なら、ボタンの文で「登録してインストール」と示してから登録する。
+    /// </summary>
+    private void DrawPluginsTab()
+    {
+        ImGui.PushTextWrapPos(0);
+        ImGui.TextWrapped("この自動化に要るプラグインです。「インストール」を押すと、Dalamud のリポジトリから入れます"
+                          + "（まだ登録していないリポジトリは、ボタンに「リポジトリを登録してインストール」と出ます。押したときに Dalamud の設定へ登録します）。"
+                          + "うまくいかないときは Dalamud のプラグイン画面が開くので、そこで入れてください。");
+        ImGui.PopTextWrapPos();
+        ImGui.Separator();
+
+        using var table = ImRaii.Table("##plugins", 4, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH);
+        if (!table)
+            return;
+        ImGui.TableSetupColumn("プラグイン", ImGuiTableColumnFlags.WidthFixed, 190);
+        ImGui.TableSetupColumn("用途", ImGuiTableColumnFlags.WidthFixed, 140);
+        ImGui.TableSetupColumn("状態", ImGuiTableColumnFlags.WidthStretch);
+        ImGui.TableSetupColumn("操作", ImGuiTableColumnFlags.WidthFixed, 230);
+        ImGui.TableHeadersRow();
+
+        foreach (var p in Ipc.PluginInstaller.Required)
+        {
+            var (state, version, from) = Ipc.PluginInstaller.Read(p);
+            ImGui.TableNextRow();
+            ImGui.TableNextColumn();
+            var (icon, color) = state switch
+            {
+                Ipc.PluginInstaller.State.Loaded => (FontAwesomeIcon.Check, Green),
+                Ipc.PluginInstaller.State.NotLoaded => (FontAwesomeIcon.ExclamationTriangle, Yellow),
+                _ => (FontAwesomeIcon.Times, Red),
+            };
+            using (ImRaii.PushFont(UiBuilder.IconFont))
+                ImGui.TextColored(color, icon.ToIconString());
+            ImGui.SameLine();
+            ImGui.TextUnformatted(p.Display);
+
+            ImGui.TableNextColumn();
+            ImGui.TextUnformatted(p.Why);
+
+            ImGui.TableNextColumn();
+            ImGui.PushTextWrapPos(0);
+            ImGui.TextColored(color, state switch
+            {
+                Ipc.PluginInstaller.State.Loaded => $"読み込み済み {version}",
+                Ipc.PluginInstaller.State.NotLoaded => $"入っているが読み込まれていない {version}",
+                _ => "入っていない",
+            });
+            if (from != null)
+                ImGui.TextColored(Grey, $"導入元：{from}");
+            if (this.installer.Busy(p) is { } busy)
+                ImGui.TextColored(Yellow, busy);
+            else if (this.installer.Result(p) is { } result)
+                ImGui.TextColored(Grey, result);
+            ImGui.PopTextWrapPos();
+
+            ImGui.TableNextColumn();
+            switch (state)
+            {
+                case Ipc.PluginInstaller.State.Missing:
+                    var registered = Ipc.PluginInstaller.RepoRegistered(p) == true;
+                    using (ImRaii.Disabled(this.installer.Busy(p) != null))
+                    {
+                        if (ImGui.Button($"{(registered ? "インストール" : "リポジトリを登録してインストール")}##install{p.Display}"))
+                            this.installer.Install(p);
+                    }
+
+                    if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                        ImGui.SetTooltip(p.RepoUrl == null ? "Dalamud の公式リポジトリから入れます" : $"リポジトリ：{p.RepoUrl}");
+                    break;
+                case Ipc.PluginInstaller.State.NotLoaded:
+                    if (ImGui.Button($"プラグイン画面で有効にする##open{p.Display}"))
+                        Ipc.PluginInstaller.OpenInstaller(p, installed: true);
+                    break;
+            }
+        }
     }
 
     // 選んだ職のジョブクエに要るメインクエストが未完了か（チェックを変えたとき・5秒ごとに調べ直す）
@@ -601,8 +734,8 @@ public sealed class MainWindow : Window
         this.blockedCache = null;
         this.blockedKey = string.Empty;
         this.blockedAt = DateTime.MinValue;
-        this.bagKey = string.Empty;
-        this.bagProblem = null;
+        this.startKey = string.Empty;
+        this.startConditions = null;
         this.report = null;
         this.reportRequested = true;
     }
@@ -682,7 +815,7 @@ public sealed class MainWindow : Window
 
             var keepFree = this.config.KeepFreeBagSlots;
             ImGui.SetNextItemWidth(160);
-            if (ImGui.InputInt("鞄に残しておく空き（枠）", ref keepFree, 1, 5))
+            if (ImGui.InputInt("予備枠（鞄に残しておく空き・枠）", ref keepFree, 1, 5))
             {
                 this.config.KeepFreeBagSlots = Math.Clamp(keepFree, 0, 100);
                 this.config.Save();

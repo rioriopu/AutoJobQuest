@@ -136,8 +136,10 @@ public static class Preflight
                     why.Add($"「{AreaAccess.Name(step.Territory)}」の風脈がすべて開放されていない（漁場が水中で、GBR は飛べるエリアでだけ潜る）");
                 if (!ctx.AutoHook.IsLoaded)
                     why.Add("AutoHook が読み込まれていない");
-                if (GatherAbilities.Usable(GatherAbilities.Gig) == false)
-                    why.Add($"刺突漁が使えない（{GatherAbilities.Requirement(GatherAbilities.Gig)}）");
+                // 刺突漁が未解放なら、そのジョブクエの前に解放のクエストを Questionable で進める
+                var gigNote = GatherAbilities.Usable(GatherAbilities.Gig) == false
+                    ? $"。刺突漁は未解放なので、このジョブクエの前に「{Unlocks.QuestName(StartConditions.GigUnlockQuest())}」を Questionable で進めて解放します"
+                    : string.Empty;
                 // GBR が潜水・刺突漁をできる設定でなければ、刺突漁の間だけ合わせる。何を変えるかを先に知らせる
                 var willChange = Automation.GbrRequiredSettings.Fishing.Concat(Automation.GbrRequiredSettings.Spearfishing)
                     .Where(s => ctx.Gbr.ReadAutoGatherBool(s.Name) == !s.Value).ToList();
@@ -146,7 +148,7 @@ public static class Preflight
                     : $"。GBR の設定を刺突漁の間だけ変え、終わったら戻します：{string.Join("・", willChange.Select(s => $"「{s.Label}」を {Automation.GbrRequiredSettings.OnOff(s.Value)}（{s.Why}）"))}";
                 list.Add(why.Count == 0
                     ? new PreflightItem(Severity.Ok, $"{Jobs.Name(q.ClassJobId)} {q} の手で行う手順の {CraftPlanner.ItemName(item)} は、GBR と AutoHook で自動で刺突漁をします"
-                                                     + "（AutoHook に刺突漁のプリセットを1つ残します）" + settingsNote)
+                                                     + "（AutoHook に刺突漁のプリセットを1つ残します）" + gigNote + settingsNote)
                     : new PreflightItem(Severity.Warn, $"{Jobs.Name(q.ClassJobId)} {q} の手で行う手順の {CraftPlanner.ItemName(item)} は、自動の刺突漁ができません"
                                                        + $"（{string.Join("・", why)}）。そこで手で行うよう知らせて待ちます"));
             }
@@ -172,12 +174,10 @@ public static class Preflight
         if (Jobs.VerifyLayout() is { } layoutProblem)
             list.Add(new PreflightItem(Severity.Error, layoutProblem));
 
-        if (Jobs.StartProblem(ctx.Config.SelectedCrafters, Jobs.Level) is { } levelProblem)
-            list.Add(new PreflightItem(Severity.Error, levelProblem));
-
-        // 選んだ製作職のギアセットの主道具・副道具・頭・胴・腕・脚・足が Lv68 以上か
-        if (GearCheck.GearProblem(ctx.Config.SelectedCrafters) is { } gearProblem)
-            list.Add(new PreflightItem(Severity.Error, gearProblem));
+        // 開始条件（Lv70・装備 Lv68・メインクエスト・蒼天と紅蓮の風脈とエーテライト・受注数・必須プラグイン・ギル）。
+        // 画面でも開始ボタンを止めているが、始める直前にもう一度確かめる。鞄は画面で確かめる（ここでは計画を立て直さない）
+        foreach (var c in StartConditions.Evaluate(StartConditions.Read(ctx.Config, ctx.Data, null)).Where(c => c.Kind != StartConditionKind.Bag && c.Ok != true))
+            list.Add(new PreflightItem(Severity.Error, $"開始条件：{c.Label}（{c.Detail}）"));
 
 
         // 3) レベル。見るのは今の計画で使う職だけ（以前は使わない職の Lv60 未満でも注意を出していた）。
@@ -373,20 +373,7 @@ public static class Preflight
         if (plan != null && plan.RemainingQuests.Count > 0)
             list.AddRange(QuestionableSettings(plan, ctx.Config.HideOtherQuestsDuringRun));
 
-        // 5.98) ジャーナルの受注数（受注中のクエストが上限だと、新しいクエストを受けられず Questionable が受注を待ち続ける）
-        unsafe
-        {
-            var qm = FFXIVClientStructs.FFXIV.Client.Game.QuestManager.Instance();
-            if (qm != null && plan != null && plan.RemainingQuests.Count > 0)
-            {
-                var accepted = qm->NumAcceptedQuests;
-                var cap = qm->NormalQuests.Length;
-                if (accepted >= cap)
-                    list.Add(new PreflightItem(Severity.Warn, $"受注中のクエストが {accepted} 本で上限です。受注済みは進められますが、新規受注時に空きがなければ止めます"));
-                else if (accepted >= cap - 2)
-                    list.Add(new PreflightItem(Severity.Warn, $"受注中のクエストが {accepted} 本です（上限 {cap} 本）。ジョブクエと前提のクエストを受けるうちに上限に届くと止まります"));
-            }
-        }
+        // 5.98) ジャーナルの受注数は、開始条件（受注枠−2 本以下）で見る（上の「開始条件」）
 
         // 6) Artisan の簡易製作（設定ファイルを読むだけ）
         var quick = ReadArtisanBool("QuickSynthMode");
