@@ -90,6 +90,19 @@ public sealed class Configuration
     public int MaxRetryRounds { get; set; } = 3;
 
     /// <summary>
+    /// 受注後に作る品（Lv61〜70 の32品。材料はクエストがくれて、何度でももらい直せる）が HQ にならなかったとき、何回まで作り直すか（既定10）。
+    /// 失うのは1回ごとのクリスタルだけなので、ほかの製作の上限（<see cref="MaxRetryRounds"/>）とは分ける。クリスタルの予備も、この回数分を先に用意する。
+    /// </summary>
+    public int QuestCraftRetryRounds { get; set; } = 10;
+
+    /// <summary>
+    /// 選ばなかった製作職で中間素材を作るときも、ギアセットの主道具・副道具・頭・胴・腕・脚・足が Lv68 以上であることを求めるか
+    /// （既定 true。製作の失敗で素材を失わないため）。満たさない職の中間素材は、作らずにマーケットボードで買う。
+    /// 切ると、レシピのレベルに届けば装備を問わず作る（ギアセットは要る）。
+    /// </summary>
+    public bool RequireGearForOtherCrafters { get; set; } = true;
+
+    /// <summary>
     /// 紫貨を稼ぐために作って納品する収集品（収集用のシーダーロングボウ＝30970）。
     /// 戦闘でしか取れない素材が無く、Lv50 の木工レシピで作れるため。別の品にしたい場合はここを変える。
     /// </summary>
@@ -280,7 +293,10 @@ public sealed class Configuration
         Data.SpecialCurrency.Fallback = this.SpecialCurrencyFallback;
 
         // 受注後に作る品の作り直しの予備（そのクリスタルを先に用意する）。開始するときにも入れ直す（JobQuestFlow）
-        Planning.PlanBuilder.QuestCraftSpare = Math.Max(0, this.MaxRetryRounds);
+        Planning.PlanBuilder.QuestCraftSpare = Math.Max(0, this.QuestCraftRetryRounds);
+
+        // 選ばなかった製作職の装備の条件（作れる職の判定へ渡す）
+        Data.CraftAbility.RequireGear = this.RequireGearForOtherCrafters;
 
         // 古い設定ファイルで配列の長さが違うと、チェックボックスの描画で範囲外になる
         if (this.SelectedCrafters is not { Length: 11 })

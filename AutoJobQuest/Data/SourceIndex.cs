@@ -62,6 +62,12 @@ public sealed class ItemSources
 
     public bool Spearfish { get; set; }
 
+    /// <summary>
+    /// 釣り・銛で取るときの品のレベル（FishParameter・SpearfishingItem の GatheringItemLevel。行が複数なら低いほう。0 は不明）。
+    /// 漁師のレベルがこれに届かなければ、釣りの手段は使わない。
+    /// </summary>
+    public int FishLevel { get; set; }
+
     /// <summary>落とすモンスター（名前 ID）。</summary>
     public List<uint> DropMobs { get; } = [];
 
@@ -285,11 +291,22 @@ public sealed class SourceIndex
     {
         foreach (var f in Svc.Data.GetExcelSheet<FishParameter>())
             if (f.Item.RowId is > 0 and < 1_000_000)
-                this.Get(f.Item.RowId).Fish = true;
+            {
+                var s = this.Get(f.Item.RowId);
+                s.Fish = true;
+                s.FishLevel = LowerLevel(s.FishLevel, f.GatheringItemLevel.ValueNullable?.GatheringItemLevel ?? 0);
+            }
 
         foreach (var f in Svc.Data.GetExcelSheet<SpearfishingItem>())
             if (f.Item.RowId != 0)
-                this.Get(f.Item.RowId).Spearfish = true;
+            {
+                var s = this.Get(f.Item.RowId);
+                s.Spearfish = true;
+                s.FishLevel = LowerLevel(s.FishLevel, f.GatheringItemLevel.ValueNullable?.GatheringItemLevel ?? 0);
+            }
+
+        // 0（不明）は比べない
+        static int LowerLevel(int now, int level) => level <= 0 ? now : now <= 0 ? level : Math.Min(now, level);
     }
 
     private void BuildVendors()

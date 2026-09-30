@@ -60,6 +60,11 @@ public sealed class CraftPlan
 
     /// <summary>秘伝書が要るのにまだ読んでいないレシピ。</summary>
     public List<PlannedCraft> LockedBySecretBook { get; } = [];
+
+    /// <summary>
+    /// レシピはあるが、作れる職がいないので作らない品（品 → 理由。製作しない素材として扱い、マーケットボードで買う）。
+    /// </summary>
+    public Dictionary<uint, string> NotCraftable { get; } = [];
 }
 
 /// <summary>所持数の見え方。計画を所持数から切り離して確かめられるようにするための窓口。</summary>
@@ -110,17 +115,31 @@ public sealed class CraftPlanner
         }
     }
 
-    /// <summary>そのアイテムを作るレシピ。作れないなら null。</summary>
-    public Recipe? Pick(uint itemId)
+    /// <summary>
+    /// そのアイテムを作るレシピ。作れないなら null。
+    /// <paramref name="ability"/> を渡すと、作れる職のレシピの中から選ぶ（null なら職を問わない）。
+    /// </summary>
+    public Recipe? Pick(uint itemId, CraftAbility? ability = null)
     {
         if (!this.byItem.TryGetValue(itemId, out var list))
             return null;
 
         return list
+            .Where(x => ability == null || ability.Can(x))
             .OrderBy(x => x.RecipeLevelTable.ValueNullable?.ClassJobLevel ?? 999)
             .ThenBy(x => x.RowId)
-            .First();
+            .Cast<Recipe?>()
+            .FirstOrDefault();
     }
+
+    /// <summary>その品のレシピを、どの職も作れない理由（職ごと。例：「鍛冶師 Lv45・レシピ Lv58」）。</summary>
+    public string WhyNotCraftable(uint itemId, CraftAbility ability)
+        => this.byItem.TryGetValue(itemId, out var list)
+            ? string.Join("／", list
+                .GroupBy(x => Jobs.CraftTypeToClassJob(x.CraftType.RowId))
+                .OrderBy(g => g.Key)
+                .Select(g => $"{Jobs.Name(g.Key)} {ability.WhyNot(g.Key, g.Min(CraftAbility.RecipeLevel)) ?? "作れる"}"))
+            : "レシピが無い";
 
     public bool IsCraftable(uint itemId) => this.byItem.ContainsKey(itemId);
 
@@ -142,7 +161,11 @@ public sealed class CraftPlanner
     /// <param name="targets">納品物（同じ品目が複数あってもよい。合算する）。</param>
     /// <param name="inv">所持数。</param>
     /// <param name="isBookUnlocked">秘伝書を読んだか（SecretRecipeBook の行 ID → 読了）。</param>
-    public CraftPlan Build(IEnumerable<QuestItemReq> targets, IInventoryView inv, Func<uint, bool> isBookUnlocked)
+    /// <param name="ability">
+    /// どの職がどのレシピを作れるか。作れる職がいない品は製作しない素材として扱い（マーケットボードで買う）、
+    /// その材料も集めない。null なら職を問わず作れるものとする（ゲームデータだけで見積もる、別スレッドの計算用）。
+    /// </param>
+    public CraftPlan Build(IEnumerable<QuestItemReq> targets, IInventoryView inv, Func<uint, bool> isBookUnlocked, CraftAbility? ability = null)
     {
         var plan = new CraftPlan();
 
@@ -164,12 +187,16 @@ public sealed class CraftPlanner
             if (recipeOf.ContainsKey(item) || !visiting.Add(item))
                 return;
 
-            var r = this.Pick(item);
+            var r = this.Pick(item, ability);
             if (r != null)
             {
                 recipeOf[item] = r.Value;
                 foreach (var (ing, _) in Ingredients(r.Value))
                     Assign(ing);
+            }
+            else if (ability != null && this.IsCraftable(item))
+            {
+                plan.NotCraftable[item] = this.WhyNotCraftable(item, ability);
             }
 
             visiting.Remove(item);

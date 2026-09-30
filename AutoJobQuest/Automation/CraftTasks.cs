@@ -167,6 +167,14 @@ public sealed class CraftOneTask : AutoTask
     // 作る前の材料の所持数（「材料が減った」を確かめるため）
     private readonly Dictionary<uint, int> ingredientsBefore = [];
 
+    // 製作の失敗：失敗に見え始めた時刻（1秒続いたら本物とみる）・連続製作を止めてもらったか・製作が止まった時刻
+    private DateTime? failureSeenAt;
+    private bool failureStopRequested;
+    private DateTime? idleSince;
+
+    /// <summary>製作に失敗したときに、自分だけに見えるチャットへ出す文。</summary>
+    public const string FailureChat = "製作に失敗したので、装備品や食事、スキル回し等を見直して下さい";
+
     public CraftOneTask(PlannedCraft craft)
     {
         this.craft = craft;
@@ -294,8 +302,27 @@ public sealed class CraftOneTask : AutoTask
         if (busy == true)
         {
             this.sawBusy = true;
-            var made = this.CountMade(Inventory.Snapshot()) - this.beforeAll;
+            this.idleSince = null;
+            var busyInv = Inventory.Snapshot();
+            var made = this.CountMade(busyInv) - this.beforeAll;
             this.Status = $"Artisan が製作中（{Math.Max(0, made)}/{this.expected}個）";
+
+            // 連続製作の途中で失敗したら（作っている最中の1回を除いても、始めた回数ができた回数より多い状態が1秒続いたら）、
+            // 連続製作を止めてもらう。今の1回が終わってから、下で止める
+            if (!this.failureStopRequested && this.FailedSoFar(busyInv, inProgress: true) > 0)
+            {
+                this.failureSeenAt ??= DateTime.UtcNow;
+                if (DateTime.UtcNow - this.failureSeenAt.Value >= TimeSpan.FromSeconds(1))
+                {
+                    this.failureStopRequested = true;
+                    ctx.Artisan.SetEndurance(false);
+                    ctx.Log.Warn("製作", $"{CraftPlanner.ItemName(this.craft.ItemId)} の製作に失敗しました。連続製作を止めてもらい、今の1回が終わったら止めます");
+                }
+            }
+            else if (!this.failureStopRequested)
+            {
+                this.failureSeenAt = null;
+            }
 
             var limit = TimeSpan.FromSeconds(60 + 90 * this.requestCrafts);
             if (this.PhaseElapsed > limit)
@@ -314,6 +341,20 @@ public sealed class CraftOneTask : AutoTask
 
         var inv = Inventory.Snapshot();
         var nowCount = this.CountMade(inv);
+
+        // 製作に失敗していたら、その場で止めて知らせる（失敗すると材料を失うので、続けない）。
+        // 品が増える反映がわずかに遅れても取り違えないよう、止まってから1秒は見直す
+        this.idleSince ??= DateTime.UtcNow;
+        var failed = this.FailedSoFar(inv, inProgress: false);
+        if (failed > 0)
+        {
+            if (DateTime.UtcNow - this.idleSince.Value < TimeSpan.FromSeconds(1))
+                return TaskResult.Running;
+            ctx.Artisan.SetEndurance(false);
+            Svc.Chat.Print($"[AutoJobQuest] {FailureChat}（{CraftPlanner.ItemName(this.craft.ItemId)}）");
+            return this.Fail($"{CraftPlanner.ItemName(this.craft.ItemId)} の製作に失敗しました（{failed} 回。材料を失っています）。"
+                             + "装備品や食事、スキル回し（Artisan のソルバー・マクロ）等を見直してから、もう一度開始してください（続きから進みます）");
+        }
 
         // HQ 指定の試し作り（1回）の結果：HQ になっていれば残りを作る（下の頼み直しで続ける）。NQ だったら残りは作らない
         var stopAfterTrial = false;
@@ -388,6 +429,14 @@ public sealed class CraftOneTask : AutoTask
 
         this.Finished = true;
         return TaskResult.Done;
+    }
+
+    /// <summary>この作業で失敗した回数（材料の減りと品の増えから数える：<see cref="CraftFailure"/>）。</summary>
+    private int FailedSoFar(Inventory inv, bool inProgress)
+    {
+        var attempts = CraftFailure.Attempts(CraftPlanner.Ingredients(this.recipe).Select(x => (x.Item, x.Amount)),
+            item => this.ingredientsBefore.GetValueOrDefault(item) - inv.CountAll(item));
+        return CraftFailure.Failed(attempts, this.CountMade(inv) - this.beforeAll, this.craft.Yield, inProgress);
     }
 
     private int CountMade(Inventory inv)

@@ -110,7 +110,7 @@ public sealed class QuestCraftTask : AutoTask
         }
 
         // 材料が無い：HQ にならなかった（材料を使い切った）。くれた相手に話しかけてもらい直す
-        if (this.redo >= Math.Max(0, ctx.Config.MaxRetryRounds))
+        if (this.redo >= Math.Max(0, ctx.Config.QuestCraftRetryRounds))
             return this.Fail($"{CraftPlanner.ItemName(this.qc.ItemId)} を {this.redo + 1} 回作っても HQ になりませんでした。"
                              + "装備・食事・Artisan のソルバーの設定を見直し、材料をくれた相手"
                              + (this.qc.Giver != 0 ? $"（{NpcStepTask.NpcName(this.qc.Giver)}）" : string.Empty)
@@ -120,7 +120,7 @@ public sealed class QuestCraftTask : AutoTask
                              + "手で材料をもらい直してから、もう一度開始してください");
 
         this.redo++;
-        ctx.Log.Warn("クエスト", $"{CraftPlanner.ItemName(this.qc.ItemId)} が HQ になりませんでした。{NpcStepTask.NpcName(this.qc.Giver)} に話しかけて材料をもらい直し、作り直します（{this.redo}/{ctx.Config.MaxRetryRounds} 回目）");
+        ctx.Log.Warn("クエスト", $"{CraftPlanner.ItemName(this.qc.ItemId)} が HQ になりませんでした。{NpcStepTask.NpcName(this.qc.Giver)} に話しかけて材料をもらい直し、作り直します（{this.redo}/{ctx.Config.QuestCraftRetryRounds} 回目）");
         this.giver = new NpcStepTask(step, this.quest.RowId);
         this.sub = this.giver;
         return TaskResult.Running;

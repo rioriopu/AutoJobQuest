@@ -8,8 +8,9 @@ using Lumina.Excel.Sheets;
 namespace AutoJobQuest.Data;
 
 /// <summary>
-/// 選んだ職のジョブクエ（Lv70 まで）に要るメインクエストが未完了なら、開始させない（
-/// 「メインクエスト：○○未達のため、開始不可」と出して、Lv69 以下と同じく開始できないようにする）。
+/// 選んだ職のジョブクエ（Lv70 まで）に要るメインクエストのうち、未完了のもの。
+/// 開始は止めない：進められるジョブクエは進め、受けられないジョブクエの手前で止める
+/// （画面と開始の確認に「メインクエスト：○○未達のため、その手前で止まります」と出す。以前は開始そのものを止めていた）。
 ///
 /// 【要るメインクエストの見つけ方（ゲームデータの調査。242本すべてで確認）】
 ///  ① 前提の欄（Quest.PreviousQuest）：11職とも Lv50 の蒼天の入口 ← 希望の灯火、Lv60 の紅蓮の入口 ← 宿命の果て。
@@ -210,11 +211,12 @@ public static class MainQuestGate
             : [];
 
     /// <summary>
-    /// 開始できない理由（選んだ職のジョブクエに要るメインクエストが未完了）。無ければ null。
-    /// 文言は「メインクエスト：○○未達のため、開始不可（職名）」。同じメインクエストの職はまとめる。
+    /// 止まる場所の案内（選んだ職のジョブクエに要るメインクエストが未完了）。無ければ null。
+    /// 文言は「メインクエスト：○○未達のため、その手前で止まります（職名）」。同じメインクエストの職はまとめる。
     /// あわせて、漁師 Lv68 の刺突漁のように、納品物を取る能力の解放クエストが未完了のものも同じ形で出す（「サブクエスト：…」）。
+    /// 実際に止まる場所は計画の進められないジョブクエ（<see cref="Planning.PlanBuilder.FindBlocked(IEnumerable{JobQuest}, Planning.PrereqContext)"/>）で決まる。
     /// </summary>
-    public static string? StartProblem(QuestCatalog catalog, SourceIndex? sources, bool[] selected, Func<uint, bool> isComplete,
+    public static string? StopNote(QuestCatalog catalog, SourceIndex? sources, bool[] selected, Func<uint, bool> isComplete,
         Func<uint, bool?>? areaReachable, Func<uint, bool?> abilityUsable)
     {
         var lines = new List<(uint Quest, uint Job)>();
@@ -235,16 +237,16 @@ public static class MainQuestGate
         if (lines.Count == 0)
             return null;
         return string.Join(" / ", lines.GroupBy(l => l.Quest).Select(g =>
-            $"{SectionLabel(g.Key)}：{Unlocks.QuestName(g.Key)}未達のため、開始不可（{string.Join("・", g.Select(x => Jobs.Name(x.Job)))}）"));
+            $"{SectionLabel(g.Key)}：{Unlocks.QuestName(g.Key)}未達のため、その手前で止まります（{string.Join("・", g.Select(x => Jobs.Name(x.Job)))}）"));
     }
 
     /// <summary>ゲームから読む版（フレームワークのスレッドから呼ぶ）。ゲームデータの読み込み前は null（判断しない）。</summary>
-    public static string? StartProblem(GameDataCache data, bool[] selected)
+    public static string? StopNote(GameDataCache data, bool[] selected)
     {
         if (data.Quests is not { } catalog)
             return null;
         var unlocked = AreaAccess.UnlockedNow();
-        return StartProblem(catalog, data.Sources, selected, FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete,
+        return StopNote(catalog, data.Sources, selected, FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete,
             terr => AreaAccess.Reachable(terr, unlocked), GatherAbilities.Usable);
     }
 

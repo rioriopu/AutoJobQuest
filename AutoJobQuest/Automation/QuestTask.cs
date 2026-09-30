@@ -96,6 +96,10 @@ public sealed unsafe class QuestTask : AutoTask
     private bool gearsetSetupChecked;
     private int ownFromSeq;
 
+    // Questionable が推奨装備に着替えた（園芸師のジョブクエ17本）。完了したら、その職のギアセットに着直す
+    private bool gearChangedByQuestionable;
+    private EquipJobTask? reequip;
+
     // Lv1 の受注をこちらで行う前の準備（着替え → 受注前の確かめ）
     private QuestionableStep? lv1Accept;
     private AutoTask? lv1Equip;
@@ -199,6 +203,23 @@ public sealed unsafe class QuestTask : AutoTask
     {
         if (this.IsComplete)
         {
+            // 推奨装備に着替えていたら、完了の後にその職のギアセットに着直す（途中で着直すと、Questionable が段の頭からやり直して、また着替えるため）
+            if (this.gearChangedByQuestionable)
+            {
+                this.reequip ??= new EquipJobTask(this.quest.ClassJobId, reequip: true);
+                var r = this.reequip.Step(ctx);
+                this.Status = this.reequip.Status;
+                if (r == TaskResult.Running)
+                    return TaskResult.Running;
+                this.reequip.Cleanup(ctx);
+                if (r == TaskResult.Failed)
+                    ctx.Log.Warn("クエスト", $"{Jobs.Name(this.quest.ClassJobId)} のギアセットに着直せませんでした（{this.reequip.FailReason}）。ギアセットで着替え直してください");
+                else
+                    ctx.Log.Write("クエスト", $"推奨装備から {Jobs.Name(this.quest.ClassJobId)} のギアセットに着直しました");
+                this.gearChangedByQuestionable = false;
+                this.reequip = null;
+            }
+
             ctx.Log.Write("クエスト", $"{this.quest} を完了しました");
             return TaskResult.Done;
         }
@@ -277,6 +298,13 @@ public sealed unsafe class QuestTask : AutoTask
         if (stepData != null && stepData.QuestId == QuestionableIpc.ToQuestId(this.quest.RowId))
         {
             this.Status = $"Questionable: 手順 {stepData.Sequence}-{stepData.Step} {stepData.InteractionType}";
+
+            // Questionable が推奨装備に着替える手順（園芸師のジョブクエ17本）。完了したら、その職のギアセットに着直す
+            if (stepData.InteractionType == "EquipRecommended" && !this.gearChangedByQuestionable)
+            {
+                this.gearChangedByQuestionable = true;
+                ctx.Log.Write("クエスト", $"Questionable が推奨装備に着替えます。クエストが完了したら {Jobs.Name(this.quest.ClassJobId)} のギアセットに着直します");
+            }
 
             // 手で行う手順（Instruction）：Questionable は段が変わるまで待つ。知らせて待つ（その間は上限に数えない）。
             // この段で渡す品がそろい、残りが話しかけるだけなら、渡すところからこちらで行う
@@ -740,6 +768,15 @@ public sealed unsafe class QuestTask : AutoTask
         this.ownTask = null;
         this.lv1Equip?.Cleanup(ctx);
         this.lv1Equip = null;
+        this.reequip?.Cleanup(ctx);
+        this.reequip = null;
+        if (this.gearChangedByQuestionable)
+        {
+            // 途中で止まった。装備が推奨装備のままなので、利用者に着直してもらう
+            var msg = $"Questionable が {Jobs.Name(this.quest.ClassJobId)} の装備を推奨装備に替えたまま止まりました。ギアセットで着替え直してください";
+            ctx.Log.Warn("クエスト", msg);
+            Svc.Chat.Print($"[AutoJobQuest] {msg}");
+        }
         this.questCraft?.Cleanup(ctx);
         this.questCraft = null;
 

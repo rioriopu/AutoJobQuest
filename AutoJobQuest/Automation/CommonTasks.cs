@@ -476,21 +476,27 @@ public sealed class TeleportTask : AutoTask
 public sealed class EquipJobTask : AutoTask
 {
     private readonly uint classJob;
+    private readonly bool reequip;
     private int requests;
 
     // 前に頼んだときの EquipGearset の戻り値（0＝受け付けた、-1＝断った。まだ頼んでいなければ null）
     private int? lastResult;
 
-    public EquipJobTask(uint classJob)
+    /// <param name="classJob">着替える職。</param>
+    /// <param name="reequip">
+    /// 同じ職でも、その職のギアセットを着直す（ギアセットの品が全部装備されるまで）。Questionable が推奨装備に着替えた後に使う。
+    /// </param>
+    public EquipJobTask(uint classJob, bool reequip = false)
     {
         this.classJob = classJob;
+        this.reequip = reequip;
     }
 
-    public override string Name => $"着替え: {Jobs.Name(this.classJob)}";
+    public override string Name => $"{(this.reequip ? "着直し" : "着替え")}: {Jobs.Name(this.classJob)}";
 
     protected override unsafe TaskResult Tick(TaskContext ctx)
     {
-        if (Jobs.CurrentClassJob == this.classJob)
+        if (Jobs.CurrentClassJob == this.classJob && (!this.reequip || GearCheck.FindGearset(this.classJob) is var set && set >= 0 && GearsetGuard.GearsetEquipped(set)))
             return TaskResult.Done;
 
         // 動けない間（戦闘中・会話中など）の待ちは長めの上限で別に数える
@@ -510,7 +516,9 @@ public sealed class EquipJobTask : AutoTask
                 return TaskResult.Running;
             case EquipRetry.Verdict.Fail:
                 return this.Fail(this.lastResult == 0
-                    ? $"{Jobs.Name(this.classJob)} に着替えられませんでした（{EquipRetry.MaxRequests} 回頼み、ゲームは受け付けましたが、ジョブが変わりません）"
+                    ? this.reequip
+                        ? $"{Jobs.Name(this.classJob)} のギアセットに着直せませんでした（{EquipRetry.MaxRequests} 回頼み、ゲームは受け付けましたが、ギアセットの品が全部は装備されません）"
+                        : $"{Jobs.Name(this.classJob)} に着替えられませんでした（{EquipRetry.MaxRequests} 回頼み、ゲームは受け付けましたが、ジョブが変わりません）"
                     : $"{Jobs.Name(this.classJob)} に着替えられませんでした（{EquipRetry.MaxRequests} 回頼み、ゲームが断りました。ギアセットの装備が欠けている可能性）");
         }
 

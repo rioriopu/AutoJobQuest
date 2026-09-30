@@ -28,9 +28,10 @@ public static class RetainerPlan
     /// 引き出す数を求める。計画の注意（CraftPlan.Problems）があっても例外で止めない（以前は事前点検より前に
     /// 「例外で止まりました」になった）。注意は呼び出し側が記録に出し、その品も分かる範囲で引き出す。
     /// </summary>
-    public static Result Build(CraftPlanner planner, IEnumerable<QuestItemReq> targets, IInventoryView bags, IInventoryView retainers)
+    /// <param name="ability">どの職がどのレシピを作れるか（計画と同じ判定にそろえる。作らない中間素材は、それ自体を引き出す）。</param>
+    public static Result Build(CraftPlanner planner, IEnumerable<QuestItemReq> targets, IInventoryView bags, IInventoryView retainers, CraftAbility? ability = null)
     {
-        var plan = planner.Build(targets, new Combined(bags, retainers), _ => true);
+        var plan = planner.Build(targets, new Combined(bags, retainers), _ => true, ability);
         var result = new Stock();
         foreach (var (id, demand) in plan.StockDemand)
         {

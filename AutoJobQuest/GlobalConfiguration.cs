@@ -16,9 +16,10 @@ public sealed class GlobalConfiguration : IPluginConfiguration
     public int Version { get; set; } = 2;
 
     /// <summary>
-    /// 記録（ログ）を残すフォルダ。既定は開発用のフォルダの ログ（作れなければプラグインの設定フォルダの ログ）。
+    /// 記録（ログ）を残すフォルダ。空なら自動：開発環境（開発用のフォルダがある）では、そのフォルダの ログ、
+    /// それ以外ではプラグインの設定フォルダの ログ（配布したとき、ほかの人の PC に開発用のフォルダを作らない）。
     /// </summary>
-    public string LogDirectory { get; set; } = Core.DebugLog.DefaultDirectory;
+    public string LogDirectory { get; set; } = string.Empty;
 
     /// <summary>画面をゲーム起動時に開くか。</summary>
     public bool OpenOnStartup { get; set; }

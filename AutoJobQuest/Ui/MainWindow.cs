@@ -108,7 +108,8 @@ public sealed class MainWindow : Window
             ? null
             : this.config.OwnerContentId == 0
                 ? "キャラクターにログインしてから開始してください（設定はキャラクターごとに保存します）"
-                : runner.StartBlocker() ?? Jobs.StartProblem(this.config.SelectedCrafters, Jobs.Level) ?? this.DataBlocker(anySelected) ?? this.MainQuestProblem();
+                : runner.StartBlocker() ?? Jobs.StartProblem(this.config.SelectedCrafters, Jobs.Level) ?? GearCheck.GearProblem(this.config.SelectedCrafters)
+                  ?? this.DataBlocker(anySelected) ?? this.BagBlocker(anySelected);
 
         // 一時停止：止めると他のプラグインに頼んだことを全部戻す（止めている間に Artisan・GBR・Questionable が
         // 勝手に動き続けないように）。進み具合は毎回ゲームから読み直すので、もう一度開始すれば続きから進む。
@@ -215,7 +216,8 @@ public sealed class MainWindow : Window
 
     private void DrawJobSelection()
     {
-        ImGui.TextWrapped("対象職はそれぞれLv70以上が必要です（ジョブクエは Lv70 まで）。職ごとに区切って進め、区切りの始めに呼び鈴でリテイナーから必要品を引き出します"
+        ImGui.TextWrapped("対象職はそれぞれLv70以上が必要です（ジョブクエは Lv70 まで）。選んだ職のジョブクエをまとめて進め、始めに呼び鈴でリテイナーから必要品をまとめて引き出します。"
+                          + "鞄の空きが足りなければ開始できません"
                           + "（チョコボかばん・リテイナーの収集品・装備中・出品中・マテリア付きの品は使いません）。");
         var sel = this.config.SelectedCrafters;
         var all = sel.All(x => x);
@@ -270,12 +272,15 @@ public sealed class MainWindow : Window
         else if (blocked.Count > 0)
         {
             ImGui.PushTextWrapPos(0);
-            // メインクエストが未達の職があれば開始できない。そのときは「続けた場合は飛ばします」と案内しない
-            ImGui.TextColored(Yellow, this.MainQuestProblem() != null
-                ? "⚠ 前提のクエストが未完了のため、次のジョブクエは進められません（メインクエストが未達の職があるので、いまは開始できません。上の理由を見てください）："
-                : "⚠ 前提のクエストが未完了のため、次のジョブクエは進められません（開始すると確認が出ます。続けた場合は飛ばします）：");
+            // 開始は止めない（進められるところまで進め、受けられないジョブクエの手前で止まる。
+            // メインクエストに止められる職は、最後にその受注の NPC に話しかけて、断られたところで止まる）
+            ImGui.TextColored(Yellow, "⚠ 前提のクエストが未完了のため、次のジョブクエは進められません（その手前まで進めて止まります。素材も集めません）：");
             foreach (var line in JobQuestPlan.SummarizeBlocked(blocked))
                 ImGui.TextColored(Yellow, $"　・{line}");
+            if (this.MainQuestProblem() is { } note)
+                ImGui.TextColored(Yellow, $"　{note}");
+            if (PlanBuilder.KnockCandidates(blocked, MainQuestGate.IsMainScenario).FirstOrDefault() is { } knock)
+                ImGui.TextColored(Yellow, $"　最後に{Jobs.Name(knock.Quest.ClassJobId)}のジョブクエ「{knock.Quest.Name}」（Lv{knock.Quest.Level}）の受注の NPC に話しかけ、断られたところで止まります");
             ImGui.PopTextWrapPos();
         }
     }
@@ -300,6 +305,41 @@ public sealed class MainWindow : Window
         return "ゲームデータを読み込んでいます（読み終わると開始できます）";
     }
 
+    // 選んだ職のジョブクエに要る鞄の空きが足りないか（チェックを変えたとき・5秒ごとに調べ直す）
+    private string? bagProblem;
+    private string bagKey = string.Empty;
+    private DateTime bagAt = DateTime.MinValue;
+
+    private string? BagBlocker(bool anySelected)
+    {
+        var data = this.Ctx.Data;
+        if (!anySelected || !data.IsReady || !Me.Available)
+            return null;
+        var key = string.Concat(this.config.SelectedCrafters.Select(x => x ? '1' : '0')) + "|" + this.config.KeepFreeBagSlots;
+        if (key != this.bagKey || DateTime.UtcNow - this.bagAt > TimeSpan.FromSeconds(5))
+        {
+            try
+            {
+                var plan = PlanBuilder.Build(data, this.config.SelectedCrafters);
+                var need = BagEstimate.ForPlan(plan);
+                var free = Inventory.FreeBagSlots();
+                this.bagProblem = BagEstimate.Shortage(need, free, this.config.KeepFreeBagSlots) > 0
+                    ? BagEstimate.ShortageText(need, free, this.config.KeepFreeBagSlots)
+                    : null;
+            }
+            catch (Exception ex)
+            {
+                this.log.Warn("計画", $"鞄の空きを見積もれませんでした: {ex.Message}");
+                this.bagProblem = null;
+            }
+
+            this.bagKey = key;
+            this.bagAt = DateTime.UtcNow;
+        }
+
+        return this.bagProblem;
+    }
+
     // 選んだ職のジョブクエに要るメインクエストが未完了か（チェックを変えたとき・5秒ごとに調べ直す）
     private string? msqProblem;
     private string msqKey = string.Empty;
@@ -315,7 +355,7 @@ public sealed class MainWindow : Window
         {
             try
             {
-                this.msqProblem = MainQuestGate.StartProblem(data, this.config.SelectedCrafters);
+                this.msqProblem = MainQuestGate.StopNote(data, this.config.SelectedCrafters);
             }
             catch (Exception ex)
             {
@@ -561,6 +601,8 @@ public sealed class MainWindow : Window
         this.blockedCache = null;
         this.blockedKey = string.Empty;
         this.blockedAt = DateTime.MinValue;
+        this.bagKey = string.Empty;
+        this.bagProblem = null;
         this.report = null;
         this.reportRequested = true;
     }
@@ -630,7 +672,7 @@ public sealed class MainWindow : Window
             ImGui.Separator();
             ImGui.TextUnformatted("リテイナーと鞄");
             var useRetainers = this.config.UseRetainerStock;
-            if (ImGui.Checkbox("区切りの始めに、呼び鈴でリテイナーから要る品を引き出す", ref useRetainers))
+            if (ImGui.Checkbox("開始したら、呼び鈴でリテイナーから要る品をまとめて引き出す", ref useRetainers))
             {
                 this.config.UseRetainerStock = useRetainers;
                 this.config.Save();
@@ -646,7 +688,7 @@ public sealed class MainWindow : Window
                 this.config.Save();
             }
 
-            ImGui.TextColored(Grey, "既定は 5。区切りの大きさ（一度に進める本数）と、リテイナーから引き出す量を、この空きを残す範囲に抑えます");
+            ImGui.TextColored(Grey, "既定は 5。選んだ職に要る鞄の見積もりが、この空きを残して入らなければ開始できません");
 
             ImGui.Separator();
             ImGui.TextUnformatted("製作");
@@ -659,6 +701,29 @@ public sealed class MainWindow : Window
             }
 
             ImGui.TextColored(Grey, "既定は 3（1〜10）。品目ごとに数え、届いたら何を見直せばよいかを出して止めます");
+
+            var questRetry = this.config.QuestCraftRetryRounds;
+            ImGui.SetNextItemWidth(160);
+            if (ImGui.InputInt("受注後に作る品（Lv61〜70）が HQ にならなかったとき、何回まで作り直すか", ref questRetry, 1, 1))
+            {
+                this.config.QuestCraftRetryRounds = Math.Clamp(questRetry, 0, 30);
+                Planning.PlanBuilder.QuestCraftSpare = this.config.QuestCraftRetryRounds;
+                this.config.Save();
+            }
+
+            ImGui.TextColored(Grey, "既定は 10。材料はクエストがくれて、何度でももらい直せます（失うのは1回ごとのクリスタル）。クリスタルはこの回数分を先に用意します");
+
+            var otherGear = this.config.RequireGearForOtherCrafters;
+            if (ImGui.Checkbox("選んでいない製作職も、主道具〜足が Lv68 以上の装備でなければ、中間素材を作らずにマーケットボードで買う", ref otherGear))
+            {
+                this.config.RequireGearForOtherCrafters = otherGear;
+                Data.CraftAbility.RequireGear = otherGear;
+                this.config.Save();
+                this.plan = null;
+            }
+
+            ImGui.TextColored(Grey, "既定は ON。中間素材のレシピのレベルに届く職がいれば、素材を集めて作ります。届く職がいない・ギアセットが無い"
+                                    + "（ON なら装備も足りない）ときは、作らずにマーケットボードで買います。選んだ職の装備は、この設定にかかわらず開始の条件です");
 
             var consumables = this.config.UseArtisanConsumables;
             if (ImGui.Checkbox("ジョブクエの製作で Artisan の既定の食事・薬を使う", ref consumables))

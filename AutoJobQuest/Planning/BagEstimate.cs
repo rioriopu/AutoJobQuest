@@ -96,4 +96,19 @@ public static class BagEstimate
     /// <summary>その品のスタック数（ゲームデータ。読めなければ 1）。</summary>
     public static int StackSize(uint item)
         => Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Item>().TryGetRow(item, out var row) ? (int)Math.Max(1u, row.StackSize) : 1;
+
+    /// <summary>計画の鞄の見積もり（製作の途中の最大＋報酬＋秘伝書の分）。</summary>
+    public static int ForPlan(JobQuestPlan plan)
+        => Slots(plan.Craft, RewardSlots(plan.RemainingQuests), plan.Craft.LockedBySecretBook.Count > 0);
+
+    /// <summary>
+    /// 鞄の空きの不足（枠）。使える空き＝空き − 残しておく空き。足りていれば 0（足りなければ開始できない）。
+    /// </summary>
+    public static int Shortage(int need, int freeSlots, int keepFree)
+        => Math.Max(0, need - (freeSlots - keepFree));
+
+    /// <summary>鞄の空きが足りないときの文。</summary>
+    public static string ShortageText(int need, int freeSlots, int keepFree)
+        => $"鞄の空きが {Shortage(need, freeSlots, keepFree)} 枠足りません（選んだ職のジョブクエに要る見積もり {need} 枠・使える空き {Math.Max(0, freeSlots - keepFree)} 枠"
+           + $"〔空き {freeSlots} 枠から、残しておく空き {keepFree} 枠を除く〕）。選ぶ職を減らすか、鞄を空けてください。残しておく空きは設定タブで変えられます";
 }

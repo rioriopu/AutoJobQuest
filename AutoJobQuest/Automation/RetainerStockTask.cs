@@ -752,7 +752,7 @@ public sealed unsafe class RetainerStockTask : AutoTask
         var (targets, notes) = this.Targets(ctx, bags);
         foreach (var n in notes)
             ctx.Log.Warn("リテイナー", n);
-        var built = RetainerPlan.Build(ctx.Data.Planner!, targets, bags, this.total);
+        var built = RetainerPlan.Build(ctx.Data.Planner!, targets, bags, this.total, CraftAbility.FromGame());
         foreach (var n in built.Problems)
             ctx.Log.Warn("リテイナー", $"引き出しの計算から外した品：{n}");
         this.needed = built.Pull;
@@ -927,7 +927,7 @@ public sealed unsafe class RetainerStockTask : AutoTask
 
         // 引き出せる完成品・中間素材を差し引いた後でも要る秘伝書だけを見る
         var combined = new RetainerPlan.Combined(bags, this.total);
-        var craft = ctx.Data.Planner!.Build(targets, combined, PlanBuilder.IsBookUnlocked);
+        var craft = ctx.Data.Planner!.Build(targets, combined, PlanBuilder.IsBookUnlocked, CraftAbility.FromGame());
         var tomes = craft.LockedBySecretBook.Select(c => c.SecretRecipeBookId).ToHashSet();
         if (tomes.Count == 0)
             return (targets, notes);

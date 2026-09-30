@@ -38,6 +38,30 @@ public static class Preflight
         + "（主道具・副道具・頭・胴・手・脚・足）。満たしていない場合、動作は保証しません。"
         + "チョコボかばんの中身は数えず、引き出しもしません。使いたい素材・完成品は、開始前にカバンかリテイナーへ移してください。";
 
+    /// <summary>
+    /// 開始の確認の先頭に出す、マーケットボードの自動購入のリスクの文（開始ボタン → この文 → はい で始める）。
+    /// </summary>
+    public static string MarketRiskText(Configuration config)
+        => "【ギルの消費についての確認】\n"
+           + "不足する品（マテリア・中間素材・レベルの届かない職の製作品や素材など）は、マーケットボードで自動で買います。ギルを大きく使うことがあります。"
+           + (config.ConfirmPurchaseAboveGil > 0
+               ? $"1回の購入額が {config.ConfirmPurchaseAboveGil:N0} ギルを超えるときは、あらためて確かめます（設定タブで変えられます）。"
+               : "1回の購入額での確かめは切ってあります（設定タブで変えられます）。")
+           + "\nこのリスクを受け入れて開始しますか？「いいえ」で止めます。";
+
+    /// <summary>
+    /// 開始の確認に出す「マーケットボードで買う予定の品」（呼び鈴から引き出す前の見込み）。<paramref name="max"/> 行を超えた分は数だけ出す。
+    /// </summary>
+    public static string MarketPlanText(IReadOnlyList<(string Name, int Need, string? Why)> lines, int max = 20)
+    {
+        if (lines.Count == 0)
+            return string.Empty;
+        var shown = lines.Take(max).Select(l => $"・{l.Name}×{l.Need}" + (l.Why != null ? $"（{l.Why}）" : string.Empty));
+        return "【マーケットボードで買う予定の品】（呼び鈴から引き出す前の見込み。引き出せた分は買いません）\n"
+               + string.Join("\n", shown)
+               + (lines.Count > max ? $"\n・ほか {lines.Count - max} 品目（計画タブにすべて出ています）" : string.Empty);
+    }
+
     /// <summary>必須プラグイン（InternalName, 表示名, 用途）。</summary>
     public static readonly (string Internal, string Display, string Why)[] RequiredPlugins =
     [
@@ -124,10 +148,10 @@ public static class Preflight
         if (Jobs.StartProblem(ctx.Config.SelectedCrafters, Jobs.Level) is { } levelProblem)
             list.Add(new PreflightItem(Severity.Error, levelProblem));
 
-        // 選んだ職のジョブクエ（Lv70 まで）に要るメインクエストが未完了なら始めない
-        var msqProblem = MainQuestGate.StartProblem(ctx.Data, ctx.Config.SelectedCrafters);
-        if (msqProblem != null)
-            list.Add(new PreflightItem(Severity.Error, msqProblem));
+        // 選んだ製作職のギアセットの主道具・副道具・頭・胴・腕・脚・足が Lv68 以上か
+        if (GearCheck.GearProblem(ctx.Config.SelectedCrafters) is { } gearProblem)
+            list.Add(new PreflightItem(Severity.Error, gearProblem));
+
 
         // 3) レベル。見るのは今の計画で使う職だけ（以前は使わない職の Lv60 未満でも注意を出していた）。
         // 使う職＝残りのクエストの職・製作に使う職・採集で集める素材があれば採掘と園芸・釣りで集める素材があれば漁師
@@ -256,14 +280,10 @@ public static class Preflight
                     + $"材料が無ければ Questionable が NPC から買い足します。こちらからは止められません）：{string.Join("、", premadeAlways)}"));
 
             // 前提のクエストが自動で進められない（メインクエスト等が未完了）ジョブクエ。
-            // 止めずに「どのクエストが未達なので動作保証しない」と注意を出す（確認窓で続けるか決める）。
-            // 続けた場合、そのクエストは計画に入れない（素材も集めない）。進められる分だけ進める
-            // メインクエストが未達で開始できない（上の Error）ときは、「続けた場合は飛ばす」とは案内しない
-            var cannotStart = msqProblem != null;
+            // 開始は止めずに、進められるところまで進め、受けられないジョブクエの手前で止まる（素材も集めない）。
+            // 想定した動きなので「動作保証外」の注意にはしない（開始の確認に「進められるところまで」として出す：JobQuestFlow.StopPlanText）
             foreach (var line in plan.BlockedSummary())
-                list.Add(new PreflightItem(Severity.Warn, cannotStart
-                    ? $"前提のクエストが未完了のため、次のジョブクエは進められません：{line}"
-                    : $"前提のクエストが未完了のため、次のジョブクエは進められません（動作保証外。続けた場合、これらは飛ばし、素材も集めません）：{line}"));
+                list.Add(new PreflightItem(Severity.Ok, $"前提のクエストが未完了のため、次のジョブクエは進められません（その手前まで進めて止まります。素材も集めません）：{line}"));
         }
 
         // RSR がこちらを使う前から動いている（利用者が使っている）とき。
@@ -400,6 +420,14 @@ public static class Preflight
                 => e.TryGetProperty("Stop", out var sec) && sec.ValueKind == JsonValueKind.Object && sec.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Array
                     ? v.EnumerateArray().Where(x => x.ValueKind == JsonValueKind.String).Select(x => x.GetString()!).ToList()
                     : [];
+
+            // 推奨装備に着替える手順のあるクエスト（園芸師の17本）で、Questionable がギアセットも上書きする設定（Stylist）なら始めない
+            var equipQuests = plan.RemainingQuests.Where(q => QuestionablePaths.Steps(q.ShortId)?.Any(s => s.Type == "EquipRecommended") == true).ToList();
+            if (equipQuests.Count > 0 && root.TryGetProperty("General", out var general) && general.ValueKind == JsonValueKind.Object
+                && general.TryGetProperty("GearsetUpdateSource", out var source) && source.ValueKind == JsonValueKind.Number && source.GetInt32() != 0)
+                yield return new PreflightItem(Severity.Error,
+                    $"Questionable の設定で、推奨装備への着替えがギアセットも上書きする形（Stylist）になっています。{string.Join("、", equipQuests.Take(3))} などで"
+                    + "ギアセットが書き換わるので、Questionable の設定を Vanilla に戻してから開始してください");
 
             if (Flag(root, "Stop", "Enabled"))
             {

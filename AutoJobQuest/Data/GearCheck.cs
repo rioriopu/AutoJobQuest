@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Dalamud.Game;
@@ -139,6 +140,62 @@ public static class GearCheck
     }
 
     /// <summary>そのジョブの最初のギアセットの作業精度・加工精度。</summary>
+    /// <summary>
+    /// 開始に要る装備の欄（ギアセットの欄の番号と名前）。製作の失敗・NQ で素材を失わないよう、選んだ製作職は、
+    /// この7か所が <see cref="RequiredEquipLevel"/> 以上の装備でないと開始できない。
+    /// 欄の番号は ClientStructs の RaptureGearsetModule.GearsetItemIndex（主道具0・副道具1・頭2・胴3・腕4・腰5・脚6・足7）。
+    /// </summary>
+    public static readonly (int Slot, string Name)[] RequiredSlots =
+        [(0, "主道具"), (1, "副道具"), (2, "頭"), (3, "胴"), (4, "腕"), (6, "脚"), (7, "足")];
+
+    /// <summary>開始に要る装備のレベル。</summary>
+    public const int RequiredEquipLevel = 68;
+
+    /// <summary>
+    /// ギアセットの欄の品（欄の番号 → 品。HQ は 100万を足した番号のまま）から、装備レベルが足りない欄（空の欄を含む）の名前。
+    /// </summary>
+    public static List<string> LowSlots(IReadOnlyDictionary<int, uint> items, Func<uint, int> equipLevel, int minLevel)
+        => RequiredSlots.Where(s => !items.TryGetValue(s.Slot, out var id) || id == 0 || equipLevel(id % 1_000_000) < minLevel).Select(s => s.Name).ToList();
+
+    /// <summary>その職のギアセットで、装備レベルが足りない欄（空の欄を含む）。ギアセットが無ければ null。</summary>
+    public static unsafe List<string>? LowGearsetSlots(uint classJobId)
+    {
+        var idx = FindGearset(classJobId);
+        if (idx < 0)
+            return null;
+        var m = RaptureGearsetModule.Instance();
+        var g = m == null ? null : m->GetGearset(idx);
+        if (g == null)
+            return null;
+        var items = new Dictionary<int, uint>();
+        for (var k = 0; k < g->Items.Length; k++)
+            items[k] = g->Items[k].ItemId;
+        var sheet = Svc.Data.GetExcelSheet<Item>();
+        return LowSlots(items, id => sheet.TryGetRow(id, out var row) ? row.LevelEquip : 0, RequiredEquipLevel);
+    }
+
+    /// <summary>選んだ製作職のうち、ギアセットの装備が足りない職の説明（開始できない理由）。足りていれば null。</summary>
+    public static string? GearProblem(bool[] selected)
+    {
+        var lines = new List<string>();
+        for (var i = 0; i < selected.Length && i < Jobs.QuestJobs.Length; i++)
+        {
+            var job = Jobs.QuestJobs[i];
+            if (!selected[i] || !Jobs.Crafters.Contains(job))
+                continue;
+            var low = LowGearsetSlots(job);
+            if (low == null)
+                lines.Add($"{Jobs.Name(job)}：ギアセットがありません");
+            else if (low.Count > 0)
+                lines.Add($"{Jobs.Name(job)}：{string.Join("・", low)}");
+        }
+
+        return lines.Count == 0
+            ? null
+            : $"製作の失敗で素材を失わないよう、選んだ製作職のギアセットの主道具・副道具・頭・胴・腕・脚・足は Lv{RequiredEquipLevel} 以上の装備にしてください"
+              + $"（足りない欄：{string.Join(" / ", lines)}）";
+    }
+
     public static unsafe CrafterGear ReadGearset(uint classJobId)
     {
         var idx = FindGearset(classJobId);

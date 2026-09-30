@@ -909,6 +909,22 @@ public sealed class HqFailureTally
 /// 1回もできなかった頼みの後は頼み直さない（Artisan が作れない理由があるので、今までどおり結果で判断する）。
 /// 頼み直しの回数は、予定の製作回数までで打ち切る（1回の頼みで必ず1つ以上進むので、それ以上は要らない）。
 /// </summary>
+/// <summary>
+/// 製作の失敗の数え方（ゲームを起動せずに試せるように分けた）。
+/// 製作は、始めたときに材料（クリスタルを含む）が減り、終わったときに品が増える。失敗すると品は増えない。
+/// だから「始めた回数（減った材料 ÷ 1回分）」と「できた回数（増えた品 ÷ 1回にできる数）」の差が、失敗の回数になる（作っている最中の1回は除く）。
+/// </summary>
+public static class CraftFailure
+{
+    /// <summary>始めた回数：材料ごとに「減った数 ÷ 1回分」を求めて、一番大きいもの。</summary>
+    public static int Attempts(IEnumerable<(uint Item, int Amount)> perCraft, Func<uint, int> used)
+        => perCraft.Where(x => x.Amount > 0).Select(x => Math.Max(0, used(x.Item)) / x.Amount).DefaultIfEmpty(0).Max();
+
+    /// <summary>失敗の回数：始めた回数 − できた回数 − 作っている最中の1回（<paramref name="inProgress"/>）。</summary>
+    public static int Failed(int attempts, int made, int yield, bool inProgress)
+        => Math.Max(0, attempts - (Math.Max(0, made) / Math.Max(1, yield)) - (inProgress ? 1 : 0));
+}
+
 public static class CraftResume
 {
     /// <summary>頼み直す製作回数。頼み直さないなら 0。</summary>

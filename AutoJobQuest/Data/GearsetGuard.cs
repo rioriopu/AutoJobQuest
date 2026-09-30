@@ -86,7 +86,27 @@ public static class GearsetGuard
                                && p.Materia.OrderBy(x => x.Id).ThenBy(x => x.Grade).SequenceEqual(mine));
     }
 
+    /// <summary>
+    /// そのギアセットの品が、いま全部装備されているか（持っていない品は見ない：売った・捨てた品で着替え直しが止まらないように）。
+    /// Questionable が推奨装備に着替えた後、ギアセットに着替え直したかを確かめるのに使う。
+    /// </summary>
+    public static bool GearsetEquipped(int gearset)
+    {
+        var equipped = EquippedCounts();
+        var owned = Inventory.Snapshot(subtractGearsets: false);
+        return AllEquipped(Read().Where(p => p.Gearset == gearset).Select(p => (p.ItemId, p.Hq)),
+            k => equipped.GetValueOrDefault(k), k => k.Hq ? owned.CountHq(k.ItemId) : owned.CountNq(k.ItemId));
+    }
+
+    /// <summary>
+    /// ギアセットの品（品, HQ）が全部装備されているか（ゲームを起動せずに試せるように分けた）。
+    /// 装備していない品でも、鞄・アーマリーチェストに無ければ（売った・捨てた）見ない。
+    /// </summary>
+    public static bool AllEquipped(IEnumerable<(uint ItemId, bool Hq)> pieces, Func<(uint ItemId, bool Hq), int> equipped, Func<(uint ItemId, bool Hq), int> owned)
+        => pieces.All(k => equipped(k) > 0 || owned(k) <= 0);
+
     /// <summary>いま装備している品の数（HQ の区別あり）。</summary>
+
     public static unsafe Dictionary<(uint ItemId, bool Hq), int> EquippedCounts()
     {
         var d = new Dictionary<(uint, bool), int>();
