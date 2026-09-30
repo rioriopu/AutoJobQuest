@@ -35,7 +35,7 @@
   <!--
     ビルドしたら dev プラグインの置き場へコピーする。
     DalamudPackager が manifest を作った後に走らせる（AfterTargets="Build" だと manifest が無い）。
-    依存 DLL（ECommons・LuminaSupplemental とその依存）も一緒に置く。
+    依存 DLL（LuminaSupplemental とその依存。ECommons は使っていない）も一緒に置く。
   -->
   <PropertyGroup>
     <DeployDir Condition="'$(Configuration)' == 'Release'">C:\自作プラグイン\AutoJobQuest\</DeployDir>
