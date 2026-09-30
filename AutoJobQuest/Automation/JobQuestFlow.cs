@@ -429,7 +429,6 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
             Preflight.MarketRiskText(ctx.Config)
             + (marketPlan.Length > 0 ? "\n\n" + marketPlan : string.Empty)
             + (stopPlan.Length > 0 ? "\n\n" + stopPlan : string.Empty)
-            + "\n\n" + Preflight.Premise
             + (warns.Count > 0 ? "\n\n【注意】\n" + string.Join("\n", warns.Select(w => "・" + w.Text)) : string.Empty));
         this.stage = Stage.WaitPreflightAnswer;
         return TaskResult.Running;
