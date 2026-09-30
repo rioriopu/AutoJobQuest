@@ -577,22 +577,17 @@ public static class DefensePolicy
 /// <summary>
 /// 外部の処理を始める直前に、要るものがそろっているか（計画を立て直した後や、途中でプラグインを外した・設定を変えた
 /// 場合にも、始める直前にもう一度確かめる。以前は釣りの同意だけを見ていて、AutoHook と GBR の UseAutoHook は開始時にしか見なかった）。
-/// 竿の釣りでは、釣果送信の同意はこちらからは変えない。足りなければ理由を返す（空ならそろっている）。
-/// GBR の UseAutoHook は、釣りの間だけこちらで ON にする（<see cref="GbrRequiredSettings"/>）ので、ここでは見ない。
-/// 刺突漁では、同意も刺突漁の間だけこちらで ON にする（SpearfishTask が GBR を動かす前に合わせる）。
+/// 足りなければ理由を返す（空ならそろっている）。
+/// GBR の UseAutoHook と釣果送信の同意は、釣りの間だけこちらで ON にする（<see cref="GbrRequiredSettings"/>。
+/// 同意は、止まってしまうくらいなら ON にする。以前は「変えずに、始める前に止める」だった）ので、ここでは見ない。
 /// </summary>
 public static class RequiredCapabilities
 {
     /// <summary>釣り（GBR ＋ AutoHook）。</summary>
-    /// <param name="optIn">GBR の「Opt-in to fishing data collection」（読めなければ null）。</param>
     /// <param name="autoHookLoaded">AutoHook が読み込まれているか。</param>
-    public static List<string> Fishing(bool? optIn, bool autoHookLoaded)
+    public static List<string> Fishing(bool autoHookLoaded)
     {
         var list = new List<string>();
-        if (optIn != true)
-            list.Add(optIn == false
-                ? "GBR の「Opt-in to fishing data collection」が OFF のため GBR は釣りをしません（釣果を外部へ送る同意なので、こちらからは変えません。GBR の設定画面の検索欄に「fishing data」と入れると項目が出ます）"
-                : "GBR の「Opt-in to fishing data collection」の設定を読めませんでした（GBR の版が変わった可能性。記録の IPC 欄を見てください）");
         if (!autoHookLoaded)
             list.Add("AutoHook が読み込まれていません（釣りに使います）");
         return list;

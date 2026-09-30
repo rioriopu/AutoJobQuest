@@ -941,13 +941,12 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
             steps.Add(_ => this.Track(new ReduceTask(reduceNeed)));
         }
 
-        // 5) 釣り（GBR に一任）。GBR が釣れない設定なら、別の手段に黙って切り替えずに止める。
-        //    周回を始める前に、同意・AutoHook をそろって確かめる（作業の始めでももう一度確かめる。
-        //    GBR の UseAutoHook は、釣りの作業の間だけ GatherTask が ON にする）
+        // 5) 釣り（GBR に一任）。周回を始める前に、AutoHook が読み込まれているかを確かめる（
+        //    作業の始めでももう一度確かめる。GBR の UseAutoHook と釣果送信の同意は、釣りの作業の間だけ GatherTask が ON にする）
         var fish = raw.Where(r => r.Routes[0] == Route.Fish).ToList();
         if (fish.Count > 0)
         {
-            var missing = RequiredCapabilities.Fishing(ctx.Gbr.ReadAutoGatherBool(GbrRequiredSettings.FishDataCollection), ctx.AutoHook.IsLoaded);
+            var missing = RequiredCapabilities.Fishing(ctx.AutoHook.IsLoaded);
             if (missing.Count > 0)
             {
                 return this.Fail(

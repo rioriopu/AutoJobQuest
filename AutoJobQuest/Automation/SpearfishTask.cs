@@ -271,9 +271,7 @@ public sealed class SpearfishTask : AutoTask
             ctx.Log.Write("刺突漁", $"GBR の設定を、刺突漁の間だけ変えました：{GbrRequiredSettings.Describe(c)}。終わったら戻します");
         if (changed.Count > 0)
         {
-            var consent = changed.Any(c => c.Setting.Name == GbrRequiredSettings.FishDataCollection)
-                ? "（釣果送信の同意を ON にした間は、釣った魚のデータが GBR の外部サーバーへ送られます）"
-                : string.Empty;
+            var consent = GbrRequiredSettings.ConsentNote(changed);
             Svc.Chat.Print($"[AutoJobQuest] GBR が潜水・刺突漁をできるよう、設定を刺突漁の間だけ変えました：{string.Join("、", changed.Select(c => $"{c.Setting.Label} {GbrRequiredSettings.OnOff(c.Before)}→{GbrRequiredSettings.OnOff(c.Setting.Value)}"))}。"
                            + $"終わったら元に戻します{consent}");
         }

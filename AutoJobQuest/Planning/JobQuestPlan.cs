@@ -308,11 +308,10 @@ public static class PlanBuilder
             // 用意しない（受注後に Questionable が作る・採る）。取引できる魚・鉱石などは先に用意できる。
             // 品質不問で2個以上を渡す製作品は HQ で用意する（NQ と HQ の山が分かれると納品窓で渡せない）
             // 採集職の納品物で、こちら（GBR）で集めきれなかった品（採集・釣りの手段を外した品）は、受注後に Questionable が自分で採るので、
-            // 先に集める対象から外す（以前は集めにくい品が1つあると、周回の上限で実行全体が止まった）
+            // 先に集める対象から外す（以前は集めにくい品が1つあると、周回の上限で実行全体が止まった）。
+            // 漁師のジョブクエで Questionable が自分で釣る魚は、最初から任せる（エサは Questionable が用意する）
             var questGathers = Jobs.IsGatherer(q.ClassJobId) ? QuestionablePaths.GatheredItems(q.ShortId) : new HashSet<uint>();
-            bool LeftToQuestionable(uint item) => questGathers.Contains(item) && excludedRoutes != null
-                && excludedRoutes.TryGetValue(item, out var bad) && (bad.Contains(Route.Gather) || bad.Contains(Route.Fish));
-            var prepare = needs.Needed.Where(n => !q.AfterAcceptItems.Contains(n.ItemId) && !LeftToQuestionable(n.ItemId))
+            var prepare = needs.Needed.Where(n => !q.AfterAcceptItems.Contains(n.ItemId) && !LeaveToQuestionable(q.ClassJobId, n.ItemId, questGathers, excludedRoutes))
                 .Select(n => PlanAsHq(data.Planner!, n))
                 .Select(n => PlanSingleQuality(data.Planner!, n, inv)).ToList();
             plan.RetainerTargets.AddRange(prepare);
@@ -431,6 +430,21 @@ public static class PlanBuilder
         if (!Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Item>().TryGetRow(n.ItemId, out var item) || item.StackSize <= 1 || !item.CanBeHq)
             return n;
         return n with { Hq = true, Evidence = n.Evidence + "（品質不問だが、NQ と HQ の山が分かれると納品窓で渡せないので HQ で用意する）" };
+    }
+
+    /// <summary>
+    /// 採集職の納品物を、先に集めずに Questionable に任せるか（Questionable が経路の採集・釣りの手順で自分で採る品だけ）。
+    ///  ・漁師のジョブクエの魚は、最初から任せる（漁師ジョブクエは Questionable が釣り餌を全部用意するので、
+    ///    万能ルアーを買う必要も持つ必要も無い。以前は先に GBR で釣っていたので、GBR 用のエサ＝万能ルアーが要った）。
+    ///  ・採掘・園芸の品は、こちら（GBR）で集めきれなかった（採集・釣りの手段を外した）ときだけ任せる。
+    /// </summary>
+    public static bool LeaveToQuestionable(uint classJobId, uint item, IReadOnlySet<uint> questGathers, IReadOnlyDictionary<uint, HashSet<Route>>? excludedRoutes)
+    {
+        if (!questGathers.Contains(item))
+            return false;
+        if (classJobId == Automation.SpearfishTask.Fisher)
+            return true;
+        return excludedRoutes != null && excludedRoutes.TryGetValue(item, out var bad) && (bad.Contains(Route.Gather) || bad.Contains(Route.Fish));
     }
 
     /// <summary>

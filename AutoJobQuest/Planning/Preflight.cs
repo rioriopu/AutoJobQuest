@@ -265,11 +265,6 @@ public static class Preflight
         {
             // 釣りは GBR に一任する。GBR が釣れない設定なら、別の手段に黙って切り替えず始める前に止める
             var fishItems = string.Join("、", plan!.Shortfalls.Where(x => x.Route == Route.Fish).Select(x => $"{x.Name}×{x.Shortfall}"));
-            if (ctx.Gbr.ReadAutoGatherBool("FishDataCollection") != true)
-                list.Add(new PreflightItem(routeSeverity,
-                    $"釣りで集める素材があります（{fishItems}）が、GBR の「Opt-in to fishing data collection」が OFF のため GBR は釣りをしません。"
-                    + "これは釣果を GBR の外部サーバーへ送ることへの同意なので、こちらからは変えません。"
-                    + "GBR の設定画面の検索欄に「fishing data」と入れると項目が出ます。ON にしてからもう一度始めてください" + retainerNote));
             // 釣りのエサは万能ルアー。0個なら釣りの前にリムサ・ロミンサのよろず屋で5個買う（GBR の NPC 購入）
             var lure = Inventory.CountNow(Automation.VersatileLure.ItemId);
             var canBuyLure = installed.Any(x => x.IsLoaded && x.InternalName is "InventoryTools" or "AllaganItemSearch");
@@ -281,7 +276,8 @@ public static class Preflight
                     : new PreflightItem(Severity.Warn, $"釣りで集める素材があります（{fishItems}）が、万能ルアーが0個で、Allagan Tools が無いため GBR の NPC 購入で買えません。"
                                                        + "釣りの素材は別の手段になります（万能ルアーを用意してから始めると釣ります）"));
 
-            foreach (var s in Automation.GbrRequiredSettings.Fishing.Where(s => ctx.Gbr.ReadAutoGatherBool(s.Name) == !s.Value))
+            // GBR の UseAutoHook・釣果送信の同意（止まるくらいなら ON）・グローバルプリセットは、釣りの間だけ合わせる
+            foreach (var s in Automation.GbrRequiredSettings.Fishing.Concat(Automation.GbrRequiredSettings.RodFishing).Where(s => ctx.Gbr.ReadAutoGatherBool(s.Name) == !s.Value))
                 list.Add(new PreflightItem(Severity.Ok, $"釣りで集める素材があります（{fishItems}）。GBR の「{s.Label}」が {Automation.GbrRequiredSettings.OnOff(!s.Value)} です（{s.Why}）。"
                                                         + $"釣りの間だけ {Automation.GbrRequiredSettings.OnOff(s.Value)} にし、終わったら戻します"));
         }

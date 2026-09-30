@@ -84,8 +84,8 @@ public sealed class GatherTask : AutoTask
     public override string Name => $"採集: {this.label}";
 
     /// <summary>
-    /// この作業が GBR に合わせる設定（刺突漁の設定は含まない：釣果送信の同意は、竿の釣りでは変えない。
-    /// 刺突漁は <see cref="SpearfishTask.RequiredSettings"/> が先に合わせる）。
+    /// この作業が GBR に合わせる設定。釣りは釣果送信の同意も釣りの間だけ ON にする（以前は変えなかった）。
+    /// 刺突漁の GBR の作業には、竿の釣りの設定（グローバルプリセット）を入れない。徒歩の強制は <see cref="SpearfishTask.RequiredSettings"/> が先に合わせる。
     /// </summary>
     public static List<GbrRequiredSettings.Setting> RequiredSettings(Planning.Route route, bool spearfish = false)
         => spearfish ? [.. GbrRequiredSettings.Always, .. GbrRequiredSettings.Fishing] : GbrRequiredSettings.For(route, spearfish: false);
@@ -114,12 +114,12 @@ public sealed class GatherTask : AutoTask
         if (!ctx.GatherBuddy.IsLoaded)
             return this.Fail("GatherBuddyReborn が読み込まれていません");
 
-        // 釣りは、始める直前に要るもの（GBR の同意・AutoHook）をもう一度確かめる（
-        // 計画を立て直して初めて釣りが要った・途中で AutoHook を外した・設定を変えた場合に、90分待ってから止まらないように）。
-        // GBR の UseAutoHook は、下でこの作業の間だけ ON にする（GbrRequiredSettings）
+        // 釣りは、始める直前に AutoHook が読み込まれているかをもう一度確かめる（
+        // 計画を立て直して初めて釣りが要った・途中で AutoHook を外した場合に、90分待ってから止まらないように）。
+        // GBR の UseAutoHook と釣果送信の同意は、下でこの作業の間だけ ON にする（GbrRequiredSettings）
         if (this.Route == Planning.Route.Fish)
         {
-            var missing = RequiredCapabilities.Fishing(ctx.Gbr.ReadAutoGatherBool(GbrRequiredSettings.FishDataCollection), ctx.AutoHook.IsLoaded);
+            var missing = RequiredCapabilities.Fishing(ctx.AutoHook.IsLoaded);
             if (missing.Count > 0)
                 return this.Fail($"釣りを始められません（{string.Join(" / ", this.needs.Select(n => CraftPlanner.ItemName(n.ItemId)))}）：{string.Join(" / ", missing)}");
         }
@@ -185,6 +185,8 @@ public sealed class GatherTask : AutoTask
         var changed = GbrRequiredSettings.Apply(required, ctx.Gbr.ReadAutoGatherBool, ctx.Gbr.OverrideBool, out var failedSetting);
         foreach (var c in changed)
             ctx.Log.Write("採集", $"GBR の設定を、この作業の間だけ変えました：{GbrRequiredSettings.Describe(c)}。終わったら戻します");
+        if (GbrRequiredSettings.ConsentNote(changed) is { Length: > 0 } consent)
+            Svc.Chat.Print($"[AutoJobQuest] GBR が釣りをできるよう、「Opt-in to fishing data collection」を釣りの間だけ ON にしました。終わったら元に戻します{consent}");
         if (failedSetting != null)
             return this.Fail(GbrRequiredSettings.FailText(failedSetting, ctx.Gbr.LastError));
         ctx.Log.Debug("採集", $"GBR の設定：{GbrRequiredSettings.Snapshot(required, ctx.Gbr.ReadAutoGatherBool)}");

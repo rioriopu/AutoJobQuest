@@ -13,8 +13,9 @@ namespace AutoJobQuest.Automation;
 ///
 /// どの設定が要るかは GBR 7.5.6.1 のソースで確かめた。
 ///
-/// 釣果送信の同意（FishDataCollection）は、釣った魚のデータを GBR の外部サーバーへ送る同意なので、
-/// 刺突漁のときだけ変える。竿の釣りでは変えずに、始める前に止める。
+/// 釣果送信の同意（FishDataCollection）は、釣った魚のデータを GBR の外部サーバーへ送る同意。刺突漁に続き、竿の釣りでも
+/// 釣りの間だけ ON にする（止まってしまうよりは ON にする。以前は変えずに、始める前に止めていた）。
+/// ON にしたときは、外部へ送られることをチャットでも知らせる。
 /// ゲームに触らない（読み書きは外から渡す）ので、ゲームを起動せずに試せる。
 /// </summary>
 public static class GbrRequiredSettings
@@ -47,6 +48,10 @@ public static class GbrRequiredSettings
     [
         // AutoGather.AutoHook.cs:39-40（刺突漁は AutoGig を ON にしない＝突かない）。画面には無く、設定ファイルだけにある
         new("UseAutoHook", true, "UseAutoHook", "OFF だと GBR が AutoHook を動かさないので、釣らない・突かない。GBR の画面に無く、設定ファイルだけにある項目"),
+
+        // AutoGather.cs:917-926（魚が目標にあるだけで、チャットにエラーを出して止まる）
+        new(FishDataCollection, true, "Opt-in to fishing data collection",
+            "OFF だと GBR は魚が目標にあるだけで止まる。ON の間は、釣った魚のデータが GBR の外部サーバーへ送られる"),
     ];
 
     /// <summary>竿の釣りのとき（刺突漁には効かない設定）。</summary>
@@ -62,10 +67,6 @@ public static class GbrRequiredSettings
     [
         // AutoGather.Var.cs:130-133（飛ばない → 水面を泳ぐだけで潜れない。沈没川船の漁場は水中）
         new("ForceWalking", false, "Force Walking", "ON だと GBR が飛ばないので潜れない（漁場は水中）"),
-
-        // AutoGather.cs:917-926（魚が目標にあるだけで、チャットにエラーを出して止まる）
-        new(FishDataCollection, true, "Opt-in to fishing data collection",
-            "OFF だと GBR は魚が目標にあるだけで止まる。ON の間は、釣った魚のデータが GBR の外部サーバーへ送られる"),
     ];
 
     /// <summary>その作業で要る設定。竿の釣りは釣りの設定と竿の釣りの設定、刺突漁は釣りの設定と刺突漁の設定を含む。</summary>
@@ -113,6 +114,12 @@ public static class GbrRequiredSettings
 
         return changed;
     }
+
+    /// <summary>釣果送信の同意を ON にしたときに、チャットへ添える文（変えていなければ空）。</summary>
+    public static string ConsentNote(IEnumerable<Change> changed)
+        => changed.Any(c => c.Setting.Name == FishDataCollection)
+            ? "（釣果送信の同意を ON にした間は、釣った魚のデータが GBR の外部サーバーへ送られます）"
+            : string.Empty;
 
     /// <summary>ON / OFF / 読めない。</summary>
     public static string OnOff(bool? value) => value switch { true => "ON", false => "OFF", _ => "読めない" };
