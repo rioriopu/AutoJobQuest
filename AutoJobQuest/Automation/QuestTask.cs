@@ -236,6 +236,9 @@ public sealed unsafe class QuestTask : AutoTask
             return TaskResult.Done;
         }
 
+        // Questionable の購入の手順で出た購入の確認に、こちらで OK を押す（QuestPurchaseConfirm）
+        this.HandlePurchaseConfirm(ctx);
+
         // 納品窓が開いたら、条件（HQ・マテリア）に合う品をこちらで自動で入れて渡す（確認は出さない）。
         // TextAdvance は一覧の先頭を入れるので、NQ と HQ を両方持っていると NQ が入る恐れがあった
         if (this.HandleRequest(ctx) is { } requestFailure)
@@ -511,6 +514,97 @@ public sealed unsafe class QuestTask : AutoTask
     ///  ・窓が求める品が、このクエストの納品物に含まれること（RequestFiller が確かめる）
     /// 失敗（条件に合う品が無い等）なら理由を返す。
     /// </summary>
+    // 購入の確認：最初に見えた窓（Questionable に1フレーム譲る）・押した窓・同じ理由を2度書かない控え
+    private nint purchaseSeen;
+    private nint purchasePressed;
+    private string lastPurchaseNote = string.Empty;
+
+    // 購入の確認の文面（ゲームデータ Addon#3406。Questionable の YesNoChoiceHandler と同じ行）から作った照合の形
+    private const uint PurchaseConfirmAddon = 3406;
+    private static QuestPurchaseConfirm.Pattern? purchasePattern;
+
+    public static QuestPurchaseConfirm.Pattern? PurchasePattern()
+    {
+        if (purchasePattern != null)
+            return purchasePattern;
+        if (!Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Addon>().TryGetRow(PurchaseConfirmAddon, out var row))
+            return null;
+        var parts = new List<QuestPurchaseConfirm.Part>();
+        foreach (var p in row.Text)
+        {
+            if (p.Type == Lumina.Text.ReadOnly.ReadOnlySePayloadType.Text)
+            {
+                parts.Add(new(true, p.ToString(), string.Empty));
+                continue;
+            }
+
+            var kind = p.MacroCode switch
+            {
+                Lumina.Text.Payloads.MacroCode.Sheet when p.ToString().Contains("Item", StringComparison.Ordinal) => "item",
+                Lumina.Text.Payloads.MacroCode.Num => "count",
+                Lumina.Text.Payloads.MacroCode.Kilo => "price",
+                Lumina.Text.Payloads.MacroCode.NewLine => "br",
+                _ => string.Empty,
+            };
+            parts.Add(new(false, string.Empty, kind));
+        }
+
+        return purchasePattern = QuestPurchaseConfirm.Build(parts);
+    }
+
+    /// <summary>
+    /// Questionable の購入の手順で出た購入の確認（SelectYesno）に OK を押す。押すかは <see cref="QuestPurchaseConfirm.Decide"/> で決める。
+    /// 窓が見えた最初のフレームは Questionable に譲り（Questionable が押せれば閉じる）、次のフレームでも開いていれば押す。
+    /// </summary>
+    private void HandlePurchaseConfirm(TaskContext ctx)
+    {
+        var body = GameUi.YesnoText(out var addon);
+        if (body == null || addon == null)
+        {
+            this.purchaseSeen = 0;
+            this.purchasePressed = 0;
+            return;
+        }
+
+        var ptr = (nint)addon;
+        if (ptr == this.purchasePressed)
+            return;
+        if (ptr != this.purchaseSeen)
+        {
+            this.purchaseSeen = ptr;
+            return;
+        }
+
+        var step = ctx.Questionable.GetCurrentStepData();
+        var purchaseStep = step?.InteractionType == "PurchaseItem" && ctx.Questionable.IsRunning() == true;
+        var shopOpen = GameUi.IsVisible("Shop");
+        var expected = (QuestionablePaths.Steps(this.quest.ShortId) ?? [])
+            .Where(s => s.Type == "PurchaseItem" && s.ItemId is { } id && id != 0)
+            .Select(s => (CraftPlanner.ItemName(s.ItemId!.Value), s.ItemCount))
+            .ToList();
+        var parsed = PurchasePattern() is { } pattern ? QuestPurchaseConfirm.Parse(pattern, body) : null;
+        var verdict = QuestPurchaseConfirm.Decide(purchaseStep, shopOpen, body, parsed, expected, ctx.Config.ConfirmPurchaseAboveGil);
+        if (verdict == QuestPurchaseConfirm.Verdict.Press)
+        {
+            if (GameUi.ClickYes(addon))
+            {
+                this.purchasePressed = ptr;
+                ctx.Log.Write("クエスト", $"Questionable の購入の確認に OK を押しました：{body.Replace("\n", " ")}（{parsed?.Item}×{parsed?.Count}・{parsed?.Price:N0} ギル）");
+            }
+
+            return;
+        }
+
+        // 押さない理由は、同じ窓・同じ理由につき1回だけ記録する（Questionable の手順が購入でないときは、ほかの確認なので書かない）
+        var note = $"{ptr}:{verdict}";
+        if (note != this.lastPurchaseNote && verdict != QuestPurchaseConfirm.Verdict.NotPurchaseStep)
+        {
+            this.lastPurchaseNote = note;
+            ctx.Log.Debug("クエスト", $"購入の確認に OK を押しません（{verdict}）：{body.Replace("\n", " ")}"
+                                     + $"（読んだ品 {parsed?.Item ?? "なし"}×{parsed?.Count}・{parsed?.Price} ギル／手順の品 {string.Join("、", expected.Select(e => $"{e.Item1}×{e.ItemCount}"))}）");
+        }
+    }
+
     private string? HandleRequest(TaskContext ctx)
     {
         // 渡した後：求めた品が減ったかを確かめる（渡す操作を送ったことを「納品した」とはしない）

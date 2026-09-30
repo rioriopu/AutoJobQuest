@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.RegularExpressions;
 using AutoJobQuest.Data;
 
 namespace AutoJobQuest.Automation;
@@ -1153,4 +1154,141 @@ public static class InnRequest
         false => Verdict.Refused,
         null => Verdict.Unknown,
     };
+}
+
+/// <summary>
+/// Questionable の「アイテムの購入」の手順で出る購入の確認（SelectYesno。ゲームデータ Addon#3406
+/// 「〈品〉×〈数〉を、〈値段〉で購入します。よろしいですか？」）に、こちらで「OK」と答えるか。
+///
+/// 不具合の例：漁師ジョブクエのエサ（ピルバグ×99）の購入の確認を誰も押さず止まった。
+/// Questionable は自分で押す作り（YesNoChoiceHandler：購入を頼んだ後に「確認待ち」の旗を立て、本文を Addon#3406 から作った正規表現で照合）だが、
+/// 日本語の文面は固定の部分にギルの記号（私用領域の文字 U+E049）を含み、Questionable が読む本文と合わずに照合が外れる見込み
+/// （記録では購入を頼んだ 0.1 秒後に確認が開き、Questionable の処理は購入の分岐を通らなかった）。
+/// こちらはクエストの間 YesAlready を止めているので、YesAlready も押さない。そこでこちらで押す。
+///
+/// 押すのは全部そろったときだけ：Questionable の今の手順が購入・店（Shop）が開いている・本文が購入の確認の文面に合う・
+/// 品がそのクエストの購入の手順の品・数がその手順の数以下・値段が設定の「1回の購入額の確認」の額以下・危ない語を含まない。
+/// 文面の照合は、私用領域の文字と空白を除いてから行う（ギルの記号・改行の違いに左右されない）。
+/// </summary>
+public static class QuestPurchaseConfirm
+{
+    public enum Verdict
+    {
+        /// <summary>押す。</summary>
+        Press,
+
+        /// <summary>Questionable の今の手順が購入ではない。</summary>
+        NotPurchaseStep,
+
+        /// <summary>店が開いていない。</summary>
+        NoShop,
+
+        /// <summary>本文がまだ読めない。</summary>
+        Unreadable,
+
+        /// <summary>購入の確認の文面ではない。</summary>
+        NotPurchase,
+
+        /// <summary>そのクエストの購入の手順の品ではない。</summary>
+        UnknownItem,
+
+        /// <summary>手順の数より多く買おうとしている。</summary>
+        TooMany,
+
+        /// <summary>値段が設定の額を超える。</summary>
+        TooExpensive,
+
+        /// <summary>危ない語を含む。</summary>
+        Dangerous,
+    }
+
+    /// <summary>文面の部品（固定の文字か、差し込み）。差し込みの種類は item（品）・count（数）・price（値段）・br（改行）・空（そのほか）。</summary>
+    public sealed record Part(bool IsText, string Text, string Kind);
+
+    /// <summary>照合の形と、品・数・値段のグループ番号。</summary>
+    public sealed record Pattern(Regex Regex, int ItemGroup, int CountGroup, int PriceGroup);
+
+    /// <summary>私用領域の文字（ギルの記号など）と空白・改行を除く。</summary>
+    public static string Normalize(string s)
+        => new(s.Where(c => !char.IsWhiteSpace(c) && c is not (>= '\uE000' and <= '\uF8FF')).ToArray());
+
+    /// <summary>文面の部品から照合の形を作る。品・数・値段の差し込みがそろっていなければ null。</summary>
+    public static Pattern? Build(IReadOnlyList<Part> parts)
+    {
+        var sb = new System.Text.StringBuilder("^");
+        int group = 0, item = 0, count = 0, price = 0;
+        foreach (var p in parts)
+        {
+            if (p.IsText)
+            {
+                sb.Append(Regex.Escape(Normalize(p.Text)));
+                continue;
+            }
+
+            switch (p.Kind)
+            {
+                case "item":
+                    item = ++group;
+                    sb.Append("(.+?)");
+                    break;
+                case "count":
+                    count = ++group;
+                    sb.Append("([0-9,，]+)");
+                    break;
+                case "price":
+                    price = ++group;
+                    sb.Append("([0-9,，]+)");
+                    break;
+                case "br":
+                    break;
+                default:
+                    sb.Append("(?:.*?)");
+                    break;
+            }
+        }
+
+        sb.Append('$');
+        return item == 0 || count == 0 || price == 0 ? null : new Pattern(new Regex(sb.ToString(), RegexOptions.CultureInvariant), item, count, price);
+    }
+
+    /// <summary>本文から品・数・値段を読む。購入の確認の文面でなければ null。</summary>
+    public static (string Item, int Count, long Price)? Parse(Pattern pattern, string body)
+    {
+        var m = pattern.Regex.Match(Normalize(body));
+        if (!m.Success)
+            return null;
+        static string Digits(string v) => v.Replace(",", string.Empty).Replace("，", string.Empty);
+        if (!int.TryParse(Digits(m.Groups[pattern.CountGroup].Value), out var count) || !long.TryParse(Digits(m.Groups[pattern.PriceGroup].Value), out var price))
+            return null;
+        return (m.Groups[pattern.ItemGroup].Value, count, price);
+    }
+
+    /// <param name="purchaseStep">Questionable が動いていて、今の手順が購入（PurchaseItem）か。</param>
+    /// <param name="shopOpen">店（Shop）が開いているか。</param>
+    /// <param name="body">確認の本文。</param>
+    /// <param name="parsed">本文から読んだ品・数・値段（購入の確認の文面でなければ null）。</param>
+    /// <param name="expected">そのクエストの購入の手順の品の名前と数。</param>
+    /// <param name="maxGil">この額を超える購入は押さない（0 以下なら見ない）。</param>
+    public static Verdict Decide(bool purchaseStep, bool shopOpen, string body, (string Item, int Count, long Price)? parsed,
+        IReadOnlyList<(string Name, int? Count)> expected, long maxGil)
+    {
+        if (!purchaseStep)
+            return Verdict.NotPurchaseStep;
+        if (!shopOpen)
+            return Verdict.NoShop;
+        if (string.IsNullOrWhiteSpace(body))
+            return Verdict.Unreadable;
+        if (ConfirmPolicy.DangerousWord(body) != null)
+            return Verdict.Dangerous;
+        if (parsed is not { } p)
+            return Verdict.NotPurchase;
+        var hits = expected.Where(e => Normalize(e.Name) == Normalize(p.Item)).ToList();
+        if (hits.Count == 0)
+            return Verdict.UnknownItem;
+        if (hits.All(e => e.Count is { } c && p.Count > c))
+            return Verdict.TooMany;
+        if (maxGil > 0 && p.Price > maxGil)
+            return Verdict.TooExpensive;
+        return Verdict.Press;
+    }
 }
