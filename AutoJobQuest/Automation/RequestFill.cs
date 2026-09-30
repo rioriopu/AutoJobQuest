@@ -707,14 +707,25 @@ public sealed unsafe class GameRequestWindow : IRequestWindow
 
     public bool? SlotFilledWith(int slot, TurnInItem item)
     {
+        var im = InventoryManager.Instance();
+        return im == null ? null : HandInLinked(im->GetInventoryContainer(InventoryType.HandIn), slot, item);
+    }
+
+    /// <summary>
+    /// 受け渡しの枠（HandIn の欄 <paramref name="slot"/>）が、その品へのリンクになっているか（読めなければ null）。
+    /// 枠は Items から直接読む。GetInventorySlot はゲームの関数（容器の仮想関数5番）で、枠がリンクならリンク先の元の品を返すので、
+    /// それで読むと、入れるのに成功した枠ほど「リンクでない」と読めてしまう（不具合の例：漁師 Lv5 の納品で、入れた直後に
+    /// 「受け渡しの枠が選んだ品を指していません」で止まった原因。ゲーム本体 2026.09.15 の逆アセンブルで確定）。
+    /// ゲームは入れるとき、同じ呼び出しの中で枠にリンク（+0x0E=1、+0x10=元の枠の番号、+0x12=元の容器）を置く。
+    /// </summary>
+    public static bool? HandInLinked(InventoryContainer* c, int slot, TurnInItem item)
+    {
         if (item.Container < 0 || item.SlotIndex < 0)
             return null;
-        var im = InventoryManager.Instance();
-        var c = im == null ? null : im->GetInventoryContainer(InventoryType.HandIn);
-        if (c == null || !c->IsLoaded || slot >= c->Size)
+        if (c == null || !c->IsLoaded || c->Items == null || slot < 0 || slot >= c->Size)
             return null;
-        var s = c->GetInventorySlot(slot);
-        return s != null && s->IsSymbolic && s->LinkedInventoryType == (ushort)item.Container && s->LinkedItemSlot == (ushort)item.SlotIndex;
+        var s = c->Items + slot;
+        return s->IsSymbolic && s->LinkedInventoryType == (ushort)item.Container && s->LinkedItemSlot == (ushort)item.SlotIndex;
     }
 
     public void SelectSlot(int slot) => Agent->SelectTurnInSlot((ushort)slot);
