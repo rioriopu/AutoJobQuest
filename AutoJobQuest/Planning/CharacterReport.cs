@@ -274,7 +274,9 @@ public static class CharacterReport
             string Flag(string name) => ctx.Gbr.ReadAutoGatherBool(name) switch { true => "ON", false => "OFF", _ => "読めない" };
             var fish = ctx.Gbr.ReadAutoGatherBool("FishDataCollection");
             lines.Add(new ReportLine(fish == true ? Severity.Ok : Severity.Warn,
-                $"GBR：釣果送信の同意 {Flag("FishDataCollection")}（釣りは GBR に一任。OFF だと GBR は釣りをしないので、釣りの素材があるときは始める前に止めます）／UseAutoHook {Flag("UseAutoHook")}／vnavmesh 移動 {Flag("UseNavigation")}／採集窓の操作 {Flag("DoGathering")}"));
+                $"GBR：釣果送信の同意 {Flag("FishDataCollection")}（釣りは GBR に一任。OFF だと GBR は釣りをしないので、竿の釣りの素材があるときは始める前に止めます。刺突漁の間だけは ON にして、終わったら戻します）"
+                + $"／UseAutoHook {Flag("UseAutoHook")}／vnavmesh 移動 {Flag("UseNavigation")}／採集窓の操作 {Flag("DoGathering")}／徒歩の強制 {Flag("ForceWalking")}"
+                + "（違っていれば、GBR で集める間だけこちらで合わせて、終わったら戻します。徒歩の強制は刺突漁のときだけ）"));
             lines.Add(new ReportLine(Severity.Ok, $"GBR：終わったら帰宅 {Flag("GoHomeWhenDone")}／待機中に帰宅 {Flag("GoHomeWhenIdle")}（こちらが GBR を使う間だけ OFF にします）"));
             var quick = Preflight.ReadArtisanBool("QuickSynthMode");
             lines.Add(new ReportLine(quick == true ? Severity.Warn : Severity.Ok, $"Artisan：簡易製作 {(quick == true ? "ON（HQ 指定の品が NQ になります）" : quick == false ? "OFF" : "読めない")}"));

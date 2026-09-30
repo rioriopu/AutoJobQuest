@@ -14,7 +14,9 @@ namespace AutoJobQuest.Automation;
 ///  1) 漁師に着替える。刺突漁が使える・GBR と AutoHook が読み込まれている・そのエリアの風脈がすべて開放済み
 ///     （沈没川船の漁場は水中。GBR は飛べるエリアでだけ潜る：GBR の ShouldFly）を確かめる。
 ///  2) 計画（<see cref="SpearfishPlanner"/>）：前提の魚・GBR の目標・親の漁場と魚影・欲しい魚の大きさ・速さと代わりの札。
-///  3) AutoHook に、刺突漁のプリセット（親の漁場＝前提の魚、魚影＝代わりの札）を取り込む。取り込むと選ばれ、刺突の自動が ON になる。
+///  3) GBR が潜水・刺突漁をできる設定になっていなければ、刺突漁の間だけ合わせる（<see cref="GbrRequiredSettings"/>：
+///     vnavmesh の移動 ON・採集窓の操作 ON・UseAutoHook ON・徒歩の強制 OFF・釣果送信の同意 ON）。変えたものは記録とチャットに出し、後始末で戻す。
+///     AutoHook に、刺突漁のプリセット（親の漁場＝前提の魚、魚影＝代わりの札）を取り込む。取り込むと選ばれ、刺突の自動が ON になる。
 ///     GBR が自分のプリセットを作って上書きしないよう、GBR の「Use existing AutoHook presets」を一時的に ON にし、
 ///     前提の魚と目標の魚の番号の名前の竿のプリセット（中身は既定の値）を置く（GBR は刺突漁でも、その名前の竿のプリセットがあれば自分のものを作らない）。
 ///     AutoHook は設定をファイルに少し遅れて書く。GBR はそのファイルを読むので、名前がファイルに出てから GBR を動かす。
@@ -106,6 +108,9 @@ public sealed class SpearfishTask : AutoTask
 
     /// <summary>計画（記録・試験用）。</summary>
     public SpearfishPlan? Plan => this.plan;
+
+    /// <summary>GBR が潜水・刺突漁をするのに要る設定（違えば刺突漁の間だけ合わせる）。</summary>
+    public static List<GbrRequiredSettings.Setting> RequiredSettings() => GbrRequiredSettings.For(Route.Fish, spearfish: true);
 
     /// <summary>
     /// 手で行う手順でそろえる品のうち、刺突漁でしか取れず、まだ足りないもの（無ければ null）。
@@ -248,6 +253,34 @@ public sealed class SpearfishTask : AutoTask
     private TaskResult Prepare(TaskContext ctx)
     {
         var pl = this.plan!;
+
+        // GBR が潜水・刺突漁をできる設定になっていなければ、刺突漁の間だけ合わせる（
+        // 要る設定は GBR のソースで確かめた：GbrRequiredSettings。戻すのは後始末＝RestoreIfIdle）。AutoHook に触る前に行う。
+        // GBR が動いている・読めないときは設定に触らない（利用者が動かしている GBR の設定を途中で変えない。GatherTask と同じく止める）
+        var running = ctx.GatherBuddy.IsAutoGatherEnabled();
+        if (running != false)
+            return this.Fail(running == true
+                ? "GBR の自動採集がすでに動いています（利用者の操作を横取りしないため、GBR の設定に触らずに止めました）"
+                : "GBR の自動採集の状態が読めません（GBR の設定に触らずに止めました）");
+
+        this.gbrTouched = true;
+        var required = RequiredSettings();
+        ctx.Log.Debug("刺突漁", $"GBR の設定（合わせる前）：{GbrRequiredSettings.Snapshot(required, ctx.Gbr.ReadAutoGatherBool)}");
+        var changed = GbrRequiredSettings.Apply(required, ctx.Gbr.ReadAutoGatherBool, ctx.Gbr.OverrideBool, out var failedSetting);
+        foreach (var c in changed)
+            ctx.Log.Write("刺突漁", $"GBR の設定を、刺突漁の間だけ変えました：{GbrRequiredSettings.Describe(c)}。終わったら戻します");
+        if (changed.Count > 0)
+        {
+            var consent = changed.Any(c => c.Setting.Name == GbrRequiredSettings.FishDataCollection)
+                ? "（釣果送信の同意を ON にした間は、釣った魚のデータが GBR の外部サーバーへ送られます）"
+                : string.Empty;
+            Svc.Chat.Print($"[AutoJobQuest] GBR が潜水・刺突漁をできるよう、設定を刺突漁の間だけ変えました：{string.Join("、", changed.Select(c => $"{c.Setting.Label} {GbrRequiredSettings.OnOff(c.Before)}→{GbrRequiredSettings.OnOff(c.Setting.Value)}"))}。"
+                           + $"終わったら元に戻します{consent}");
+        }
+
+        if (failedSetting != null)
+            return this.Fail(GbrRequiredSettings.FailText(failedSetting, ctx.Gbr.LastError));
+
         var configPath = AutoHookData.ConfigPath;
         var before = configPath == null ? null : AutoHookData.ReadConfig(configPath);
         if (before == null)
@@ -277,7 +310,6 @@ public sealed class SpearfishTask : AutoTask
         if (!this.ImportGigPreset(ctx))
             return this.Fail($"AutoHook に刺突漁のプリセットを取り込めませんでした（{ctx.AutoHook.LastErrors.GetValueOrDefault("ImportAndSelectPreset") ?? "理由を読めません"}）");
 
-        this.gbrTouched = true;
         if (!ctx.Gbr.OverrideBool("UseExistingAutoHookPresets", true))
             return this.Fail($"GBR の「Use existing AutoHook presets」を一時的に ON にできませんでした（{ctx.Gbr.LastError}）");
 
@@ -464,7 +496,7 @@ public sealed class SpearfishTask : AutoTask
         this.equip?.Cleanup(ctx);
         this.equip = null;
 
-        // GBR を止めて、リストと設定（Use existing AutoHook presets を含む）を戻す
+        // GBR を止めて、リストと設定（潜水・刺突漁のために変えた設定と Use existing AutoHook presets を含む）を戻す
         if (this.gather != null)
             this.gather.Cleanup(ctx);
         else if (this.gbrTouched && !ctx.Gbr.RestoreIfIdle(ctx.GatherBuddy.IsAutoGatherEnabled(), ctx.Gbr.VendorIsBusy()))

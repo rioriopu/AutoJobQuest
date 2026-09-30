@@ -78,6 +78,12 @@ public sealed class GatherTask : AutoTask
     public override string Name => $"採集: {this.label}";
 
     /// <summary>
+    /// この作業が GBR に合わせる設定（刺突漁の設定は含まない：釣果送信の同意は、竿の釣りでは変えない。
+    /// 刺突漁は <see cref="SpearfishTask.RequiredSettings"/> が先に合わせる）。
+    /// </summary>
+    public static List<GbrRequiredSettings.Setting> RequiredSettings(Planning.Route route) => GbrRequiredSettings.For(route, spearfish: false);
+
+    /// <summary>
     /// GBR と同じ数え方の所持数（GBR の GatherableExtensions.GetInventoryCount と同じ）：
     /// 普通の品（最低収集価値 0）＋ 収集品になりうる品なら収集品（最低収集価値 1）も足す。
     /// 収集品を数えないと、GBR が目標まで採って止まったのに「0 個のまま止まった」と誤って判定する。
@@ -101,11 +107,12 @@ public sealed class GatherTask : AutoTask
         if (!ctx.GatherBuddy.IsLoaded)
             return this.Fail("GatherBuddyReborn が読み込まれていません");
 
-        // 釣りは、始める直前に要るもの（GBR の同意・AutoHook・GBR の UseAutoHook）をもう一度確かめる（
-        // 計画を立て直して初めて釣りが要った・途中で AutoHook を外した・設定を変えた場合に、90分待ってから止まらないように）
+        // 釣りは、始める直前に要るもの（GBR の同意・AutoHook）をもう一度確かめる（
+        // 計画を立て直して初めて釣りが要った・途中で AutoHook を外した・設定を変えた場合に、90分待ってから止まらないように）。
+        // GBR の UseAutoHook は、下でこの作業の間だけ ON にする（GbrRequiredSettings）
         if (this.Route == Planning.Route.Fish)
         {
-            var missing = RequiredCapabilities.Fishing(ctx.Gbr.ReadAutoGatherBool("FishDataCollection"), ctx.AutoHook.IsLoaded, ctx.Gbr.ReadAutoGatherBool("UseAutoHook"));
+            var missing = RequiredCapabilities.Fishing(ctx.Gbr.ReadAutoGatherBool(GbrRequiredSettings.FishDataCollection), ctx.AutoHook.IsLoaded);
             if (missing.Count > 0)
                 return this.Fail($"釣りを始められません（{string.Join(" / ", this.needs.Select(n => CraftPlanner.ItemName(n.ItemId)))}）：{string.Join(" / ", missing)}");
         }
@@ -154,6 +161,17 @@ public sealed class GatherTask : AutoTask
         // 精選に使う収集品を、GBR が収集品納品窓口へ持っていかないように（GBR は収集品が溜まると納品しに行く：AutoGather.cs:1062）
         if (this.KeepCollectables && !ctx.Gbr.OverrideBool(GbrHandle.CollectablePrefix + "AutoTurnInCollectables", false))
             return this.Fail($"GBR の収集品の自動納品を一時的に切れませんでした（採った収集品を納品されてしまうため止めます）: {ctx.Gbr.LastError}");
+
+        // GBR が集められる設定になっていなければ、この作業の間だけ合わせる（終わったら後始末で戻す。
+        // 以前は vnavmesh の移動・採集窓の操作が OFF だと始める前に止め、UseAutoHook が OFF だと釣りを止めていた）。
+        // 刺突漁の設定（徒歩の強制・釣果送信の同意）は SpearfishTask が先に合わせている
+        var required = RequiredSettings(this.Route);
+        var changed = GbrRequiredSettings.Apply(required, ctx.Gbr.ReadAutoGatherBool, ctx.Gbr.OverrideBool, out var failedSetting);
+        foreach (var c in changed)
+            ctx.Log.Write("採集", $"GBR の設定を、この作業の間だけ変えました：{GbrRequiredSettings.Describe(c)}。終わったら戻します");
+        if (failedSetting != null)
+            return this.Fail(GbrRequiredSettings.FailText(failedSetting, ctx.Gbr.LastError));
+        ctx.Log.Debug("採集", $"GBR の設定：{GbrRequiredSettings.Snapshot(required, ctx.Gbr.ReadAutoGatherBool)}");
 
         var entries = this.targets.Select(t => new GbrGatherEntry(t.Key, t.Value, this.preferredTerritory)).ToList();
         if (!ctx.Gbr.PrepareGatherList(entries, out var unsupported))

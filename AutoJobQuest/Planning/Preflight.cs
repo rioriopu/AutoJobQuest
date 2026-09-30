@@ -138,9 +138,15 @@ public static class Preflight
                     why.Add("AutoHook が読み込まれていない");
                 if (GatherAbilities.Usable(GatherAbilities.Gig) == false)
                     why.Add($"刺突漁が使えない（{GatherAbilities.Requirement(GatherAbilities.Gig)}）");
+                // GBR が潜水・刺突漁をできる設定でなければ、刺突漁の間だけ合わせる。何を変えるかを先に知らせる
+                var willChange = Automation.GbrRequiredSettings.Fishing.Concat(Automation.GbrRequiredSettings.Spearfishing)
+                    .Where(s => ctx.Gbr.ReadAutoGatherBool(s.Name) == !s.Value).ToList();
+                var settingsNote = willChange.Count == 0
+                    ? string.Empty
+                    : $"。GBR の設定を刺突漁の間だけ変え、終わったら戻します：{string.Join("・", willChange.Select(s => $"「{s.Label}」を {Automation.GbrRequiredSettings.OnOff(s.Value)}（{s.Why}）"))}";
                 list.Add(why.Count == 0
                     ? new PreflightItem(Severity.Ok, $"{Jobs.Name(q.ClassJobId)} {q} の手で行う手順の {CraftPlanner.ItemName(item)} は、GBR と AutoHook で自動で刺突漁をします"
-                                                     + "（AutoHook に刺突漁のプリセットを1つ残します）")
+                                                     + "（AutoHook に刺突漁のプリセットを1つ残します）" + settingsNote)
                     : new PreflightItem(Severity.Warn, $"{Jobs.Name(q.ClassJobId)} {q} の手で行う手順の {CraftPlanner.ItemName(item)} は、自動の刺突漁ができません"
                                                        + $"（{string.Join("・", why)}）。そこで手で行うよう知らせて待ちます"));
             }
@@ -247,11 +253,10 @@ public static class Preflight
         else
             list.Add(new PreflightItem(Severity.Ok, $"戦闘に使うジョブ：{Jobs.Name(combat.Value.ClassJob)} Lv{combat.Value.Level}（ギアセット {combat.Value.Gearset + 1}）"));
 
-        // 5) GBR の設定（読むだけ）
-        if (ctx.Gbr.ReadAutoGatherBool("UseNavigation") == false)
-            list.Add(new PreflightItem(Severity.Error, "GBR の「Use vnavmesh Navigation」が OFF です。採集で移動できません"));
-        if (ctx.Gbr.ReadAutoGatherBool("DoGathering") == false)
-            list.Add(new PreflightItem(Severity.Error, "GBR の「Enable Gathering Window Interaction」が OFF です。採集できません"));
+        // 5) GBR の設定（読むだけ）。GBR が集められない設定は、GBR で集める間だけこちらで合わせて、終わったら戻す
+        //    （GbrRequiredSettings。以前は vnavmesh の移動・採集窓の操作が OFF だと開始しなかった）
+        foreach (var s in Automation.GbrRequiredSettings.Always.Where(s => ctx.Gbr.ReadAutoGatherBool(s.Name) == !s.Value))
+            list.Add(new PreflightItem(Severity.Ok, $"GBR の「{s.Label}」が {Automation.GbrRequiredSettings.OnOff(!s.Value)} です（{s.Why}）。GBR で集める間だけ {Automation.GbrRequiredSettings.OnOff(s.Value)} にし、終わったら戻します"));
         if (ctx.Gbr.ReadAutoTurnInCollectables() == true)
             list.Add(new PreflightItem(Severity.Warn, "GBR の収集品の自動納品が ON です。採った収集品を途中で納品しに行くことがあります"));
 
@@ -265,8 +270,9 @@ public static class Preflight
                     $"釣りで集める素材があります（{fishItems}）が、GBR の「Opt-in to fishing data collection」が OFF のため GBR は釣りをしません。"
                     + "これは釣果を GBR の外部サーバーへ送ることへの同意なので、こちらからは変えません。"
                     + "GBR の設定画面の検索欄に「fishing data」と入れると項目が出ます。ON にしてからもう一度始めてください" + retainerNote));
-            if (ctx.Gbr.ReadAutoGatherBool("UseAutoHook") == false)
-                list.Add(new PreflightItem(routeSeverity, $"釣りで集める素材があります（{fishItems}）が、GBR の UseAutoHook が OFF のため釣りが始まりません{retainerNote}"));
+            foreach (var s in Automation.GbrRequiredSettings.Fishing.Where(s => ctx.Gbr.ReadAutoGatherBool(s.Name) == !s.Value))
+                list.Add(new PreflightItem(Severity.Ok, $"釣りで集める素材があります（{fishItems}）。GBR の「{s.Label}」が {Automation.GbrRequiredSettings.OnOff(!s.Value)} です（{s.Why}）。"
+                                                        + $"釣りの間だけ {Automation.GbrRequiredSettings.OnOff(s.Value)} にし、終わったら戻します"));
         }
 
         // 5.5) 任意のマテリア（既定は剛柔のマテリア）が、付ける納品物に付けられるか

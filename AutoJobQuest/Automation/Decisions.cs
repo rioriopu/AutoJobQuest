@@ -577,15 +577,16 @@ public static class DefensePolicy
 /// <summary>
 /// 外部の処理を始める直前に、要るものがそろっているか（計画を立て直した後や、途中でプラグインを外した・設定を変えた
 /// 場合にも、始める直前にもう一度確かめる。以前は釣りの同意だけを見ていて、AutoHook と GBR の UseAutoHook は開始時にしか見なかった）。
-/// 同意や他のプラグインの設定は、こちらからは変えない。足りなければ理由を返す（空ならそろっている）。
+/// 竿の釣りでは、釣果送信の同意はこちらからは変えない。足りなければ理由を返す（空ならそろっている）。
+/// GBR の UseAutoHook は、釣りの間だけこちらで ON にする（<see cref="GbrRequiredSettings"/>）ので、ここでは見ない。
+/// 刺突漁では、同意も刺突漁の間だけこちらで ON にする（SpearfishTask が GBR を動かす前に合わせる）。
 /// </summary>
 public static class RequiredCapabilities
 {
     /// <summary>釣り（GBR ＋ AutoHook）。</summary>
     /// <param name="optIn">GBR の「Opt-in to fishing data collection」（読めなければ null）。</param>
     /// <param name="autoHookLoaded">AutoHook が読み込まれているか。</param>
-    /// <param name="useAutoHook">GBR の UseAutoHook（読めなければ null）。</param>
-    public static List<string> Fishing(bool? optIn, bool autoHookLoaded, bool? useAutoHook)
+    public static List<string> Fishing(bool? optIn, bool autoHookLoaded)
     {
         var list = new List<string>();
         if (optIn != true)
@@ -594,10 +595,6 @@ public static class RequiredCapabilities
                 : "GBR の「Opt-in to fishing data collection」の設定を読めませんでした（GBR の版が変わった可能性。記録の IPC 欄を見てください）");
         if (!autoHookLoaded)
             list.Add("AutoHook が読み込まれていません（釣りに使います）");
-        if (useAutoHook != true)
-            list.Add(useAutoHook == false
-                ? "GBR の UseAutoHook が OFF のため釣りが始まりません"
-                : "GBR の UseAutoHook の設定を読めませんでした");
         return list;
     }
 }
