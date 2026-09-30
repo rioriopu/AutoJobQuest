@@ -1294,6 +1294,74 @@ public static class QuestPurchaseConfirm
 }
 
 /// <summary>
+/// Questionable は動いているのに、今の手順のエリアの外で、動ける状態のまま動かずにいる（たどり着けないエリアを待ち続けている）かの判断
+/// （例：漁師 Lv40 で、マーケットのあるリムサから、経路データの「餌を持っていればテレポを飛ばす」でテレポせず、
+/// グリダニアに入るのを待ち続けた。この条件は漁師 Lv1〜50 の餌を買う手順9件にあり、途中から始め直したときにも起こりうる）。
+/// Questionable が止まっている形は QuestionableKeepAlive が見る。こちらは「動いているのに進まない」形。
+/// 手で行う手順（Instruction・WaitForManualProgress）は除く。同じクエストで運ぶのは上限まで（テレポの費用がかさまないように）。
+/// </summary>
+public static class StuckElsewhere
+{
+    public enum Verdict
+    {
+        /// <summary>当てはまらない（手順のエリアにいる・動けない・手で行う手順・上限まで運んだ）。</summary>
+        None,
+
+        /// <summary>手順のエリアの外で動かずにいる。もう少し見る。</summary>
+        Watching,
+
+        /// <summary>手順の場所まで運ぶ。</summary>
+        Relocate,
+    }
+
+    /// <summary>動かずにいるとみなすまでの時間（検証の仕組みでは短くする）。</summary>
+    public static TimeSpan Still { get; set; } = TimeSpan.FromSeconds(20);
+
+    /// <summary>同じクエストで運ぶ上限。</summary>
+    public const int MaxRelocations = 2;
+
+    public static Verdict Decide(uint stepTerritory, uint here, string stepType, bool free, TimeSpan stillFor, int relocations)
+    {
+        if (stepTerritory == 0 || stepTerritory == here || stepType is "Instruction" or "WaitForManualProgress" || !free || relocations >= MaxRelocations)
+            return Verdict.None;
+        return stillFor < Still ? Verdict.Watching : Verdict.Relocate;
+    }
+}
+
+/// <summary>
+/// 製作の手順で Questionable を止めた後、Questionable が動かした Artisan の製作が終わるのを待つかの判断。
+/// Questionable の製作の手順は、始めるとすぐ Artisan の既製リスト（またはその品の製作）を動かし、Questionable を止めても Artisan は止めない
+/// （Questionable の Craft.cs：DoCraft は止めるための口〔StopNow〕を持たない）。こちらが製作の手順に入ったのを見て止めると、Artisan が
+/// もう動いていることがあり、そのままこちらの製作・移動を始めると、Artisan が空かずに「Artisan が他の処理をしていて空きません」（1分）で止まっていた。
+/// 漁師 Lv45 で、Questionable を止めた後も AutoHook が釣り続けたのと同じ形（止めた相手が動かした別のプラグインが動き続ける）。
+/// 他のプラグインは外から止めないので、終わるのを待つ。読めないときも動いているとみなす。上限を過ぎたら理由を出して止める。
+/// </summary>
+public static class ArtisanDrain
+{
+    public enum Verdict
+    {
+        /// <summary>Artisan は空いている。こちらの作業を始める。</summary>
+        Proceed,
+
+        /// <summary>Artisan が動いている（または読めない）。待つ。</summary>
+        Wait,
+
+        /// <summary>上限まで待っても空かない。止める。</summary>
+        GiveUp,
+    }
+
+    /// <summary>待つ上限（クエストの品を数個作る時間を見込む）。</summary>
+    public static readonly TimeSpan Limit = TimeSpan.FromMinutes(5);
+
+    public static Verdict Decide(bool? busy, bool? listRunning, TimeSpan waited)
+    {
+        if (busy == false && listRunning != true)
+            return Verdict.Proceed;
+        return waited > Limit ? Verdict.GiveUp : Verdict.Wait;
+    }
+}
+
+/// <summary>
 /// Questionable の見張り（このプラグインが ON の間は Questionable を OFF のままにしない。勝手に OFF になったら ON に戻す）。
 /// クエストの作業中（こちらが自分で作業している間を除く）に Questionable が止まっていたら、何度でも動かし直す（以前は3回やり直したら全体を止めていた）。
 /// すぐ止まる状況で頼み続けないよう、動かし直すたびに間を空ける（すぐ → 5秒 → 10秒 → 20秒 → 40秒 → 以降1分おき）。

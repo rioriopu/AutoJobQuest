@@ -29,6 +29,10 @@ public sealed class QuestCraftTask : AutoTask
     private NpcStepTask? giver;
     private int redo;
 
+    // Questionable が動かした Artisan の製作が終わるのを待った（ArtisanDrain）
+    private bool drained;
+    private DateTime drainSince = DateTime.MinValue;
+
     public QuestCraftTask(JobQuest quest, QuestCraft qc, System.Collections.Generic.IReadOnlyList<QuestionableStep>? paths)
     {
         this.quest = quest;
@@ -52,6 +56,30 @@ public sealed class QuestCraftTask : AutoTask
 
     protected override TaskResult Tick(TaskContext ctx)
     {
+        // 引き取った時点で、Questionable が動かした Artisan の製作が動いていれば、終わるのを待つ（ArtisanDrain）
+        if (!this.drained)
+        {
+            var busy = ctx.Artisan.IsBusy();
+            var list = ctx.Artisan.IsListRunning();
+            if (this.drainSince == DateTime.MinValue)
+            {
+                this.drainSince = DateTime.UtcNow;
+                ctx.Log.Write("クエスト", $"引き取った時点の Artisan：処理中={busy?.ToString() ?? "読めない"}・リスト実行中={list?.ToString() ?? "読めない"}"
+                                       + (busy == false && list != true ? string.Empty : "（Questionable が動かした製作が終わるのを待ってから、HQ の数で判断します）"));
+            }
+
+            switch (ArtisanDrain.Decide(busy, list, DateTime.UtcNow - this.drainSince))
+            {
+                case ArtisanDrain.Verdict.Wait:
+                    this.Status = "Questionable が動かした Artisan の製作が終わるのを待っています";
+                    return TaskResult.Running;
+                case ArtisanDrain.Verdict.GiveUp:
+                    return this.Fail($"Questionable が動かした Artisan の製作が {ArtisanDrain.Limit.TotalMinutes:0} 分たっても終わりません。Artisan の画面で製作を止めてから、もう一度開始してください（クエストは受注したままで続きから進みます）");
+            }
+
+            this.drained = true;
+        }
+
         // 材料をもらえた（会話が終わり、材料で作れるようになった）ら、相手との手順をそこで終える（材料を渡してもクエストの段・変数は
         // 変わらない見込みなので、以前は計3回話しかけ、「既に済んだ相手の可能性」という誤った注意を作り直しのたびに出していた）
         if (this.giver != null && this.sub == this.giver && GameUi.PlayerFree()

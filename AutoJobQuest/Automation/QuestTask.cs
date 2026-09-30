@@ -264,6 +264,12 @@ public sealed unsafe class QuestTask : AutoTask
             return this.RunWeatherBuy(ctx);
         }
 
+        if (this.relocate != null)
+        {
+            this.KeepFishingStopped();
+            return this.RunRelocate(ctx);
+        }
+
         // 釣りの手順の魚がもうそろっているのに、Questionable がその手前にいるなら、残り（報告）をこちらで行う（QuestTakeOver.AfterFishReady）
         if (this.HandleFishReady(ctx))
             return TaskResult.Running;
@@ -300,6 +306,22 @@ public sealed unsafe class QuestTask : AutoTask
         if (this.own != null)
         {
             this.KeepFishingStopped();
+
+            // 製作の手順で止めたときは、Questionable が動かした Artisan の製作が終わるのを待ってから進める（ArtisanDrain）
+            if (this.ownDrainSince is { } drainSince)
+            {
+                switch (ArtisanDrain.Decide(ctx.Artisan.IsBusy(), ctx.Artisan.IsListRunning(), DateTime.UtcNow - drainSince))
+                {
+                    case ArtisanDrain.Verdict.Wait:
+                        this.Status = "Questionable が動かした Artisan の製作が終わるのを待っています" + OwnWorkNote;
+                        return TaskResult.Running;
+                    case ArtisanDrain.Verdict.GiveUp:
+                        return this.Fail($"Questionable が動かした Artisan の製作が {ArtisanDrain.Limit.TotalMinutes:0} 分たっても終わりません。Artisan の画面で製作を止めてから、もう一度開始してください（続きから進みます）");
+                }
+
+                this.ownDrainSince = null;
+            }
+
             return this.RunOwnSteps(ctx);
         }
 
@@ -470,6 +492,8 @@ public sealed unsafe class QuestTask : AutoTask
                     ctx.Questionable.Stop(Plugin.InternalNameConst);
                     this.own = new Queue<QuestionableStep>(rest);
                     this.ownFromSeq = stepData.Sequence;
+                    if (stepData.InteractionType == "Craft")
+                        this.ownDrainSince = DateTime.UtcNow; // Questionable が動かした Artisan の製作が終わるのを待ってから進める（ArtisanDrain）
                     ctx.Log.Write("クエスト", $"Questionable が段 {stepData.Sequence} の{(stepData.InteractionType == "Craft" ? "製作" : "材料の購入")}に入ったので止め、"
                                          + $"この段の残り（{string.Join("→", rest.Select(x => $"{x.Type}（{NpcStepTask.NpcName(x.DataId)}）"))}）をこちらで行います"
                                          + "（納品物は用意済み。既製リストの追加製作・材料の買い足しをさせないため）");
@@ -535,8 +559,70 @@ public sealed unsafe class QuestTask : AutoTask
         else
         {
             this.notRunningFrames = 0;
+            if (running == true && stepData != null && stepData.QuestId == QuestionableIpc.ToQuestId(this.quest.RowId) && this.WatchStuckElsewhere(ctx, stepData))
+                return TaskResult.Running;
         }
 
+        return TaskResult.Running;
+    }
+
+    /// <summary>
+    /// Questionable は動いているのに、今の手順のエリアの外で、動ける状態のまま動かずにいたら（StuckElsewhere）、Questionable を止めて
+    /// 手順の場所まで運び（既存の GoToTask：テレポ・エーテライト網・歩き）、着いたら頼み直す。運び始めたら true。
+    /// </summary>
+    private bool WatchStuckElsewhere(TaskContext ctx, QuestionableIpc.StepData step)
+    {
+        var here = GameWeather.CurrentTerritory;
+        var pos = Me.Position;
+        if (this.stillSince == null || System.Numerics.Vector3.Distance(pos, this.stillAt) > 1f)
+        {
+            this.stillAt = pos;
+            this.stillSince = DateTime.UtcNow;
+        }
+
+        var verdict = StuckElsewhere.Decide(step.TerritoryId, here, step.InteractionType, GameUi.PlayerFree(), DateTime.UtcNow - this.stillSince.Value, this.relocations);
+        if (verdict == StuckElsewhere.Verdict.None && this.relocations >= StuckElsewhere.MaxRelocations && step.TerritoryId != 0 && step.TerritoryId != here
+            && !this.relocateLimitNoted && DateTime.UtcNow - this.stillSince.Value >= StuckElsewhere.Still)
+        {
+            this.relocateLimitNoted = true;
+            var msg = $"Questionable が {AreaAccess.Name(step.TerritoryId)} の手順（{step.Sequence}-{step.Step} {step.InteractionType}）を、{AreaAccess.Name(here)} で待ち続けています。"
+                      + $"{StuckElsewhere.MaxRelocations} 回運んでも進まないので、これ以上は運びません。手で {AreaAccess.Name(step.TerritoryId)} へ移動してください（Questionable がそのまま続けます）";
+            ctx.Log.Warn("クエスト", msg);
+            Svc.Chat.Print($"[AutoJobQuest] {msg}");
+        }
+
+        if (verdict != StuckElsewhere.Verdict.Relocate)
+            return false;
+
+        this.relocations++;
+        this.stillSince = null;
+        ctx.Questionable.Stop(Plugin.InternalNameConst);
+        this.PauseAutoFishing(ctx);
+        ctx.Log.Warn("クエスト", $"Questionable が {AreaAccess.Name(step.TerritoryId)} の手順（{step.Sequence}-{step.Step} {step.InteractionType}）を、"
+                                + $"{AreaAccess.Name(here)} で {StuckElsewhere.Still.TotalSeconds:0} 秒動かずに待っています（たどり着けないエリアを待ち続ける形）。"
+                                + $"Questionable を止めて {AreaAccess.Name(step.TerritoryId)} へ運び、着いたら頼み直します（{this.relocations}/{StuckElsewhere.MaxRelocations} 回目）");
+        this.relocate = TestReturnTask?.Invoke(step.TerritoryId)
+                        ?? (step.Position is { } p
+                            ? new GoToTask(step.TerritoryId, p, 10f, AreaAccess.Name(step.TerritoryId))
+                            : new TeleportTask(step.TerritoryId));
+        this.NextPhase($"{AreaAccess.Name(step.TerritoryId)} へ運んでいます");
+        return true;
+    }
+
+    /// <summary>手順の場所へ運ぶ作業を進める。終わったら（着けなくても）Questionable に頼み直す。</summary>
+    private TaskResult RunRelocate(TaskContext ctx)
+    {
+        var r = this.relocate!.Step(ctx);
+        this.Status = this.relocate.Status + OwnWorkNote;
+        if (r == TaskResult.Running)
+            return TaskResult.Running;
+        if (r == TaskResult.Failed)
+            ctx.Log.Warn("クエスト", $"手順の場所へ運べませんでした（{this.relocate.FailReason}）。そのまま Questionable に頼み直します");
+        this.relocate.Cleanup(ctx);
+        this.relocate = null;
+        this.RestoreAutoFishing(ctx);
+        this.started = false; // Questionable に頼み直す
+        this.notRunningFrames = 0;
         return TaskResult.Running;
     }
 
@@ -824,6 +910,16 @@ public sealed unsafe class QuestTask : AutoTask
     // AutoHook が有効のまま残り、釣り場で自分で竿を投げ続けて、こちらの移動が始まらなかった。Questionable の釣りの手順は、終わると AutoHook を
     // 「手順を始めたときの状態」に戻す。この実行では始めから有効だった）
     private bool? autoHookBefore;
+
+    // 製作の手順で止めて残りをこちらで行うとき、Artisan の製作が終わるのを待ち始めた時刻（ArtisanDrain）
+    private DateTime? ownDrainSince;
+
+    // たどり着けないエリアを待ち続ける形の見張り（StuckElsewhere）：運んでいる作業・動かずにいる位置と時刻・運んだ回数・知らせた印
+    private AutoTask? relocate;
+    private System.Numerics.Vector3 stillAt;
+    private DateTime? stillSince;
+    private int relocations;
+    private bool relocateLimitNoted;
     private DateTime quitSentAt = DateTime.MinValue;
 
     /// <summary>釣りの構えを解く行動（Action 299「中断」。Questionable の EAction.FSHQuit と同じ）。</summary>
@@ -1397,6 +1493,8 @@ public sealed unsafe class QuestTask : AutoTask
         // 自分が始めた進行（または別のクエストへ移ったのを見た進行）がまだ動いていれば止め、Questionable の優先リストを元に戻す
         this.starter.Cleanup(ctx);
 
+        this.relocate?.Cleanup(ctx);
+        this.relocate = null;
         this.RestoreAutoFishing(ctx);
         ctx.TextAdvance.ReleaseControl();
         ctx.YesAlready.Release();
