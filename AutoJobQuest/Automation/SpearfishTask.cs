@@ -18,10 +18,14 @@ namespace AutoJobQuest.Automation;
 ///     GBR が自分のプリセットを作って上書きしないよう、GBR の「Use existing AutoHook presets」を一時的に ON にし、
 ///     前提の魚と目標の魚の番号の名前の竿のプリセット（中身は既定の値）を置く（GBR は刺突漁でも、その名前の竿のプリセットがあれば自分のものを作らない）。
 ///     AutoHook は設定をファイルに少し遅れて書く。GBR はそのファイルを読むので、名前がファイルに出てから GBR を動かす。
-///  4) GBR の目標を「魚影の別の魚」にして動かす（GatherTask）。欲しい魚が要る数になったら止める。
+///  4) GBR を動かす前に、ファゾム（漁場が見える）とトゥルー・オブ・オーシャン（魚影がナビマップに出る）を付ける。
+///     どちらも永続の状態で、特性（オートファゾム・オートトゥルー・オブ・オーシャン）は「漁師にクラスチェンジした際」にしか付かない。
+///     すでに漁師で状態が外れていると付かず、漁場が見えないまま GBR が水中で止まる（沈没川船で潜ったまま動かなかった原因）。
+///     ファゾムを付けられなければ始めない。トゥルー・オブ・オーシャンは付かなくても進める（GBR は物の一覧でも魚影を見つける）。
+///  5) GBR の目標を「魚影の別の魚」にして動かす（GatherTask）。欲しい魚が要る数になったら止める。
 ///     刺突の画面に出た魚の大きさ・速さは、変わるたびに記録に残す。魚影で、いつもの魚のどれとも違う値の魚を見たら、
-///     それを欲しい魚とみて、プリセットを見た値に合わせ直す。ファゾムが付いていなければ使う（Questionable の注記）。
-///  5) 後始末：GBR を止めて設定とリストを戻す。置いた竿のプリセットを消し、前に選ばれていた竿のプリセットを選び直す。
+///     それを欲しい魚とみて、プリセットを見た値に合わせ直す。動かしている間にファゾムが外れたら付け直し、1分付けられなければ止める。
+///  6) 後始末：GBR を止めて設定とリストを戻す。置いた竿のプリセットを消し、前に選ばれていた竿のプリセットを選び直す。
 ///     刺突漁のプリセットは、消す IPC が無いので残る（知らせる）。刺突の自動の ON/OFF は、始める前の状態に戻す。
 /// </summary>
 public sealed class SpearfishTask : AutoTask
@@ -29,6 +33,7 @@ public sealed class SpearfishTask : AutoTask
     private enum SpearStep
     {
         Equip,
+        Buffs,
         Prepare,
         WaitAutoHook,
         Gather,
@@ -40,8 +45,23 @@ public sealed class SpearfishTask : AutoTask
     /// <summary>ファゾム（Action。漁師 Lv61）。刺突漁の漁場を見えるようにする（Questionable の注記「activate Fathom」）。</summary>
     public const uint FathomAction = 7903;
 
-    /// <summary>ファゾムの状態（Status）。</summary>
+    /// <summary>ファゾムの状態（Status。永続）。</summary>
     public const uint FathomStatus = 1166;
+
+    /// <summary>トゥルー・オブ・オーシャン（Action。漁師 Lv65）。最も近い魚影の位置をナビマップに出す。</summary>
+    public const uint TruthAction = 7911;
+
+    /// <summary>トゥルー・オブ・オーシャンの状態（Status。永続）。</summary>
+    public const uint TruthStatus = 1173;
+
+    /// <summary>GBR を動かす前に、ファゾムを付けるのを待つ上限（付かなければ始めない）。</summary>
+    public static readonly TimeSpan FathomSetupLimit = TimeSpan.FromSeconds(20);
+
+    /// <summary>トゥルー・オブ・オーシャンを付けるのを待つ上限（付かなくても進める）。</summary>
+    public static readonly TimeSpan TruthSetupLimit = TimeSpan.FromSeconds(10);
+
+    /// <summary>GBR を動かしている間にファゾムが外れたとき、付け直せずに待つ上限（過ぎたら止める：漁場が見えず GBR が止まるため）。</summary>
+    public static readonly TimeSpan FathomLostLimit = TimeSpan.FromMinutes(1);
 
     /// <summary>GBR の刺突漁を続ける上限。</summary>
     public static readonly TimeSpan GatherLimit = TimeSpan.FromMinutes(50);
@@ -65,6 +85,10 @@ public sealed class SpearfishTask : AutoTask
     private string presetName = string.Empty;
     private DateTime nextFileCheck = DateTime.MinValue;
     private DateTime lastFathom = DateTime.MinValue;
+    private DateTime lastTruth = DateTime.MinValue;
+    private DateTime lastDismount = DateTime.MinValue;
+    private DateTime? fathomMissingSince;
+    private bool truthGaveUp;
     private DateTime nextProgressLog = DateTime.MinValue;
     private string lastFishKey = string.Empty;
     private readonly HashSet<(int, int)> triedStats = [];
@@ -203,8 +227,12 @@ public sealed class SpearfishTask : AutoTask
                         return this.Fail(failed);
                 }
 
-                this.step = SpearStep.Prepare;
+                this.step = SpearStep.Buffs;
+                this.NextPhase("ファゾムとトゥルー・オブ・オーシャンを付けています");
                 return TaskResult.Running;
+
+            case SpearStep.Buffs:
+                return this.SetupBuffs(ctx);
 
             case SpearStep.Prepare:
                 return this.Prepare(ctx);
@@ -298,16 +326,93 @@ public sealed class SpearfishTask : AutoTask
         return TaskResult.Running;
     }
 
+    /// <summary>
+    /// GBR を動かす前に、ファゾム（必須）とトゥルー・オブ・オーシャン（付かなくても進める）を付ける。
+    /// 使える状態なら使う。乗り物に乗っていれば降りる（乗ったままでは使えない。空中なら着地してから降りる。潜っている間は待つ）。
+    /// </summary>
+    private TaskResult SetupBuffs(TaskContext ctx)
+    {
+        var fathom = GameMemory.HasStatus(FathomStatus);
+        if (!fathom)
+        {
+            switch (this.TryBuff(ctx, FathomAction, ref this.lastFathom, allowDismount: true, this.PhaseElapsed, FathomSetupLimit))
+            {
+                case SpearBuffs.Verdict.GiveUp:
+                    return this.Fail($"ファゾムを付けられませんでした（行動の状態 {GameUi.ActionStatus(FathomAction)}）。ファゾムが無いと刺突漁の漁場が見えず、GBR が水中で止まります。"
+                                     + "ファゾムを使うか、ほかのジョブから漁師に着替え直して（特性「オートファゾム」で付きます）から再開してください");
+                default:
+                    this.Status = "ファゾムを付けています";
+                    return TaskResult.Running;
+            }
+        }
+
+        if (!this.truthGaveUp && !GameMemory.HasStatus(TruthStatus))
+        {
+            switch (this.TryBuff(ctx, TruthAction, ref this.lastTruth, allowDismount: true, this.PhaseElapsed, FathomSetupLimit + TruthSetupLimit))
+            {
+                case SpearBuffs.Verdict.GiveUp:
+                    this.truthGaveUp = true;
+                    ctx.Log.Warn("刺突漁", $"トゥルー・オブ・オーシャンを付けられませんでした（行動の状態 {GameUi.ActionStatus(TruthAction)}）。魚影がナビマップに出ませんが、GBR は物の一覧でも魚影を探すので進めます");
+                    break;
+                default:
+                    this.Status = "トゥルー・オブ・オーシャンを付けています";
+                    return TaskResult.Running;
+            }
+        }
+
+        ctx.Log.Write("刺突漁", $"ファゾム {(GameMemory.HasStatus(FathomStatus) ? "あり" : "なし")}・トゥルー・オブ・オーシャン {(GameMemory.HasStatus(TruthStatus) ? "あり" : "なし")}。AutoHook と GBR の用意に進みます");
+        this.step = SpearStep.Prepare;
+        return TaskResult.Running;
+    }
+
+    /// <summary>その状態を付けるための1歩（使う・降りる・待つ）。使ってから2秒・降りてから1秒はあける。</summary>
+    private SpearBuffs.Verdict TryBuff(TaskContext ctx, uint action, ref DateTime lastUse, bool allowDismount, TimeSpan missingFor, TimeSpan limit)
+    {
+        var verdict = SpearBuffs.Decide(false, GameUi.ActionStatus(action), GameUi.PlayerFree(), GameUi.Mounted,
+            Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.Diving],
+            allowDismount, missingFor, limit);
+        switch (verdict)
+        {
+            case SpearBuffs.Verdict.Use when DateTime.UtcNow - lastUse >= TimeSpan.FromSeconds(2):
+                lastUse = DateTime.UtcNow;
+                ctx.Log.Write("刺突漁", $"{ActionName(action)}が付いていないので使います");
+                GameUi.UseAction(action);
+                break;
+            case SpearBuffs.Verdict.Dismount when DateTime.UtcNow - this.lastDismount >= TimeSpan.FromSeconds(1):
+                this.lastDismount = DateTime.UtcNow;
+                ctx.Log.Write("刺突漁", $"{ActionName(action)}を使うため、乗り物から降ります");
+                GameUi.UseGeneralAction(23); // 降りる（GeneralAction 23：TalkToNpcTask と同じ）
+                break;
+        }
+
+        return verdict;
+    }
+
+    private static string ActionName(uint action)
+        => Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Action>().TryGetRow(action, out var a) ? a.Name.ExtractText() : $"行動 {action}";
+
     private TaskResult RunGather(TaskContext ctx, int held)
     {
-        this.UseFathomIfNeeded(ctx);
+        // GBR を動かしている間にファゾムが外れたら付け直す。乗り物の上では降ろさない（GBR の移動と取り合う）。1分付けられなければ止める
+        if (GameMemory.HasStatus(FathomStatus))
+        {
+            this.fathomMissingSince = null;
+        }
+        else if (Me.Territory == this.plan!.Parent.Territory)
+        {
+            this.fathomMissingSince ??= DateTime.UtcNow;
+            if (this.TryBuff(ctx, FathomAction, ref this.lastFathom, allowDismount: false, DateTime.UtcNow - this.fathomMissingSince.Value, FathomLostLimit) == SpearBuffs.Verdict.GiveUp)
+                return this.Fail($"刺突漁の途中でファゾムが外れ、{FathomLostLimit.TotalMinutes:0}分付け直せませんでした（行動の状態 {GameUi.ActionStatus(FathomAction)}）。"
+                                 + "漁場が見えないと GBR が止まるので止めます。ファゾムを使ってから再開してください");
+        }
 
         var r = this.gather!.Step(ctx);
         this.Status = $"{CraftPlanner.ItemName(this.wanted)} {held}/{this.count}・{CraftPlanner.ItemName(this.plan!.Predator)} {Inventory.CountNow(this.plan.Predator)}　{this.gather.Status}";
         if (DateTime.UtcNow >= this.nextProgressLog)
         {
             this.nextProgressLog = DateTime.UtcNow + TimeSpan.FromSeconds(30);
-            ctx.Log.Debug("刺突漁", $"途中：{this.Status}・GBR「{ctx.GatherBuddy.StatusText()}」・エリア {Me.Territory}・位置 {Me.Position:0.0}・ファゾム {GameMemory.HasStatus(FathomStatus)}");
+            ctx.Log.Debug("刺突漁", $"途中：{this.Status}・GBR「{ctx.GatherBuddy.StatusText()}」・エリア {Me.Territory}・位置 {Me.Position:0.0}"
+                                   + $"・ファゾム {GameMemory.HasStatus(FathomStatus)}・トゥルー・オブ・オーシャン {GameMemory.HasStatus(TruthStatus)}・乗り物 {GameUi.Mounted}");
         }
 
         if (r == TaskResult.Running)
@@ -320,18 +425,6 @@ public sealed class SpearfishTask : AutoTask
             return TaskResult.Done;
         return this.Fail($"GBR の刺突漁が、{CraftPlanner.ItemName(this.wanted)} がそろう前に終わりました（{this.Held}/{this.count}"
                          + $"{(gatherFailed != null ? $"・{gatherFailed}" : string.Empty)}）");
-    }
-
-    /// <summary>ファゾムが付いていなければ使う（使える状態のときだけ。5秒あける）。</summary>
-    private void UseFathomIfNeeded(TaskContext ctx)
-    {
-        if (GameMemory.HasStatus(FathomStatus) || Me.Territory != this.plan!.Parent.Territory || DateTime.UtcNow - this.lastFathom < TimeSpan.FromSeconds(5))
-            return;
-        if (!GameUi.PlayerFree() || GameUi.ActionStatus(FathomAction) != 0)
-            return;
-        this.lastFathom = DateTime.UtcNow;
-        ctx.Log.Write("刺突漁", "ファゾムが付いていないので使います");
-        GameUi.UseAction(FathomAction);
     }
 
     /// <summary>刺突の画面の魚を記録し、魚影で欲しい魚の値を見たら、プリセットを合わせ直す。</summary>
@@ -403,3 +496,49 @@ public sealed class SpearfishTask : AutoTask
         this.autoHookTouched = false;
     }
 }
+
+/// <summary>
+/// 刺突漁の状態（ファゾム・トゥルー・オブ・オーシャン）を付けるときの判断（ゲームを起動せずに試せるように分けた）。
+/// </summary>
+public static class SpearBuffs
+{
+    public enum Verdict
+    {
+        /// <summary>付いている。</summary>
+        Ok,
+
+        /// <summary>使う（行動が使える状態）。</summary>
+        Use,
+
+        /// <summary>乗り物から降りる（乗っていて行動が使えない。空中なら降りる操作で着地してから降りる）。</summary>
+        Dismount,
+
+        /// <summary>待つ（動けない・水中の乗り物の上など）。</summary>
+        Wait,
+
+        /// <summary>上限まで付けられなかった。</summary>
+        GiveUp,
+    }
+
+    /// <param name="has">状態が付いているか。</param>
+    /// <param name="actionStatus">行動の状態（ActionManager.GetActionStatus。0＝使える）。</param>
+    /// <param name="playerFree">自由に動ける状態か。</param>
+    /// <param name="mounted">乗り物に乗っているか。</param>
+    /// <param name="airborne">水中か（潜っている間は降ろさない）。</param>
+    /// <param name="allowDismount">降りてよいか（GBR が動かしている間は降ろさない）。</param>
+    /// <param name="missingFor">付いていない時間。</param>
+    /// <param name="limit">上限。</param>
+    public static Verdict Decide(bool has, uint actionStatus, bool playerFree, bool mounted, bool airborne, bool allowDismount, TimeSpan missingFor, TimeSpan limit)
+    {
+        if (has)
+            return Verdict.Ok;
+        if (missingFor >= limit)
+            return Verdict.GiveUp;
+        if (actionStatus == 0 && playerFree)
+            return Verdict.Use;
+        if (allowDismount && mounted && !airborne && playerFree)
+            return Verdict.Dismount;
+        return Verdict.Wait;
+    }
+}
+
