@@ -49,6 +49,7 @@ public static class ArtisanHqEstimate
         private readonly Func<string>? readSignature;
         private object? artisanInstance;
         private string? artisanConfig;
+        private int ticks;
         public List<Result> Results { get; } = [];
         public string? Error { get; private set; }
         public bool Complete { get; private set; }
@@ -85,10 +86,15 @@ public static class ArtisanHqEstimate
                         this.steps = api.RunSteps(this.recipes).GetEnumerator();
                     }
                 }
-                if (this.artisanInstance != null && !ReferenceEquals(this.artisanInstance, RsrStateReader.FindPluginInstance("Artisan")))
-                    throw new InvalidOperationException("Artisan の読み込み状態が変わりました。点検し直してください");
-                if (this.artisanInstance != null && this.artisanConfig != ConfigSignature(this.artisanInstance, this.recipes.Select(x => x.RecipeId)))
-                    throw new InvalidOperationException("計算中にArtisanの設定が変わりました。点検し直してください");
+                // 読み込み状態と設定の照合は30フレームに1回（以前は毎フレーム、全設定の直列化と全プラグインの走査を2msの枠の外で行っていた）。
+                // 正しさは、終わったときの全照合（IsCurrent＝Fingerprint）で保つ
+                if (this.artisanInstance != null && ++this.ticks % 30 == 0)
+                {
+                    if (!ReferenceEquals(this.artisanInstance, RsrStateReader.FindPluginInstance("Artisan")))
+                        throw new InvalidOperationException("Artisan の読み込み状態が変わりました。点検し直してください");
+                    if (this.artisanConfig != ConfigSignature(this.artisanInstance, this.recipes.Select(x => x.RecipeId)))
+                        throw new InvalidOperationException("計算中にArtisanの設定が変わりました。点検し直してください");
+                }
                 // 時間はフレームの占有上限だけに使う。完了は列挙の終了で判断する。
                 var clock = System.Diagnostics.Stopwatch.StartNew();
                 var count = 0;
@@ -438,20 +444,67 @@ public static class ArtisanHqEstimate
         public string StatsText(object craft)
             => $"作業精度 {this.statCraftsmanship.GetValue(craft)}・加工精度 {this.statControl.GetValue(craft)}・CP {this.statCp.GetValue(craft)}・Lv{this.statLevel.GetValue(craft)}";
 
+        /// <summary>
+        /// レシピごとに計算する。1つのレシピで例外が出ても、そのレシピを「計算できない」（Percent=null）にして次へ進む
+        /// （以前は1つの例外で計算全体を捨て、開始できなくなった。HQ の見込みは参考値なので、始めるのを止める理由にしない）。
+        /// </summary>
         public IEnumerable<Result?> RunSteps(List<(uint RecipeId, uint ItemId, uint ClassJob)> recipes)
         {
             foreach (var (recipeId, itemId, job) in recipes)
             {
-                var craft = this.BuildCraft(Svc.Data.GetExcelSheet<Recipe>().GetRow(recipeId), job);
-                var (solver, name) = this.CreateSolver(recipeId, craft);
-                if (solver == null)
+                IEnumerator<Result?>? inner = null;
+                string? error = null;
+                try
                 {
-                    yield return new Result(recipeId, itemId, null, 0, this.StatsText(craft), name, "ソルバーを選べません");
-                    continue;
+                    inner = this.RecipeSteps(recipeId, itemId, job).GetEnumerator();
                 }
-                foreach (var result in this.RunPreparedSteps(recipeId, itemId, craft, solver, name))
-                    yield return result;
+                catch (Exception e)
+                {
+                    error = Unwrap(e).Message;
+                }
+
+                while (inner != null)
+                {
+                    bool has;
+                    Result? current = null;
+                    try
+                    {
+                        has = inner.MoveNext();
+                        if (has)
+                            current = inner.Current;
+                    }
+                    catch (Exception e)
+                    {
+                        error = Unwrap(e).Message;
+                        has = false;
+                    }
+
+                    if (!has)
+                    {
+                        inner.Dispose();
+                        break;
+                    }
+
+                    yield return current;
+                }
+
+                if (error != null)
+                    yield return new Result(recipeId, itemId, null, 0, string.Empty, string.Empty, $"計算に失敗：{error}");
             }
+        }
+
+        private IEnumerable<Result?> RecipeSteps(uint recipeId, uint itemId, uint job)
+        {
+            var craft = this.BuildCraft(Svc.Data.GetExcelSheet<Recipe>().GetRow(recipeId), job);
+            var (solver, name) = this.CreateSolver(recipeId, craft);
+            if (solver == null)
+            {
+                yield return new Result(recipeId, itemId, null, 0, this.StatsText(craft), name, "ソルバーを選べません");
+                yield break;
+            }
+
+            foreach (var result in this.RunPreparedSteps(recipeId, itemId, craft, solver, name))
+                yield return result;
         }
 
         public IEnumerable<Result?> RunPreparedSteps(uint recipeId, uint itemId, object craft, object solver, string name)

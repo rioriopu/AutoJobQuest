@@ -25,7 +25,11 @@ namespace AutoJobQuest.Automation;
 /// <param name="Need">要る数（カバンの所持数を引いた不足数）。</param>
 /// <param name="Label">記録用の名前。</param>
 /// <param name="TargetOwned">指定品のとき「持っていたい総数」（計画時点の所持数＋不足数）。買う直前にカバンを数え直す基準。</param>
-public sealed record MarketNeed(List<uint> Candidates, int Need, string Label, int? TargetOwned = null);
+/// <param name="StopIfUnavailable">
+/// 買えなければ、その場で全体を止める（マテリア：代わりの手段は無いので、周回で買い直さない。
+/// 出品が0件なら、自分だけに見えるチャットに「マーケットボードに○○の出品がなかった為、動作を停止しました」を出す）。
+/// </param>
+public sealed record MarketNeed(List<uint> Candidates, int Need, string Label, int? TargetOwned = null, bool StopIfUnavailable = false);
 
 /// <summary>
 /// マーケットボード（MB）の設置場所をゲームデータから引く。
@@ -513,6 +517,12 @@ public sealed unsafe class MarketBoardTask : AutoTask
     private int boughtForCurrent;
     private int attempts;
 
+    // 買えなければ止める品（マテリア）で、出品0件を見た回数（2回続けて見たら止める：前の要求の応答が遅れて届いた0件と取り違えないため）
+    private int zeroListingsSeen;
+
+    // いま見ている品の、自分のリテイナーの出品の数（止めるときの文言に使う）
+    private int ownListings;
+
     // 出品を選んだときの不足数（送る直前に変わっていたら選び直す）
     private int needAtDecide;
 
@@ -744,6 +754,7 @@ public sealed unsafe class MarketBoardTask : AutoTask
         }
 
         this.current = this.needs[this.needIndex];
+        this.zeroListingsSeen = 0;
         this.candidateIndex = 0;
         this.bestByCandidate.Clear();
         this.boughtForCurrent = 0;
@@ -977,7 +988,22 @@ public sealed unsafe class MarketBoardTask : AutoTask
             // 1件で足りる出品が無い → 単価の安い順に買って満たす
             pick = listings.OrderBy(l => l.UnitPrice).ThenByDescending(l => l.Quantity).FirstOrDefault();
             if (pick.ListingId == 0)
-                return this.GiveUpCurrent(ctx, "出品がありません");
+            {
+                // 買えなければ止める品（マテリア）は、同じ行を押し直してもう一度0件を確かめる（件数の応答には品目も番号も無いので、
+                // 前の要求の応答が遅れて届いた0件と取り違える余地がある）
+                if (this.current!.StopIfUnavailable && UnavailableListing.Recheck(listings.Count, this.zeroListingsSeen))
+                {
+                    this.zeroListingsSeen++;
+                    ctx.Log.Warn("マーケット", $"{CraftPlanner.ItemName(this.searching)} の買える出品が0件でした（ゲームが返した件数 {this.watcher.LastCount}・自分のリテイナーの出品 {this.ownListings}）。取り違えでないか、もう一度確かめます");
+                    this.searchNotBefore = DateTime.UtcNow + MinSearchInterval;
+                    this.reuseResults = true;
+                    this.Go(Phase.Search, "出品が0件か確かめ直します");
+                    return TaskResult.Running;
+                }
+
+                return this.GiveUpCurrent(ctx, this.ownListings > 0 ? $"買える出品がありません（自分のリテイナーの出品 {this.ownListings} 件だけ）" : "出品がありません",
+                    noListings: listings.Count == 0, ownListings: this.ownListings);
+            }
             ctx.Log.Warn("マーケット", $"{CraftPlanner.ItemName(this.buyingItem)}: {need}個以上の出品が無いので、単価の安い出品（{pick.Quantity}個）から順に買います");
         }
 
@@ -1267,9 +1293,26 @@ public sealed unsafe class MarketBoardTask : AutoTask
         return this.GiveUpCurrent(ctx, why);
     }
 
-    private TaskResult GiveUpCurrent(TaskContext ctx, string why)
+    private TaskResult GiveUpCurrent(TaskContext ctx, string why, bool noListings = false, int ownListings = 0)
     {
         ctx.Log.Warn("マーケット", $"{this.current!.Label} を買えませんでした：{why}");
+
+        // 買えなければ止める品（マテリア）：周回で買い直さずに、その場で止める。
+        // 入手してから開始すれば、計画は手持ちから作り直すので続きから進む
+        if (this.current.StopIfUnavailable)
+        {
+            var name = CraftPlanner.ItemName(this.searching != 0 ? this.searching : this.current.Candidates[0]);
+            if (noListings)
+            {
+                var text = UnavailableListing.StopText(name, ownListings);
+                Svc.Chat.Print(text);
+                return this.Fail($"{text}。{name}を手に入れてから開始すると、続きから進みます");
+            }
+
+            Svc.Chat.Print($"マーケットボードで{name}を買えなかった為、動作を停止しました（{why}）");
+            return this.Fail($"マーケットボードで{name}を買えなかった為、動作を停止しました（{why}）。{name}を手に入れてから開始すると、続きから進みます");
+        }
+
         this.Unfinished.Add(this.current.Label);
         this.UnfinishedItems.AddRange(this.current.Candidates);
         this.buyingItem = 0;
@@ -1352,11 +1395,14 @@ public sealed unsafe class MarketBoardTask : AutoTask
             return list;
 
         var own = OwnRetainers();
+        this.ownListings = 0;
         for (var i = 0; i < proxy->ListingCount && i < 100; i++)
         {
             var l = proxy->Listings[i];
             if (l.ItemId != this.searching || l.UnitPrice == 0 || l.Quantity == 0)
                 continue;
+            if (own.Contains(l.RetainerId) && !this.boughtListings.Contains(l.ListingId))
+                this.ownListings++;
             if (l.IsSellingAsSet || own.Contains(l.RetainerId) || this.boughtListings.Contains(l.ListingId) || this.rejectedListings.Contains(l.ListingId))
                 continue;
 
@@ -1387,4 +1433,31 @@ public sealed unsafe class MarketBoardTask : AutoTask
 
         return set;
     }
+}
+
+/// <summary>
+/// 買えなければ止める品（装着するマテリア）で、買える出品が0件だったときの扱い（
+/// ゲームを起動せずに試せるように分けた）。
+/// </summary>
+public static class UnavailableListing
+{
+    /// <summary>
+    /// もう一度確かめるか。件数の応答には品目も番号も無いので、前の要求の応答が遅れて届いた0件と取り違える余地がある
+    /// ため、1回目の0件なら確かめ直し、2回目で止める。
+    /// </summary>
+    /// <param name="usable">こちらが買える出品の数（自分のリテイナーの出品・セット売り・断った出品を除く）。</param>
+    /// <param name="zeroSeenBefore">これまでに0件を見た回数。</param>
+    public static bool Recheck(int usable, int zeroSeenBefore) => usable == 0 && zeroSeenBefore < 1;
+
+    /// <summary>
+    /// 止めるときのチャットの文言。自分のリテイナーの出品が無ければ既定の文言そのまま。自分のリテイナーの出品しか無ければ、理由を足す
+    /// （マーケットボードには自分の出品が見えるので、「出品がなかった」だけでは事実と違って見える。
+    /// 以前はゲームが返した件数で書いたので、出品を買い切った後の0件で、自分が買った出品を「自分のリテイナーの出品など」と説明していた）。
+    /// </summary>
+    /// <param name="name">品名。</param>
+    /// <param name="ownListings">自分のリテイナーの出品の数（買い終えた出品は数えない）。</param>
+    public static string StopText(string name, int ownListings)
+        => ownListings <= 0
+            ? $"マーケットボードに{name}の出品がなかった為、動作を停止しました"
+            : $"マーケットボードに{name}の出品がなかった為（自分のリテイナーの出品 {ownListings} 件だけでした）、動作を停止しました";
 }

@@ -252,7 +252,9 @@ public sealed class CraftOneTask : AutoTask
             // 送る前に控えを保存する（読み込みの解除をまたいでも戻せるように）
             if (!ctx.Config.UseArtisanConsumables && !this.consumablesDisabled)
             {
-                if (!ctx.Artisan.CanDisableConsumables(this.craft.RecipeId))
+                // 前の実行でこちらが入れて戻しきれなかった指定（控えにあり、値もこちらの値）なら、自分の指定としてそのまま使う
+                var ownLeftover = ctx.Config.ArtisanTempConsumableRecipes.Contains(this.craft.RecipeId) && ctx.Artisan.IsOwnTemp(this.craft.RecipeId);
+                if (!ownLeftover && !ctx.Artisan.CanDisableConsumables(this.craft.RecipeId))
                     return this.Fail("Artisan の食事・薬に既存の一時指定があるか、読み取れません。他の処理の指定を上書きせず止めました。Artisan を確認してください");
                 if (!ctx.Config.ArtisanTempConsumableRecipes.Contains(this.craft.RecipeId))
                 {
@@ -260,7 +262,7 @@ public sealed class CraftOneTask : AutoTask
                     ctx.Config.Save();
                 }
 
-                if (!ctx.Artisan.DisableConsumablesTemporarily(this.craft.RecipeId))
+                if (!ownLeftover && !ctx.Artisan.DisableConsumablesTemporarily(this.craft.RecipeId))
                     return this.Fail($"Artisan に「この製作では食事・薬を使わない」を頼めませんでした（高価な消耗品を使わないよう、製作を始めません）: {string.Join(" / ", ctx.Artisan.LastErrors.Values)}");
                 this.consumablesDisabled = true;
             }
@@ -328,11 +330,19 @@ public sealed class CraftOneTask : AutoTask
 
         // 連続製作が予定の途中で止まった（Artisan の「NQ ができたら止める」「失敗したら止める」等。Crafting List ではなく
         // 連続製作で頼んでいるので、この設定が効く）→ この頼みで進んでいれば、残りを同じ作業の中で頼み直す（CraftResume）
-        // 試し作り後の依頼でHQが増えず途中停止したら、同じ条件で材料を使い続けない。
+        // HQ が増えていなければ止めて材料を残す：この頼みで1個以上できたのに HQ が1つも増えず、予定の途中で止まったら、
+        // 残りは頼まずに材料を残し、試し作りの NQ と同じく「HQ の失敗」として数える（以前は実行全体を止めていたので、
+        // 試し作りの NQ〔失敗を数えて次の周回で作り直す〕と食い違い、1個もできない中断〔製作の失敗・Artisan が始めない〕まで
+        // 「材料を残して停止」という誤った理由で止まり、製作の構えも解かれなかった）。1個もできないときは、下の頼み直しと診断に任せる
         if (!stopAfterTrial && this.craft.WantHq && this.HqNeeded > 0 && !this.collectable
-            && nowCount - this.beforeAll < this.expected && inv.CountHq(this.craft.ItemId) <= this.attemptHq
+            && nowCount - this.beforeAll < this.expected && nowCount - this.attemptBase > 0
+            && inv.CountHq(this.craft.ItemId) <= this.attemptHq
             && inv.CountHq(this.craft.ItemId) - this.beforeHq < this.HqNeeded)
-            return this.Fail($"{CraftPlanner.ItemName(this.craft.ItemId)} の HQ が増えないまま連続製作が止まりました。材料を残して停止します。装備・Artisan の設定を確認してください");
+        {
+            stopAfterTrial = true;
+            ctx.Log.Warn("製作", $"{CraftPlanner.ItemName(this.craft.ItemId)}（HQ 指定）は、この頼みで HQ が1つも増えないまま連続製作が止まりました。"
+                                 + "材料を残すため残りは作らず、HQ の失敗として数えます（装備・Artisan の設定を見直す目安）");
+        }
 
         var resume = stopAfterTrial ? 0 : CraftResume.Decide(nowCount - this.beforeAll, this.expected, nowCount - this.attemptBase, this.resumed,
             this.craft.Crafts, CraftCut.Craftable(CraftPlanner.Ingredients(this.recipe), inv), this.craft.Yield);

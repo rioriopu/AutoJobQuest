@@ -5,295 +5,1147 @@ using System.Numerics;
 using AutoJobQuest.Core;
 using AutoJobQuest.Data;
 using AutoJobQuest.Planning;
-using Dalamud.Game;
+using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.ClientState.Objects.Enums;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
+using FFXIVClientStructs.FFXIV.Component.GUI;
 using Lumina.Excel.Sheets;
 
 namespace AutoJobQuest.Automation;
 
-/// <summary>開始時に1回だけ呼び鈴を開き、全員の実在庫を読み、必要分を引き出す。</summary>
-public sealed unsafe class RetainerStockTask(Func<JobQuestPlan> makePlan) : AutoTask
+/// <summary>
+/// 呼び鈴を開き、全員のリテイナーの持ち物を読み、計画に要る分だけ引き出す。
+///
+/// 手順は、実機で確かめたものに合わせた：
+///  ・持ち物の画面が開いたかは InventoryRetainer／InventoryRetainerLarge の窓で見る
+///    （RetainerPage1 は一度開くと読めたままになるので、入れ物が読めるかでは判定しない）
+///  ・右クリックのメニュー（ContextMenu）は常駐の窓とみられ、開くたびに PostSetup が来ない。
+///    「頼む前は出ていなかった」「メニューの対象が頼んだ枠」の2つで自分のものと見る
+///  ・数の入力（InputNumeric）は「受け取る」を選んでも出ることがある（実測）。出たら入れ、出ずに増えたらそのまま
+///  ・クリスタルの入れ物は読み込み済みと報告しないことがある
+///  ・閉じる順：数の入力 → 持ち物（AgentRetainer.Hide）→「リテイナーを帰す」→ 一覧（-1）
+///  ・引き出す前に、鞄（クリスタルは専用の欄）に入る数を確かめる（見ずに撃つと弾かれて空振りする）
+///
+/// 窓が自分のものかは、画面の持ち主の記録（呼び鈴に話しかける直前から記録する）か、
+/// 「操作する前は出ていなかった窓が、操作の後に出た」かで見る（以前は記録を始めておらず、自分で開いた窓を1つも認識できなかった）。
+/// 見分けの決まりは <see cref="RetainerWindows"/> にまとめ、ゲーム無しで試している。
+///
+/// 1巡目で全員の持ち物を読み、合計から引き出す数を決める。2巡目は引き出す品を持っているリテイナーだけを開く。
+/// 引き出しは「リテイナー側が減った」かつ「手持ちが増えた」が頼んだ数と一致したときだけ済んだとする。
+/// 片側だけの反映・対象の変化・応答が分からないときは送り直さずに止める。
+///
+/// 数えない・引き出さないもの：収集品、装備中の品（リテイナーの装備欄は読まない）、
+/// 出品中の品（マーケットの欄は読まない）、マテリアの付いた品（納品で失わないように）、チョコボかばん。
+/// </summary>
+public sealed unsafe class RetainerStockTask : AutoTask
 {
-    private enum Phase { Bell, List, Menu, Inventory, CloseInventory, Quit, Context, Numeric, Verify, CloseBell }
-    private Phase phase;
-    private DateTime changed = DateTime.UtcNow;
-    private DateTime opened = DateTime.MinValue;
+    private enum Phase
+    {
+        FindBell,
+        TakeControl,
+        Bell,
+        List,
+        Select,
+        Menu,
+        Inventory,
+        Context,
+        Numeric,
+        Verify,
+        CloseInventory,
+        Quit,
+        CloseList,
+        Leave,
+    }
+
+    /// <summary>この距離まで近づいてから話しかける。</summary>
+    private const float BellRange = 3.5f;
+
+    /// <summary>呼び鈴に話しかける回数の上限（1回目はターゲットするだけなので、その分を含む）。</summary>
+    private const int MaxBellTries = 12;
+
+    /// <summary>各段で待つ上限（進む条件は窓・在庫の状態で見る。これは詰まったときに止めるための上限）。</summary>
+    private static readonly TimeSpan PhaseLimit = TimeSpan.FromSeconds(30);
+
+    /// <summary>AutoRetainer が動作中のとき、終わるのを待つ上限。</summary>
+    private static readonly TimeSpan AutoRetainerBusyLimit = TimeSpan.FromSeconds(20);
+
+    /// <summary>
+    /// 始める前に、動ける状態になるのを待つ上限（区切りの切り替えはクエストの完了の直後なので、
+    /// クエストのイベントがまだ終わっていないことがある。以前はその場で失敗して全体が止まっていた）。
+    /// </summary>
+    private static readonly TimeSpan FreeWaitLimit = TimeSpan.FromSeconds(60);
+
+    /// <summary>宿屋の個室に入った後、呼び鈴が物体の一覧に載るまで探し続ける上限。</summary>
+    private static readonly TimeSpan InnBellSearchLimit = TimeSpan.FromSeconds(15);
+
+    /// <summary>着いたとみる高さの差（MoveToTask と同じ見方にそろえる）。</summary>
+    private const float BellHeightTolerance = 8f;
+
+    private static readonly InventoryType[] Pages =
+    [
+        InventoryType.RetainerPage1, InventoryType.RetainerPage2, InventoryType.RetainerPage3, InventoryType.RetainerPage4,
+        InventoryType.RetainerPage5, InventoryType.RetainerPage6, InventoryType.RetainerPage7, InventoryType.RetainerCrystals,
+    ];
+
+    private readonly Func<JobQuestPlan> makePlan;
+    private readonly Ipc.RetainerControl control = new();
+
+    private Phase phase = Phase.FindBell;
+    private DateTime phaseAt = DateTime.UtcNow;
+    private bool began;
     private AutoTask? travel;
     private bool visitedInn;
+    private DateTime innArrivedAt = DateTime.MinValue;
+    private int bellTries;
+    private DateTime lastBellTry = DateTime.MinValue;
+    private DateTime? busySince;
+    private bool bellOpened;
+    private DateTime bellAt = DateTime.MinValue;
+    private DateTime lastTalk = DateTime.MinValue;
+
+    // AutoRetainer の抑制が外れた・動き出したので止めた（止めた後に呼び鈴を押すと AutoRetainer と取り合うので、見張りを置かない）
+    private bool autoRetainerTookOver;
+
+    // 自分の操作と、その直前に出ていた窓（前後で見るため）。OnStart で作る
+    private RetainerWindows? windows;
+
+    private HashSet<string> bellNames = new(StringComparer.OrdinalIgnoreCase);
+
+    // リテイナー：1巡目は全員、2巡目は引き出す品を持っている人だけ
+    private readonly List<ulong> queue = [];
+    private bool listed;
+    private ulong current;
     private bool withdrawing;
-    private readonly List<ulong> retainers = [];
-    private int index;
+    private readonly Dictionary<ulong, List<RetainerSlot>> contents = [];
     private readonly RetainerPlan.Stock total = new();
     private RetainerPlan.Stock? needed;
+    private readonly List<string> skippedProblems = [];
+
+    // 引き出し中の品
     private RetainerSlot? pending;
     private int amount;
     private int beforeBag;
     private int beforeSource;
-    private readonly Ipc.RetainerControl control = new();
-    private HashSet<string> bellNames = [];
-    private DateTime lastBellTry;
-    private static readonly InventoryType[] Pages = [InventoryType.RetainerPage1, InventoryType.RetainerPage2,
-        InventoryType.RetainerPage3, InventoryType.RetainerPage4, InventoryType.RetainerPage5,
-        InventoryType.RetainerPage6, InventoryType.RetainerPage7, InventoryType.RetainerCrystals];
-    public override string Name => "開始時のリテイナー在庫確認・引き出し";
-    private sealed record RetainerSlot(InventoryType Container, int Slot, uint Item, bool Hq, int Count);
+    private DateTime firedAt = DateTime.MinValue;
+    private bool numericSent;
+
+    public RetainerStockTask(Func<JobQuestPlan> makePlan)
+    {
+        this.makePlan = makePlan;
+    }
+
+    public override string Name => "リテイナーの在庫の確認と引き出し";
+
+    /// <summary>引き出した品（品, HQ か）→ 数（記録・試験用）。</summary>
+    public Dictionary<(uint Item, bool Hq), int> Withdrawn { get; } = [];
+
+    /// <summary>リテイナーの持ち物の1枠。</summary>
+    public sealed record RetainerSlot(InventoryType Container, int Slot, uint Item, bool Hq, int Count);
 
     protected override TaskResult OnStart(TaskContext ctx)
     {
-        if (!ctx.Ownership.Registered || !GameUi.PlayerFree())
-            return this.Fail("画面を閉じ、自由に動ける状態で開始してください");
+        if (!ctx.Ownership.Registered)
+            return this.Fail("画面の開閉の知らせを受け取れないため、リテイナーの窓を見分けられません");
+
+        var ownership = ctx.Ownership;
+        this.windows = new RetainerWindows(
+            GameUi.IsVisible,
+            (name, since) => ownership.TryGetOwnedSince(name, since, out var owned) ? (nint)owned : 0,
+            name => GameUi.IsReady(name, out var addon) ? (nint)addon : 0);
+
+        this.bellNames = BellNames();
+        if (this.bellNames.Count == 0)
+            return this.Fail("呼び鈴の名前をゲームデータから引けません");
+
+        // YesAlready の選択肢の自動選択が、リテイナーのメニューを押さないように止めてもらう（設定は変えない）
         ctx.YesAlready.Suppress();
-        if (!this.control.Take(ctx.Config))
-            return this.Fail("AutoRetainerが動作中、または抑制状態を確認できません");
-        if (!ctx.TextAdvance.EnsureTurnInControl())
-            return this.Fail("呼び鈴の会話を操作するTextAdvanceの操作権を取得できません");
-        var ids = Svc.Data.GetExcelSheet<EObjName>(ClientLanguage.Japanese)
-            .Where(x => x.Singular.ExtractText() is "呼び鈴" or "リテイナーベル").Select(x => x.RowId).ToHashSet();
-        this.bellNames = Svc.Data.GetExcelSheet<EObjName>().Where(x => ids.Contains(x.RowId)).Select(x => x.Singular.ExtractText()).ToHashSet();
         return TaskResult.Running;
     }
 
-    private void Next(Phase value) { this.phase = value; this.changed = DateTime.UtcNow; }
+    /// <summary>
+    /// 呼び鈴の名前（クライアント言語）。EObjName で日本語の名前が「呼び鈴」の行と、ハウジングの家具（Item）で日本語の名前が
+    /// 「リテイナーベル」の品（家に置いた呼び鈴はこの名前で出る：AutoRetainer の Lang.BellName と同じ考え方）。
+    /// 比べるときは大文字と小文字を区別しない（英語などでは "summoning bell"）。
+    /// </summary>
+    public static HashSet<string> BellNames()
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var eobjJa = Svc.Data.GetExcelSheet<EObjName>(Dalamud.Game.ClientLanguage.Japanese);
+        var eobj = Svc.Data.GetExcelSheet<EObjName>();
+        foreach (var row in eobjJa.Where(x => x.Singular.ExtractText() == "呼び鈴"))
+            if (eobj.TryGetRow(row.RowId, out var local) && local.Singular.ExtractText() is { Length: > 0 } n)
+                names.Add(n);
+
+        var itemJa = Svc.Data.GetExcelSheet<Item>(Dalamud.Game.ClientLanguage.Japanese);
+        var item = Svc.Data.GetExcelSheet<Item>();
+        foreach (var row in itemJa.Where(x => x.Name.ExtractText() == "リテイナーベル"))
+            if (item.TryGetRow(row.RowId, out var local) && local.Name.ExtractText() is { Length: > 0 } n)
+                names.Add(n);
+        return names;
+    }
+
+    private void Next(Phase value)
+    {
+        this.phase = value;
+        this.phaseAt = DateTime.UtcNow;
+    }
+
+    /// <summary>操作の直前に呼ぶ。その時点で出ていた窓を控える（前後で自分の窓を見分けるため）。操作の後には呼ばない。</summary>
+    private void MarkAct() => this.windows!.MarkAct();
+
+    /// <summary>直前の自分の操作の後に出た窓か（持ち主の記録か、操作の前は出ていなかったか）。</summary>
+    private bool Fresh(string name, out AtkUnitBase* addon)
+    {
+        addon = (AtkUnitBase*)this.windows!.Fresh(name);
+        return addon != null;
+    }
 
     protected override TaskResult Tick(TaskContext ctx)
     {
-        if (this.Elapsed > TimeSpan.FromMinutes(20)) return this.Fail("リテイナー処理が20分以内に完了しませんでした");
-        if (this.phase != Phase.Bell && DateTime.UtcNow - this.changed > TimeSpan.FromSeconds(30))
-            return this.Fail($"リテイナーの状態を確認できません（{this.phase}）。不明な引き出しは再送しません");
-        if (!this.control.Keep()) return this.Fail("AutoRetainerとの競合を検出しました");
-        if (!ctx.TextAdvance.EnsureTurnInControl()) return this.Fail("呼び鈴の会話の操作権が失われました");
-        if (this.phase is Phase.Inventory or Phase.Context or Phase.Numeric or Phase.Verify or Phase.CloseInventory or Phase.Quit)
+        if (this.Elapsed > TimeSpan.FromMinutes(20))
+            return this.Fail("リテイナーの処理が20分以内に終わりませんでした");
+
+        // 動ける状態になってから始める（クエストの完了の直後は、イベントがまだ終わっていないことがある）
+        if (!this.began)
         {
-            var manager = RetainerManager.Instance();
-            if (manager == null || this.index >= this.retainers.Count || manager->LastSelectedRetainerId != this.retainers[this.index])
-                return this.Fail("操作中のリテイナーが変わったため止めました");
+            if (!GameUi.PlayerFree())
+            {
+                this.Status = "動ける状態になるのを待っています";
+                return this.Elapsed > FreeWaitLimit
+                    ? this.Fail($"{FreeWaitLimit.TotalSeconds:0} 秒たっても動ける状態になりません。画面を閉じ、自由に動ける状態で開始してください")
+                    : TaskResult.Running;
+            }
+
+            if (GameUi.IsVisible("RetainerList") || Svc.Condition[ConditionFlag.OccupiedSummoningBell])
+                return this.Fail("開始前から呼び鈴が開いています。閉じてから開始してください");
+            this.began = true;
         }
-        this.Status = $"{(this.withdrawing ? "必要分の引き出し" : "在庫の読出し")} {this.index + 1}/{this.retainers.Count}：{this.phase}";
+
         if (this.travel != null)
         {
             var r = this.travel.Step(ctx);
             this.Status = this.travel.Status;
-            if (r == TaskResult.Running) return r;
+            if (r == TaskResult.Running)
+                return r;
             var error = this.travel.FailReason;
-            this.travel.Cleanup(ctx); this.travel = null;
-            if (r == TaskResult.Failed) return this.Fail(error ?? "呼び鈴へ移動できません");
+            var wasInn = this.travel is GoToInnTask;
+            this.travel.Cleanup(ctx);
+            this.travel = null;
+            if (r == TaskResult.Failed)
+                return this.Fail(error ?? "呼び鈴へ移動できません");
+            if (wasInn)
+                this.innArrivedAt = DateTime.UtcNow;
+            this.Next(Phase.FindBell);
         }
-        switch (this.phase)
+
+        // 呼び鈴を開いた後だけ AutoRetainer を見る（移動中は Lifestream の移動も AutoRetainer の IsBusy に入るので見ない）
+        if (this.bellOpened && this.phase != Phase.Leave && !this.control.Keep())
         {
-            case Phase.Bell:
-            {
-                // 名前はクライアント言語のシートから求める。ゲームオブジェクトIDは固定しない。
-                var bell = Svc.Objects.Where(x => x.ObjectKind is ObjectKind.EventObj or ObjectKind.HousingEventObject
-                    && x.IsTargetable && this.bellNames.Contains(x.Name.TextValue)).OrderBy(x => Vector3.Distance(x.Position, Me.Position)).FirstOrDefault();
-                if (bell == null)
-                {
-                    if (this.visitedInn) return this.Fail("宿屋の呼び鈴を見つけられません");
-                    this.visitedInn = true; this.travel = new GoToInnTask(); return TaskResult.Running;
-                }
-                if (Vector3.Distance(bell.Position, Me.Position) > 4f)
-                { this.travel = new MoveToTask(bell.Position, 4f, "呼び鈴"); return TaskResult.Running; }
-                if (GameUi.IsReady("RetainerList", out _)) return this.Fail("開始前から呼び鈴が開いています。閉じて開始してください");
-                if (DateTime.UtcNow - this.lastBellTry < TimeSpan.FromSeconds(1)) return TaskResult.Running;
-                this.lastBellTry = DateTime.UtcNow;
-                this.opened = DateTime.UtcNow;
-                if (GameUi.Interact(bell, checkLineOfSight: true))
-                { ctx.InOwnConversation = true; this.Next(Phase.List); }
-                return TaskResult.Running;
-            }
-            case Phase.List:
-            {
-                if (!ctx.Ownership.TryGetOwnedSince("RetainerList", this.opened, out var list, out _)) return TaskResult.Running;
-                var manager = RetainerManager.Instance();
-                if (manager == null || !manager->IsReady) return TaskResult.Running;
-                if (this.retainers.Count == 0)
-                    for (uint i = 0; i < manager->Retainers.Length; i++)
-                    {
-                        var retainer = manager->GetRetainerBySortedIndex(i);
-                        if (retainer != null && retainer->RetainerId != 0 && retainer->Available) this.retainers.Add(retainer->RetainerId);
-                    }
-                if (this.index >= this.retainers.Count)
-                {
-                    if (!this.withdrawing)
-                    {
-                        var bags = Inventory.Snapshot();
-                        this.needed = RetainerPlan.Build(ctx.Data.Planner!, this.Targets(ctx, bags), bags, this.total);
-                        this.withdrawing = true; this.index = 0;
-                        ctx.Log.Write("リテイナー", $"実在庫 {this.total.Counts.Count} 種類を確認。必要な引き出しは {this.needed.Counts.Count} 種類です");
-                        if (this.retainers.Count > 0 && this.needed.Counts.Count > 0) return TaskResult.Running;
-                    }
-                    if (this.needed?.Counts.Values.Any(n => n > 0) == true) return this.Fail("確認したリテイナー在庫と引出結果が一致しません");
-                    GameUi.Fire(list, true, -1); this.Next(Phase.CloseBell); return TaskResult.Running;
-                }
-                for (uint i = 0; i < manager->Retainers.Length; i++)
-                {
-                    var retainer = manager->GetRetainerBySortedIndex(i);
-                    if (retainer != null && retainer->RetainerId == this.retainers[this.index] && retainer->Available)
-                    {
-                        // ECommons/ArtisanのRetainerListと同じイベント。後続引数は型未設定。
-                        var args = stackalloc FFXIVClientStructs.FFXIV.Component.GUI.AtkValue[4];
-                        for (var n = 0; n < 4; n++) args[n] = default;
-                        args[0].SetInt(2); args[1].SetUInt(i); list->FireCallback(4, args, true);
-                        this.Next(Phase.Menu); return TaskResult.Running;
-                    }
-                }
-                return this.Fail("対象リテイナーを選べません");
-            }
-            case Phase.Menu:
-                if (RetainerManager.Instance()->LastSelectedRetainerId != this.retainers[this.index]) return TaskResult.Running;
-                if (SelectMenu(ctx, 2378)) this.Next(Phase.Inventory);
-                return TaskResult.Running;
-            case Phase.Inventory:
-            {
-                if (!AgentRetainer.Instance()->IsAgentActive()) return TaskResult.Running;
-                var slots = ReadSlots();
-                if (slots == null) return TaskResult.Running;
-                if (!this.withdrawing)
-                {
-                    foreach (var s in slots) this.total.Counts[(s.Item, s.Hq)] = this.total.Counts.GetValueOrDefault((s.Item, s.Hq)) + s.Count;
-                    this.Next(Phase.CloseInventory); return TaskResult.Running;
-                }
-                this.pending = slots.FirstOrDefault(s => this.needed!.Counts.GetValueOrDefault((s.Item, s.Hq)) > 0);
-                if (this.pending is not { } p) { this.Next(Phase.CloseInventory); return TaskResult.Running; }
-                this.amount = Math.Min(p.Count, this.needed!.Counts[(p.Item, p.Hq)]);
-                this.beforeSource = p.Count; this.beforeBag = BagCount(p);
-                if (GameUi.IsReady("ContextMenu", out _) || GameUi.IsReady("InputNumeric", out _)) return this.Fail("別の品の操作窓が開いています");
-                this.Next(Phase.Context);
-                AgentInventoryContext.Instance()->OpenForItemSlot(p.Container, p.Slot, 0, AgentRetainer.Instance()->GetAddonId()); return TaskResult.Running;
-            }
-            case Phase.Context:
-            {
-                if (!this.SourceUnchanged()) return this.Fail("引き出す前にリテイナーの品が変わりました");
-                if (!ctx.Ownership.TryGetOwnedSince("ContextMenu", this.changed, out var menu, out _)) return TaskResult.Running;
-                var p = this.pending!;
-                var label = Svc.Data.GetExcelSheet<Addon>().GetRow(p.Count == 1 || p.Container == InventoryType.RetainerCrystals ? 98u : 773u).Text.ExtractText();
-                var context = AgentInventoryContext.Instance();
-                var labels = new List<string>();
-                foreach (var value in context->EventParams)
-                    if (value.Type == FFXIVClientStructs.FFXIV.Component.GUI.AtkValueType.String)
-                        labels.Add(Dalamud.Memory.MemoryHelper.ReadSeStringNullTerminated((nint)value.String.Value).TextValue);
-                var idx = QuestMenuChoice.Unique(labels, label);
-                if (idx < 0 || context->IsContextItemDisabled(idx)) return this.Fail("有効な引き出しの選択肢を一意に読めません");
-                this.Next(p.Count == 1 ? Phase.Verify : Phase.Numeric);
-                GameUi.Fire(menu, true, 0, idx, 0, 0, 0); return TaskResult.Running;
-            }
-            case Phase.Numeric:
-                if (!this.SourceUnchanged()) return this.Fail("数量を送る前にリテイナーの品が変わりました");
-                if (ctx.Ownership.TryGetOwnedSince("InputNumeric", this.changed, out var numeric, out _))
-                { GameUi.Fire(numeric, true, this.amount); this.Next(Phase.Verify); }
-                return TaskResult.Running;
-            case Phase.Verify:
-            {
-                var p = this.pending!;
-                var slots = ReadSlots();
-                if (slots == null) return TaskResult.Running;
-                var now = slots.FirstOrDefault(x => x.Container == p.Container && x.Slot == p.Slot);
-                var sourceCount = now == null ? 0 : now.Item == p.Item && now.Hq == p.Hq ? now.Count : -1;
-                if (!TransferConfirmed(this.beforeBag, BagCount(p), this.beforeSource, sourceCount, this.amount)) return TaskResult.Running;
-                this.needed!.Counts[(p.Item, p.Hq)] -= this.amount;
-                ctx.Log.Write("リテイナー", $"{CraftPlanner.ItemName(p.Item)}{(p.Hq ? " HQ" : "")} ×{this.amount} の移動を両側の在庫で確認しました");
-                this.Next(Phase.Inventory); return TaskResult.Running;
-            }
-            case Phase.CloseInventory:
-                AgentRetainer.Instance()->Hide(); this.Next(Phase.Quit); return TaskResult.Running;
-            case Phase.Quit:
-                if (AgentRetainer.Instance()->IsAgentActive()) return TaskResult.Running;
-                if (SelectMenu(ctx, 2383)) { this.index++; this.Next(Phase.List); }
-                return TaskResult.Running;
-            case Phase.CloseBell:
-                if (GameUi.IsReady("RetainerList", out _) || !GameUi.PlayerFree()) return TaskResult.Running;
-                return TaskResult.Done;
+            this.autoRetainerTookOver = true;
+            return this.Fail("AutoRetainer の抑制が外れたか、AutoRetainer が動き出しました。取り合いを避けるため止めます");
         }
+
+        if (this.phase is not (Phase.FindBell or Phase.TakeControl or Phase.Bell) && DateTime.UtcNow - this.phaseAt > PhaseLimit)
+            return this.Fail($"リテイナーの画面が {PhaseLimit.TotalSeconds:0} 秒進みません（{PhaseLabel(this.phase)}）。結果の分からない引き出しは送り直しません");
+
+        // 呼び鈴の会話（リテイナーのあいさつ等）は自分で進める。TextAdvance には頼まない
+        if (this.bellOpened && this.AdvanceOwnTalk(ctx))
+            return TaskResult.Running;
+
+        if (this.phase is Phase.Inventory or Phase.Context or Phase.Numeric or Phase.Verify)
+        {
+            var manager = RetainerManager.Instance();
+            if (manager == null || manager->LastSelectedRetainerId != this.current)
+                return this.Fail("操作中のリテイナーが変わったため止めました");
+        }
+
+        this.Status = $"{(this.withdrawing ? "引き出し" : "在庫の読み取り")}：{PhaseLabel(this.phase)}（残り {this.queue.Count} 人）";
+        return this.phase switch
+        {
+            Phase.FindBell => this.TickFindBell(ctx),
+            Phase.TakeControl => this.TickTakeControl(ctx),
+            Phase.Bell => this.TickBell(ctx),
+            Phase.List => this.TickList(ctx),
+            Phase.Select => this.TickSelect(ctx),
+            Phase.Menu => this.TickMenu(ctx, 2378, Phase.Inventory),
+            Phase.Inventory => this.TickInventory(ctx),
+            Phase.Context => this.TickContext(ctx),
+            Phase.Numeric => this.TickNumeric(ctx),
+            Phase.Verify => this.TickVerify(ctx),
+            Phase.CloseInventory => this.TickCloseInventory(),
+            Phase.Quit => this.TickMenu(ctx, 2383, Phase.List),
+            Phase.CloseList => this.TickCloseList(ctx),
+            Phase.Leave => this.TickLeave(ctx),
+            _ => TaskResult.Running,
+        };
+    }
+
+    private static string PhaseLabel(Phase p) => p switch
+    {
+        Phase.FindBell => "呼び鈴を探す",
+        Phase.TakeControl => "AutoRetainer の一時停止",
+        Phase.Bell => "呼び鈴に話しかける",
+        Phase.List => "リテイナーの一覧",
+        Phase.Select => "リテイナーを選ぶ",
+        Phase.Menu => "アイテムの受け渡しを選ぶ",
+        Phase.Inventory => "持ち物を読む",
+        Phase.Context => "受け取るを選ぶ",
+        Phase.Numeric => "数を入れる",
+        Phase.Verify => "両側の在庫で確かめる",
+        Phase.CloseInventory => "持ち物を閉じる",
+        Phase.Quit => "リテイナーを帰す",
+        Phase.CloseList => "一覧を閉じる",
+        Phase.Leave => "呼び鈴を離れる",
+        _ => p.ToString(),
+    };
+
+    // ---- 呼び鈴 ----
+
+    private Dalamud.Game.ClientState.Objects.Types.IGameObject? FindBell()
+        => Svc.Objects
+            .Where(x => x.ObjectKind is ObjectKind.EventObj or ObjectKind.HousingEventObject && x.IsTargetable && this.bellNames.Contains(x.Name.TextValue))
+            .OrderBy(x => Vector3.Distance(x.Position, Me.Position))
+            .FirstOrDefault();
+
+    /// <summary>
+    /// 呼び鈴の近くにいるか。MoveToTask の「着いた」と同じ見方（水平の距離と高さの差）にそろえる（
+    /// 以前は3次元の距離で見ていたので、高さに差がある呼び鈴では MoveToTask がすぐ着いたと返し、こちらは遠いとみて作り直し続けた）。
+    /// </summary>
+    public static bool NearBell(Vector3 me, Vector3 bell)
+        => Vector2.Distance(new Vector2(me.X, me.Z), new Vector2(bell.X, bell.Z)) <= BellRange && MathF.Abs(me.Y - bell.Y) < BellHeightTolerance;
+
+    private TaskResult TickFindBell(TaskContext ctx)
+    {
+        var bell = this.FindBell();
+        if (bell == null)
+        {
+            // 近くに無ければ、グリダニアの宿屋の個室へ（個室に呼び鈴がある：ゲームデータの配置で確認）
+            if (this.visitedInn)
+            {
+                // 個室に入った直後は、呼び鈴がまだ物体の一覧に載っていないことがある。上限まで探し続ける
+                if (DateTime.UtcNow - this.innArrivedAt < InnBellSearchLimit)
+                {
+                    this.Status = "宿屋の個室で呼び鈴を探しています";
+                    return TaskResult.Running;
+                }
+
+                return this.Fail($"宿屋の個室で呼び鈴を {InnBellSearchLimit.TotalSeconds:0} 秒探しても見つけられません");
+            }
+
+            this.visitedInn = true;
+            ctx.Log.Write("リテイナー", "近くに呼び鈴が無いので、グリダニアの宿屋の個室へ向かいます");
+            this.travel = new GoToInnTask();
+            return TaskResult.Running;
+        }
+
+        if (!NearBell(Me.Position, bell.Position))
+        {
+            this.travel = new MoveToTask(bell.Position, BellRange - 1f, "呼び鈴");
+            return TaskResult.Running;
+        }
+
+        this.Next(Phase.TakeControl);
         return TaskResult.Running;
     }
 
-    private static bool SelectMenu(TaskContext ctx, uint addonText)
+    private TaskResult TickTakeControl(TaskContext ctx)
     {
-        var entries = GameUi.MenuEntries(out var menu);
-        if (entries == null || !ctx.Ownership.TryGetOwned("SelectString", out var owned) || owned != menu) return false;
-        var i = QuestMenuChoice.Unique(entries, Svc.Data.GetExcelSheet<Addon>().GetRow(addonText).Text.ExtractText());
-        if (i < 0) return false;
-        GameUi.Fire(menu, true, i); return true;
+        var taken = this.control.Take(ctx.Config);
+        if (this.control.StaleNotice.Length > 0)
+            ctx.Log.Warn("リテイナー", this.control.StaleNotice);
+        switch (taken)
+        {
+            case Ipc.RetainerControl.TakeResult.Taken:
+                this.busySince = null;
+                this.Next(Phase.Bell);
+                return TaskResult.Running;
+            case Ipc.RetainerControl.TakeResult.Busy:
+                this.busySince ??= DateTime.UtcNow;
+                this.Status = "AutoRetainer が動作中です。終わるのを待っています";
+                return DateTime.UtcNow - this.busySince.Value > AutoRetainerBusyLimit
+                    ? this.Fail($"AutoRetainer が {AutoRetainerBusyLimit.TotalSeconds:0} 秒たっても動作中です。取り合いを避けるため止めます")
+                    : TaskResult.Running;
+            default:
+                return this.Fail($"AutoRetainer を一時停止できません（{this.control.LastProblem}）。取り合いを避けるため止めます");
+        }
     }
 
+    private TaskResult TickBell(TaskContext ctx)
+    {
+        if (Svc.Condition[ConditionFlag.OccupiedSummoningBell] && this.bellOpened)
+        {
+            this.Next(Phase.List);
+            return TaskResult.Running;
+        }
+
+        if (!this.bellOpened && GameUi.IsVisible("RetainerList"))
+            return this.Fail("自分が話しかける前に呼び鈴の一覧が開きました（ほかの操作と取り合わないよう止めます）");
+
+        var bell = this.FindBell();
+        if (bell == null || !NearBell(Me.Position, bell.Position))
+        {
+            this.Next(Phase.FindBell);
+            return TaskResult.Running;
+        }
+
+        // 話しかけの間隔（送りすぎの防止。進む条件は「呼び鈴を使っている状態になったか」で見る）
+        if (DateTime.UtcNow - this.lastBellTry < TimeSpan.FromSeconds(1))
+            return TaskResult.Running;
+        if (this.bellTries >= MaxBellTries)
+        {
+            var height = MathF.Abs(Me.Position.Y - bell.Position.Y);
+            return this.Fail($"呼び鈴に {MaxBellTries} 回話しかけても開きませんでした"
+                             + (height > 2f ? $"（呼び鈴との高さの差が {height:0.0}m あります。同じ高さにある呼び鈴の近くで開始してください）" : string.Empty));
+        }
+        this.lastBellTry = DateTime.UtcNow;
+
+        if (!this.bellOpened)
+        {
+            // ここから開いた窓を自分のものとして記録する
+            ctx.Ownership.Clear();
+            ctx.Ownership.IsClaiming = true;
+            ctx.InOwnConversation = true;
+            this.bellAt = DateTime.UtcNow;
+        }
+
+        this.MarkAct();
+        this.bellTries++;
+        if (GameUi.Interact(bell))
+            this.bellOpened = true;
+
+        return TaskResult.Running;
+    }
+
+    /// <summary>
+    /// 呼び鈴を使っている間の会話の窓（リテイナーのあいさつ・見送り）を進める。進めたら true。
+    /// 呼び鈴を開いているのはこちらの操作なので、その間の会話はこちらのもの（AutoRetainer の MiniTA も呼び鈴の間の会話を送っている）。
+    /// </summary>
+    private bool AdvanceOwnTalk(TaskContext ctx)
+    {
+        if (!Svc.Condition[ConditionFlag.OccupiedSummoningBell] || !GameUi.IsReady("Talk", out _))
+            return false;
+        if (DateTime.UtcNow - this.lastTalk < TimeSpan.FromMilliseconds(300))
+            return true;
+        this.lastTalk = DateTime.UtcNow;
+        GameUi.AdvanceTalk();
+        return true;
+    }
+
+    // ---- 一覧・選択 ----
+
+    private TaskResult TickList(TaskContext ctx)
+    {
+        if (!this.ListReady(ctx, out var list))
+            return TaskResult.Running;
+        var manager = RetainerManager.Instance();
+        if (manager == null || !manager->IsReady)
+            return TaskResult.Running;
+
+        if (!this.listed)
+        {
+            this.listed = true;
+            for (uint i = 0; i < manager->Retainers.Length; i++)
+            {
+                var r = manager->GetRetainerBySortedIndex(i);
+                if (r != null && r->RetainerId != 0 && r->Available)
+                    this.queue.Add(r->RetainerId);
+            }
+
+            ctx.Log.Write("リテイナー", $"リテイナー {this.queue.Count} 人の持ち物を読みます");
+            if (this.queue.Count == 0)
+            {
+                ctx.Log.Warn("リテイナー", "呼べるリテイナーがいません。手持ちだけで計画します");
+                return this.StartClose(list);
+            }
+        }
+
+        if (this.queue.Count == 0)
+        {
+            if (!this.withdrawing)
+                return this.BeginWithdraw(ctx, list);
+            return this.StartClose(list);
+        }
+
+        this.current = this.queue[0];
+        this.queue.RemoveAt(0);
+        this.Next(Phase.Select);
+        return TaskResult.Running;
+    }
+
+    private bool ListReady(TaskContext ctx, out AtkUnitBase* list)
+        => ctx.Ownership.TryGetOwnedSince("RetainerList", this.bellAt, out list)
+           || (this.bellOpened && GameUi.IsReady("RetainerList", out list) && Svc.Condition[ConditionFlag.OccupiedSummoningBell]);
+
+    private TaskResult TickSelect(TaskContext ctx)
+    {
+        if (!this.ListReady(ctx, out var list))
+            return TaskResult.Running;
+        var name = RetainerName(this.current);
+        var index = name == null ? -1 : RetainerListIndex(list, name);
+        if (index < 0)
+        {
+            ctx.Log.Warn("リテイナー", $"リテイナー（{name ?? this.current.ToString()}）を一覧に見つけられないので飛ばします");
+            this.current = 0;
+            this.Next(Phase.List);
+            return TaskResult.Running;
+        }
+
+        // ECommons の AddonMaster.RetainerList.Entry.Select と同じ（2, 一覧の番号, 型なし, 型なし）
+        this.windows!.ForgetInventory();
+        this.MarkAct();
+        var args = stackalloc AtkValue[4];
+        for (var n = 0; n < 4; n++)
+            args[n] = default;
+        args[0].SetInt(2);
+        args[1].SetUInt((uint)index);
+        list->FireCallback(4, args, true);
+        this.Next(Phase.Menu);
+        return TaskResult.Running;
+    }
+
+    /// <summary>リテイナーの名前（RetainerManager から）。</summary>
+    private static string? RetainerName(ulong id)
+    {
+        var manager = RetainerManager.Instance();
+        if (manager == null)
+            return null;
+        for (uint i = 0; i < manager->Retainers.Length; i++)
+        {
+            var r = manager->GetRetainerBySortedIndex(i);
+            if (r != null && r->RetainerId == id)
+                return r->NameString;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 一覧の窓での番号（名前で探す。並びを RetainerManager の並びと決めつけない）。
+    /// 一覧の値は 3 番目から1人10個ずつ（名前・…・選べるか＝8番目）：ECommons の ReaderRetainerList と同じ。
+    /// </summary>
+    private static int RetainerListIndex(AtkUnitBase* list, string name)
+    {
+        for (var i = 0; i < 10; i++)
+        {
+            var at = 3 + (i * 10);
+            if (at + 8 >= list->AtkValuesCount)
+                break;
+            var v = list->AtkValues[at];
+            if (v.Type == 0)
+                break;
+            if (v.Type is not (AtkValueType.String or AtkValueType.ManagedString or AtkValueType.ConstString) || v.String.Value == null)
+                continue;
+            var shown = Dalamud.Memory.MemoryHelper.ReadSeStringNullTerminated((nint)v.String.Value).TextValue;
+            if (shown != name)
+                continue;
+            var active = list->AtkValues[at + 8];
+            return active.Type == AtkValueType.Bool && active.Byte == 0 ? -1 : i;
+        }
+
+        return -1;
+    }
+
+    /// <summary>リテイナーのメニュー（SelectString）で、Addon の文言が先頭に来る項目を1つだけ選ぶ。</summary>
+    private TaskResult TickMenu(TaskContext ctx, uint addonRow, Phase then)
+    {
+        if (this.phase == Phase.Menu && RetainerManager.Instance()->LastSelectedRetainerId != this.current)
+            return TaskResult.Running;
+        if (GameUi.MenuEntries(out var menu) is not { } entries || !this.Fresh("SelectString", out var owned) || owned != menu)
+            return TaskResult.Running;
+
+        var index = MenuChoice.ByAddonPrefix(entries, AddonPrefix(addonRow));
+        if (index < 0)
+            return this.Fail($"リテイナーのメニューで「{AddonPrefix(addonRow)}」を一意に選べません：{string.Join(" / ", entries)}");
+
+        this.MarkAct();
+        GameUi.Fire(menu, true, index);
+        if (then == Phase.List)
+        {
+            // リテイナーを帰した。一覧へ戻る
+            this.current = 0;
+        }
+
+        this.Next(then);
+        return TaskResult.Running;
+    }
+
+    /// <summary>
+    /// Addon の文言のうち、最初の差し込み（マクロ）より前の部分。
+    /// 2378「アイテムの受け渡し　[預託中：&lt;kilo(lnum1,\,)&gt;枠]」→「アイテムの受け渡し　[預託中：」。
+    /// 実際の項目は「アイテムの受け渡し　[預託中：15枠]」なので、完全一致では選べない（AutoRetainer は GetText(onlyFirst) の先頭一致）。
+    /// </summary>
+    public static string AddonPrefix(uint row)
+    {
+        var macro = Svc.Data.GetExcelSheet<Addon>().GetRow(row).Text.ToMacroString();
+        var cut = macro.IndexOf('<');
+        return (cut < 0 ? macro : macro[..cut]).Trim();
+    }
+
+    // ---- 持ち物 ----
+
+    private TaskResult TickInventory(TaskContext ctx)
+    {
+        // 持ち物の窓は、同じリテイナーの間は最初に認めた窓を認め続ける
+        if (!AgentRetainer.Instance()->IsAgentActive() || !this.windows!.InventoryOpen(this.current))
+            return TaskResult.Running;
+        var slots = ReadSlots();
+        if (slots == null)
+            return TaskResult.Running;
+
+        if (!this.withdrawing)
+        {
+            this.contents[this.current] = slots;
+            foreach (var s in slots)
+                this.total.Counts[(s.Item, s.Hq)] = this.total.Counts.GetValueOrDefault((s.Item, s.Hq)) + s.Count;
+            this.Next(Phase.CloseInventory);
+            return TaskResult.Running;
+        }
+
+        var want = slots.FirstOrDefault(s => this.needed!.Counts.GetValueOrDefault((s.Item, s.Hq)) > 0);
+        if (want == null)
+        {
+            this.Next(Phase.CloseInventory);
+            return TaskResult.Running;
+        }
+
+        var need = this.needed!.Counts[(want.Item, want.Hq)];
+        var fits = Room(want);
+        var take = Math.Min(Math.Min(want.Count, need), fits.Amount);
+        if (take <= 0)
+            return this.Fail($"{CraftPlanner.ItemName(want.Item)}{(want.Hq ? " HQ" : string.Empty)} を引き出せません：{fits.Reason}。鞄を空けてから再開してください");
+
+        if (GameUi.IsVisible("ContextMenu") || GameUi.IsVisible("InputNumeric"))
+            return this.Fail("別の品の右クリックのメニューか数の入力が開いています（触らずに止めます）");
+
+        this.pending = want;
+        this.amount = take;
+        this.beforeSource = want.Count;
+        this.beforeBag = BagCount(want);
+        this.numericSent = false;
+        this.MarkAct();
+        this.firedAt = DateTime.UtcNow;
+        AgentInventoryContext.Instance()->OpenForItemSlot(want.Container, want.Slot, 0, AgentRetainer.Instance()->GetAddonId());
+        this.Next(Phase.Context);
+        return TaskResult.Running;
+    }
+
+    private TaskResult TickContext(TaskContext ctx)
+    {
+        if (!this.SourceUnchanged())
+            return this.Fail("引き出す前にリテイナーの品か手持ちが変わりました");
+
+        // メニューは常駐の窓とみられる。頼む前は出ていなかった＋メニューの対象が頼んだ枠、で自分のものと見る
+        if (this.windows!.WasOpenAtAct("ContextMenu") || !GameUi.IsReady("ContextMenu", out var menu))
+            return TaskResult.Running;
+
+        var p = this.pending!;
+        var context = AgentInventoryContext.Instance();
+        var labels = new List<string>();
+        foreach (var value in context->EventParams)
+            if (value.Type == AtkValueType.String && value.String.Value != null)
+                labels.Add(Dalamud.Memory.MemoryHelper.ReadSeStringNullTerminated((nint)value.String.Value).TextValue);
+
+        // 全部取るなら「リテイナーから受け取る」（98）、一部なら「個数指定」（773）。クリスタルには個数指定が出ない
+        // （Artisan と同じ）。望んだほうが無ければもう一方にする
+        var all = Svc.Data.GetExcelSheet<Addon>().GetRow(98).Text.ExtractText();
+        var some = Svc.Data.GetExcelSheet<Addon>().GetRow(773).Text.ExtractText();
+        var useAll = this.amount >= p.Count;
+        var idx = MenuChoice.Exact(labels, useAll ? all : some);
+        if (idx < 0)
+            idx = MenuChoice.Exact(labels, useAll ? some : all);
+        if (idx < 0 || context->IsContextItemDisabled(idx))
+        {
+            menu->Close(true);
+            return this.Fail($"右クリックのメニューで「受け取る」を一意に選べません：{string.Join(" / ", labels)}");
+        }
+
+        this.MarkAct();
+        GameUi.Fire(menu, true, 0, idx, 0, 0, 0);
+        this.Next(Phase.Numeric);
+        return TaskResult.Running;
+    }
+
+    /// <summary>
+    /// 数の入力。出るかどうかは品で変わる（実測：クリスタルは「受け取る」でも出た）。
+    /// 出たら入れる。出ないまま手持ちが増えたら、そのまま確かめへ進む。
+    /// </summary>
+    private TaskResult TickNumeric(TaskContext ctx)
+    {
+        if (!this.numericSent && this.Fresh("InputNumeric", out var numeric))
+        {
+            if (!this.SourceStillThere())
+                return this.Fail("数を入れる前にリテイナーの品が変わりました");
+            this.numericSent = true;
+            GameUi.Fire(numeric, true, this.amount);
+            this.Next(Phase.Verify);
+            return TaskResult.Running;
+        }
+
+        if (BagCount(this.pending!) != this.beforeBag)
+            this.Next(Phase.Verify);
+        return TaskResult.Running;
+    }
+
+    private TaskResult TickVerify(TaskContext ctx)
+    {
+        var p = this.pending!;
+        var slots = ReadSlots();
+        if (slots == null)
+            return TaskResult.Running;
+        var now = slots.FirstOrDefault(x => x.Container == p.Container && x.Slot == p.Slot);
+        var sourceNow = now == null ? 0 : now.Item == p.Item && now.Hq == p.Hq ? now.Count : -1;
+        var bagNow = BagCount(p);
+        var got = bagNow - this.beforeBag;
+        if (!TransferConfirmed(this.beforeBag, bagNow, this.beforeSource, sourceNow, this.amount))
+        {
+            // 頼んだ数より多く移ったら、送り直さずに止める（手持ちだけ先に増えてリテイナー側が古い数のままの一瞬は待つ）
+            if (got > this.amount)
+                return this.Fail($"{CraftPlanner.ItemName(p.Item)} の引き出しの結果が頼んだ数と合いません（頼んだ {this.amount}・手持ち +{got}）。送り直さずに止めます");
+            return TaskResult.Running;
+        }
+
+        this.needed!.Counts[(p.Item, p.Hq)] -= this.amount;
+        this.Withdrawn[(p.Item, p.Hq)] = this.Withdrawn.GetValueOrDefault((p.Item, p.Hq)) + this.amount;
+        ctx.Log.Write("リテイナー", $"{CraftPlanner.ItemName(p.Item)}{(p.Hq ? " HQ" : string.Empty)} ×{this.amount} を引き出しました（リテイナー側の減少と手持ちの増加で確認）");
+        this.pending = null;
+        // ここでは控えを取り直さない（操作していない。持ち物の窓は同じ窓を認め続ける）
+        this.Next(Phase.Inventory);
+        return TaskResult.Running;
+    }
+
+    private TaskResult TickCloseInventory()
+    {
+        var agent = AgentRetainer.Instance();
+        if (agent->IsAgentActive())
+        {
+            if (DateTime.UtcNow - this.windows!.ActedAt > TimeSpan.FromMilliseconds(600))
+            {
+                this.MarkAct();
+                agent->Hide();
+            }
+
+            return TaskResult.Running;
+        }
+
+        // 閉じた後に控えを取り直さない。取り直すと、出直したリテイナーのメニューを「前から出ていた窓」とみてしまう。
+        // 帰す段は、閉じる直前（Hide の前）の控えを基準に見る
+        this.windows!.ForgetInventory();
+        this.Next(Phase.Quit);
+        return TaskResult.Running;
+    }
+
+    // ---- 2巡目と後片付け ----
+
+    private TaskResult BeginWithdraw(TaskContext ctx, AtkUnitBase* list)
+    {
+        // ギアセットが使う品のうち手持ちに無い分は、リテイナーに預けた利用者の装備とみて、引き出しの対象に数えない
+        foreach (var (key, keep) in Inventory.GearsetKeepOutsideBags())
+        {
+            if (!this.total.Counts.TryGetValue(key, out var have) || have <= 0)
+                continue;
+            this.total.Counts[key] = Math.Max(0, have - keep);
+            ctx.Log.Write("リテイナー", $"{CraftPlanner.ItemName(key.Item)}{(key.Hq ? " HQ" : string.Empty)} ×{Math.Min(have, keep)} はギアセットの品なので、引き出しの対象に数えません");
+        }
+
+        var bags = Inventory.Snapshot();
+        var (targets, notes) = this.Targets(ctx, bags);
+        foreach (var n in notes)
+            ctx.Log.Warn("リテイナー", n);
+        var built = RetainerPlan.Build(ctx.Data.Planner!, targets, bags, this.total);
+        foreach (var n in built.Problems)
+            ctx.Log.Warn("リテイナー", $"引き出しの計算から外した品：{n}");
+        this.needed = built.Pull;
+        this.withdrawing = true;
+
+        var kinds = this.needed.Counts.Where(kv => kv.Value > 0).ToList();
+        ctx.Log.Write("リテイナー", $"リテイナーの在庫 {this.total.Counts.Count} 種類を読みました。引き出すのは {kinds.Count} 種類です"
+            + (kinds.Count > 0 ? $"：{string.Join("、", kinds.Select(kv => $"{CraftPlanner.ItemName(kv.Key.Item)}{(kv.Key.Hq ? " HQ" : string.Empty)}×{kv.Value}"))}" : string.Empty));
+
+        // 鞄に入りきるかを先に確かめる（入らないまま始めると、途中で弾かれて止まる）
+        var slotsNeeded = BagSlotsNeeded(kinds.Select(kv => (kv.Key.Item, kv.Key.Hq, kv.Value, IsCrystal(kv.Key.Item))), Inventory.StackRoom, ItemStack);
+        var free = Inventory.FreeBagSlots();
+        if (slotsNeeded > free - ctx.Config.KeepFreeBagSlots)
+            return this.Fail($"引き出す品に鞄の枠が {slotsNeeded} 枠要りますが、空きは {free} 枠です（残しておく空き {ctx.Config.KeepFreeBagSlots} 枠を除くと足りません）。"
+                             + "鞄を空けるか、選ぶ職を減らしてから開始してください（残しておく空きは設定タブで減らせます）");
+
+        // 2巡目は、引き出す品を持っている人だけ
+        foreach (var (id, list2) in this.contents)
+            if (list2.Any(s => this.needed.Counts.GetValueOrDefault((s.Item, s.Hq)) > 0))
+                this.queue.Add(id);
+        if (this.queue.Count == 0)
+            return this.StartClose(list);
+        this.current = 0;
+        return TaskResult.Running;
+    }
+
+    private TaskResult StartClose(AtkUnitBase* list)
+    {
+        this.MarkAct();
+        GameUi.Fire(list, true, -1);
+        this.Next(Phase.CloseList);
+        return TaskResult.Running;
+    }
+
+    private TaskResult TickCloseList(TaskContext ctx)
+    {
+        if (GameUi.IsVisible("RetainerList"))
+        {
+            if (DateTime.UtcNow - this.windows!.ActedAt > TimeSpan.FromSeconds(1) && this.ListReady(ctx, out var list))
+            {
+                this.MarkAct();
+                GameUi.Fire(list, true, -1);
+            }
+
+            return TaskResult.Running;
+        }
+
+        this.Next(Phase.Leave);
+        return TaskResult.Running;
+    }
+
+    private TaskResult TickLeave(TaskContext ctx)
+    {
+        // 呼び鈴を使っている状態が終わってから AutoRetainer の一時停止を戻す（呼び鈴を開いたまま戻すと、AutoRetainer が動き出す）
+        if (Svc.Condition[ConditionFlag.OccupiedSummoningBell] || !GameUi.PlayerFree())
+            return TaskResult.Running;
+        this.control.Release(ctx.Config);
+        if (ctx.Config.RetainerSuppressionPendingRestore)
+        {
+            // 戻せなかった（IPC の失敗）。実行中は再試行しないので、ここで知らせる。次の区切りの呼び鈴の前（Take）と、止まった後（Services）で戻し直す
+            const string msg = "AutoRetainer の一時停止を戻せませんでした（次の呼び鈴の前と、止まった後に戻し直します）";
+            ctx.Log.Warn("リテイナー", msg);
+            Svc.Chat.Print($"[AutoJobQuest] {msg}");
+        }
+
+        ctx.Ownership.Clear();
+        ctx.InOwnConversation = false;
+        var left = this.needed?.Counts.Where(kv => kv.Value > 0).ToList() ?? [];
+        if (left.Count > 0)
+            return this.Fail($"リテイナーから引き出しきれませんでした：{string.Join("、", left.Select(kv => $"{CraftPlanner.ItemName(kv.Key.Item)}×{kv.Value}"))}");
+        return TaskResult.Done;
+    }
+
+    // ---- 読み取り ----
+
+    /// <summary>
+    /// 開いているリテイナーの持ち物。通常の7ページが読めていなければ null（まだ読み込み中）。
+    /// クリスタルの欄は読み込み済みと報告しないことがあるので、読めた枠だけを数える。
+    /// 収集品・マテリアの付いた品・リンクだけの枠は数えない。
+    /// </summary>
     private static List<RetainerSlot>? ReadSlots()
     {
         var result = new List<RetainerSlot>();
         var im = InventoryManager.Instance();
-        if (im == null) return null;
+        if (im == null)
+            return null;
         foreach (var page in Pages)
         {
             var c = im->GetInventoryContainer(page);
-            if (c == null || !c->IsLoaded) return null;
+            if (c == null || c->Size <= 0)
+            {
+                if (page == InventoryType.RetainerCrystals)
+                    continue;
+                return null;
+            }
+
+            if (!c->IsLoaded && page != InventoryType.RetainerCrystals)
+                return null;
             for (var i = 0; i < c->Size; i++)
             {
                 var s = c->GetInventorySlot(i);
-                if (s != null && s->ItemId != 0 && s->Quantity > 0 && !s->IsSymbolic && !s->IsCollectable())
-                    result.Add(new(page, i, s->ItemId, (s->Flags & InventoryItem.ItemFlags.HighQuality) != 0, s->Quantity));
+                if (s == null || s->ItemId == 0 || s->Quantity <= 0 || s->IsSymbolic || s->IsCollectable() || s->GetMateriaCount() > 0)
+                    continue;
+                result.Add(new(page, i, s->ItemId, (s->Flags & InventoryItem.ItemFlags.HighQuality) != 0, s->Quantity));
             }
         }
+
         return result;
     }
 
+    /// <summary>
+    /// 引き出しの確かめに使う手持ちの数。ギアセットの引き算をしない生の数で数える（引き算をすると、
+    /// ギアセットに登録された品を受け取っても増えたと見えず、誤った理由で止まっていた）。
+    /// </summary>
     private static int BagCount(RetainerSlot slot)
     {
-        var inv = Inventory.Snapshot();
+        var inv = Inventory.Snapshot(subtractGearsets: false);
         return slot.Hq ? inv.CountHq(slot.Item) : inv.CountNq(slot.Item);
     }
 
-    private List<QuestItemReq> Targets(TaskContext ctx, Inventory bags)
+    private static bool IsCrystal(uint item) => Inventory.IsCrystalItem(item);
+
+    private static int ItemStack(uint item)
+        => Svc.Data.GetExcelSheet<Item>().TryGetRow(item, out var row) ? (int)Math.Max(1u, row.StackSize) : 1;
+
+    /// <summary>手持ちに入る数（クリスタルは専用の欄の上限まで、ほかは鞄の空き枠と同じ品の山の余り。1つしか持てない品は持っていなければ1）。</summary>
+    private static (int Amount, string Reason) Room(RetainerSlot slot)
     {
-        var plan = makePlan();
+        var stack = ItemStack(slot.Item);
+        if (Svc.Data.GetExcelSheet<Item>().TryGetRow(slot.Item, out var row) && row.IsUnique)
+            return Inventory.CountNow(slot.Item) > 0 ? (0, "1つしか持てない品で、もう持っています") : (1, string.Empty);
+        if (slot.Container == InventoryType.RetainerCrystals || IsCrystal(slot.Item))
+        {
+            var room = Math.Max(0, stack - Inventory.CrystalCount(slot.Item));
+            return (room, room > 0 ? string.Empty : $"クリスタルの欄が上限（{stack}）です");
+        }
+
+        var amount = Inventory.StackRoom(slot.Item, slot.Hq, stack) + (Inventory.FreeBagSlots() * stack);
+        return (amount, amount > 0 ? string.Empty : "鞄に空きがありません");
+    }
+
+    /// <summary>
+    /// 引き出す品に要る鞄の新しい枠の数（クリスタルは鞄を使わない）。既存の同じ品の山に積める分は枠を使わない。
+    /// </summary>
+    public static int BagSlotsNeeded(IEnumerable<(uint Item, bool Hq, int Amount, bool Crystal)> pulls, Func<uint, bool, int, int> stackRoom, Func<uint, int> stackSize)
+    {
+        var slots = 0;
+        foreach (var (item, hq, amount, crystal) in pulls)
+        {
+            if (crystal || amount <= 0)
+                continue;
+            var stack = Math.Max(1, stackSize(item));
+            var rest = Math.Max(0, amount - stackRoom(item, hq, stack));
+            slots += (rest + stack - 1) / stack;
+        }
+
+        return slots;
+    }
+
+    /// <summary>引き出す対象（計画の納品物・中間素材・装着するマテリア・要る秘伝書・紫貨の収集品の材料）。</summary>
+    private (List<QuestItemReq> Targets, List<string> Notes) Targets(TaskContext ctx, Inventory bags)
+    {
+        var notes = new List<string>();
+        var plan = this.makePlan();
         var targets = new List<QuestItemReq>(plan.RetainerTargets);
         foreach (var materia in plan.Materia.Where(m => !m.AlreadyMelded))
         {
             var id = materia.MateriaItemId ?? MateriaCatalog.ResolveAny(ctx.Config.AnyMateriaItemId, materia.TargetItemId, out _);
-            if (id is { } item) targets.Add(new(item, 1, false, "装着するマテリア"));
+            if (id is { } item)
+                targets.Add(new(item, 1, false, "装着するマテリア"));
         }
-        // 引き出せる完成品・中間素材を差し引いた後でも必要な秘伝書だけを見る。
+
+        // 引き出せる完成品・中間素材を差し引いた後でも要る秘伝書だけを見る
         var combined = new RetainerPlan.Combined(bags, this.total);
         var craft = ctx.Data.Planner!.Build(targets, combined, PlanBuilder.IsBookUnlocked);
         var tomes = craft.LockedBySecretBook.Select(c => c.SecretRecipeBookId).ToHashSet();
-        if (tomes.Count == 0) return targets;
-        var books = ctx.Data.Books ?? throw new InvalidOperationException("秘伝書の計画を読めません");
-        if (books.CollectableItemId != ctx.Config.ScripCollectableItemId)
-            throw new InvalidOperationException("収集品の設定が変わりました。ゲームデータを再読込してください");
+        if (tomes.Count == 0)
+            return (targets, notes);
+
+        // 秘伝書の表が欠けていても、引き出しは止めない（秘伝書の段で改めて確かめて止める）
+        var books = ctx.Data.Books;
+        if (books == null || books.CollectableItemId != ctx.Config.ScripCollectableItemId)
+        {
+            notes.Add("秘伝書の表を読めないため、秘伝書と紫貨の収集品の材料は引き出しの対象に入れません");
+            return (targets, notes);
+        }
+
         var offers = books.Offers.Values.Where(o => tomes.Contains(o.TomeId)).ToList();
+        foreach (var offer in offers)
+            targets.Add(new(offer.BookItemId, 1, false, "要る秘伝書"));
         if (offers.Select(o => o.TomeId).Distinct().Count() != tomes.Count)
-            throw new InvalidOperationException("必要な秘伝書の価格を確認できません");
-        foreach (var offer in offers) targets.Add(new(offer.BookItemId, 1, false, "必要な秘伝書"));
+        {
+            notes.Add("要る秘伝書の値段を確かめられないため、紫貨の収集品の材料は引き出しの対象に入れません");
+            return (targets, notes);
+        }
+
         var price = offers.Where(o => combined.CountNq(o.BookItemId) + combined.CountHq(o.BookItemId) == 0).Sum(o => (int)o.Price);
         var count = BookMath.CollectablesNeeded(price, Inventory.CountSpecialCurrency(books.RewardSpecialCurrencyId, out _), books.RewardLow);
         count = Math.Max(0, count - Inventory.CountCollectables(books.CollectableItemId, books.MinCollectability));
-        if (count > 0) targets.Add(new(books.CollectableItemId, count, false, "秘伝書交換用の収集品の材料"));
-        return targets;
+        if (count > 0)
+            targets.Add(new(books.CollectableItemId, count, false, "紫貨のための収集品の材料"));
+        return (targets, notes);
     }
 
+    /// <summary>止めた後の見張りの名前。</summary>
+    public const string DismissWatchName = "呼び出したリテイナーを帰して呼び鈴を閉じる";
+
+    /// <summary>
+    /// 止めたときにリテイナーを呼んだまま・呼び鈴を開いたままなら、止まった後に「リテイナーを帰す」を選び、一覧を閉じる
+    /// （以前は持ち物を閉じるだけで、リテイナーのメニューと呼び鈴が開いたまま残り、AutoRetainer の一時停止も戻らなかった。
+    /// もう一度開始すると「開始前から呼び鈴が開いています」で止まった）。
+    /// 押すのは、自分が呼んだリテイナーのメニューと、呼び鈴の一覧と、その間の会話だけ。20秒で閉じきれなければ、手で閉じるよう知らせる。
+    /// 呼び鈴が閉じれば、AutoRetainer の一時停止は Services が戻す。
+    /// </summary>
+    private static (string Name, DateTime Until, Func<bool> Step) DismissWatch(ulong retainer, bool inventoryMayOpen, Ipc.RetainerControl control)
+    {
+        var prefix = AddonPrefix(2383);
+        var started = DateTime.UtcNow;
+        var giveUpAt = started + TimeSpan.FromSeconds(20);
+
+        // 最初の押しは1秒後（後始末の押しが効くのを待つ。同じフレームで同じ一覧に2回送らない）
+        var lastPress = started;
+        var hidInventory = false;
+        return (DismissWatchName, started + TimeSpan.FromSeconds(25), () =>
+        {
+            if (!Svc.Condition[ConditionFlag.OccupiedSummoningBell])
+                return true;
+            if (DateTime.UtcNow > giveUpAt)
+            {
+                Svc.Chat.Print("[AutoJobQuest] 呼び鈴を開いたまま止まりました。リテイナーの持ち物が開いていれば閉じ、メニューで「リテイナーを帰す」を選び、一覧を閉じてください"
+                               + "（閉じると AutoRetainer の一時停止を戻します）");
+                return true;
+            }
+
+            // 押す間隔（送りすぎの防止。終わりは「呼び鈴を使っている状態が解けたか」で見る）
+            if (DateTime.UtcNow - lastPress < TimeSpan.FromSeconds(1))
+                return false;
+
+            // AutoRetainer の抑制が外れた・動き出したなら押さない（取り合わない）
+            if (!control.Keep())
+            {
+                Svc.Chat.Print("[AutoJobQuest] AutoRetainer が動き出したので、呼び鈴の後始末をやめました。AutoRetainer が終わったら、呼び鈴を閉じてください");
+                return true;
+            }
+
+            // 利用者が別のリテイナーを呼んだら、利用者の操作とみて押さない
+            var manager = RetainerManager.Instance();
+            if (manager != null && manager->LastSelectedRetainerId != 0 && manager->LastSelectedRetainerId != retainer)
+            {
+                Core.DebugLog.Current?.Line("リテイナー", "止めた後に別のリテイナーが呼ばれたので、呼び鈴の後始末をやめました（利用者の操作とみなします）");
+                return true;
+            }
+
+            var agent = AgentRetainer.Instance();
+            if (agent != null && agent->IsAgentActive())
+            {
+                // 「アイテムの受け渡し」を押した直後に止めると、持ち物の窓は止めた後に開く。自分が呼んだリテイナーなら1回だけ閉じる
+                if (inventoryMayOpen && !hidInventory && manager != null && manager->LastSelectedRetainerId == retainer && DateTime.UtcNow - started < TimeSpan.FromSeconds(10))
+                {
+                    hidInventory = true;
+                    lastPress = DateTime.UtcNow;
+                    agent->Hide();
+                }
+
+                return false;
+            }
+
+            if (GameUi.IsReady("Talk", out _))
+            {
+                lastPress = DateTime.UtcNow;
+                GameUi.AdvanceTalk();
+                return false;
+            }
+
+            if (GameUi.MenuEntries(out var menu) is { } entries)
+            {
+                var index = MenuChoice.ByAddonPrefix(entries, prefix);
+                if (retainer == 0 || manager == null || manager->LastSelectedRetainerId != retainer || index < 0)
+                    return false;
+                lastPress = DateTime.UtcNow;
+                GameUi.Fire(menu, true, index);
+                return false;
+            }
+
+            if (GameUi.IsReady("RetainerList", out var list))
+            {
+                lastPress = DateTime.UtcNow;
+                GameUi.Fire(list, true, -1);
+            }
+
+            return false;
+        });
+    }
+
+    /// <summary>引き出しが済んだか：リテイナー側の減少と手持ちの増加が、どちらも頼んだ数と一致する。</summary>
     public static bool TransferConfirmed(int bagBefore, int bagNow, int sourceBefore, int sourceNow, int amount)
         => amount > 0 && sourceNow >= 0 && bagNow - bagBefore == amount && sourceBefore - sourceNow == amount;
 
+    /// <summary>メニューを出す前後で、頼んだ枠と手持ちが変わっていないか（メニューの対象が頼んだ枠か、も見る）。</summary>
     private bool SourceUnchanged()
     {
         var p = this.pending!;
         var context = AgentInventoryContext.Instance();
         if (context == null || context->TargetInventoryId != p.Container || context->TargetInventorySlotId != p.Slot
-            || context->OwnerAddonId != AgentRetainer.Instance()->GetAddonId()) return false;
+            || context->OwnerAddonId != AgentRetainer.Instance()->GetAddonId())
+            return false;
+        return this.SourceStillThere();
+    }
+
+    private bool SourceStillThere()
+    {
+        var p = this.pending!;
         var now = ReadSlots()?.FirstOrDefault(x => x.Container == p.Container && x.Slot == p.Slot);
         return now != null && now.Item == p.Item && now.Hq == p.Hq && now.Count == this.beforeSource && BagCount(p) == this.beforeBag;
     }
 
     public override void Cleanup(TaskContext ctx)
     {
-        this.travel?.Cleanup(ctx); this.travel = null;
-        if (this.opened != DateTime.MinValue)
+        this.travel?.Cleanup(ctx);
+        this.travel = null;
+
+        if (this.bellOpened)
         {
-            foreach (var name in new[] { "InputNumeric", "ContextMenu", "InventoryRetainer", "InventoryRetainerLarge", "SelectString", "Talk", "RetainerList" })
-                if (ctx.Ownership.TryGetOwnedSince(name, this.opened, out var addon, out _)) addon->Close(true);
+            // 自分が開いた窓だけを、内側から外側の順に閉じる
+            if (this.firedAt != DateTime.MinValue && GameUi.IsReady("InputNumeric", out var numeric) && this.phase is Phase.Numeric or Phase.Verify)
+                numeric->Close(true);
+            if (this.phase == Phase.Context && GameUi.IsReady("ContextMenu", out var menu) && this.windows?.WasOpenAtAct("ContextMenu") == false)
+                menu->Close(true);
+            var agent = AgentRetainer.Instance();
+            if (agent != null && agent->IsAgentActive())
+                agent->Hide();
+            if (ctx.Ownership.TryGetOwnedSince("RetainerList", this.bellAt, out var list)
+                || (Svc.Condition[ConditionFlag.OccupiedSummoningBell] && GameUi.IsReady("RetainerList", out list)))
+                GameUi.Fire(list, true, -1);
+
+            // リテイナーを呼んだまま・呼び鈴を開いたままなら、止まった後にリテイナーを帰して一覧を閉じる。
+            // AutoRetainer が動き出して止めたときは押さない（取り合う）。手で閉じるよう知らせるだけにする
+            if (Svc.Condition[ConditionFlag.OccupiedSummoningBell])
+            {
+                ctx.AfterStop.RemoveAll(a => a.Name == DismissWatchName);
+                if (this.autoRetainerTookOver)
+                    Svc.Chat.Print("[AutoJobQuest] AutoRetainer が動き出したので、呼び鈴はそのままにしました。AutoRetainer が終わったら、呼び鈴を閉じてください");
+                else
+                    ctx.AfterStop.Add(DismissWatch(this.current, this.phase is Phase.Menu or Phase.Inventory, this.control));
+            }
         }
+
+        // 一時停止を戻す。呼び鈴がまだ開いていれば戻さない（開いたまま戻すと AutoRetainer が呼び鈴で動き出す）。
+        // 控えが残るので、呼び鈴が閉じてから Services が戻す
+        if (!Svc.Condition[ConditionFlag.OccupiedSummoningBell])
+            this.control.Release(ctx.Config);
+        ctx.Ownership.Clear();
         ctx.InOwnConversation = false;
-        this.control.Release(ctx.Config);
-        ctx.TextAdvance.ReleaseControl();
         ctx.YesAlready.Release();
+    }
+}
+
+/// <summary>メニューの項目の選び方（ゲームを起動せずに試せるように分けた）。</summary>
+public static class MenuChoice
+{
+    /// <summary>先頭が <paramref name="prefix"/> の項目がちょうど1つならその番号、そうでなければ -1。</summary>
+    public static int ByAddonPrefix(IReadOnlyList<string> entries, string prefix)
+    {
+        if (string.IsNullOrWhiteSpace(prefix))
+            return -1;
+        var found = -1;
+        for (var i = 0; i < entries.Count; i++)
+        {
+            if (!entries[i].Trim().StartsWith(prefix, StringComparison.Ordinal))
+                continue;
+            if (found >= 0)
+                return -1;
+            found = i;
+        }
+
+        return found;
+    }
+
+    /// <summary>完全一致の項目がちょうど1つならその番号、そうでなければ -1。</summary>
+    public static int Exact(IReadOnlyList<string> entries, string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return -1;
+        var found = -1;
+        for (var i = 0; i < entries.Count; i++)
+        {
+            if (!string.Equals(entries[i].Trim(), text.Trim(), StringComparison.Ordinal))
+                continue;
+            if (found >= 0)
+                return -1;
+            found = i;
+        }
+
+        return found;
     }
 }

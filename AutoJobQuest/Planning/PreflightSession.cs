@@ -12,6 +12,7 @@ public sealed class PreflightSession : IDisposable
     private JobQuestPlan? plan;
     private ArtisanHqEstimate.Job? hq;
     private string? selection;
+    private bool buildRequested;
     public bool Complete { get; private set; }
     public string Status => this.hq?.Status ?? "ゲームデータを準備しています";
     public List<PreflightItem>? Items { get; private set; }
@@ -22,7 +23,21 @@ public sealed class PreflightSession : IDisposable
             return;
         try
         {
-            ctx.Data.EnsureBuilding();
+            // 読み込みは点検を始めたときに1回だけ頼む。失敗したら、作り直し続けずに理由を出して終える
+            // （以前は毎フレーム頼み直し、失敗が続くと作り直しが途切れず、点検が終わらなかった。作り直しは次の「点検する」で）
+            if (!this.buildRequested)
+            {
+                this.buildRequested = true;
+                ctx.Data.EnsureBuilding();
+            }
+
+            if (!ctx.Data.IsReady && !ctx.Data.IsBuilding && ctx.Data.BuildError is { } buildError)
+            {
+                this.Items = [new PreflightItem(Severity.Error, $"ゲームデータを読めませんでした：{buildError}")];
+                this.Dispose();
+                return;
+            }
+
             if (!ctx.Data.IsReady)
                 return;
             this.selection ??= string.Join(",", ctx.Config.SelectedCrafters);

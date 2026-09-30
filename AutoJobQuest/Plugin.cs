@@ -8,7 +8,7 @@ using AutoJobQuest.Ui;
 namespace AutoJobQuest;
 
 /// <summary>
-/// 製作系ジョブクエ（木工〜調理、Lv1〜60）を自動で進める。
+/// 製作系・採集系のジョブクエ（木工〜調理・採掘・園芸・漁師、Lv1〜70）を自動で進める。
 ///
 /// 流れ:
 ///   事前点検 → 計画（納品要件・製作リスト・素材の入手元）
@@ -30,6 +30,7 @@ public sealed class Plugin : IDalamudPlugin
 
     private readonly WindowSystem windows = new("AutoJobQuest");
 
+    private readonly GlobalConfiguration global;
     private readonly Configuration config;
     private readonly RunLog log;
     private readonly Services services;
@@ -39,11 +40,27 @@ public sealed class Plugin : IDalamudPlugin
     {
         pluginInterface.Create<Svc>();
 
-        this.config = Svc.PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
-        this.config.Initialize(Svc.PluginInterface);
+        // 全体で1つの設定（起動時に画面を開く・記録の置き場所）。読めなければ既定の値
+        GlobalConfiguration? loaded = null;
+        try
+        {
+            loaded = Svc.PluginInterface.GetPluginConfig() as GlobalConfiguration;
+        }
+        catch (Exception ex)
+        {
+            Svc.Log.Warning(ex, "[AutoJobQuest] 全体の設定を読めなかったので、既定の値で始めます");
+        }
+
+        this.global = loaded ?? new GlobalConfiguration();
+        if (loaded == null)
+            Svc.PluginInterface.SavePluginConfig(this.global);
+
+        // キャラクターごとの設定。中身はログインしたキャラクターが決まってから読む（Services.WatchCharacter）
+        this.config = new Configuration();
+        this.config.Initialize(System.IO.Path.Combine(Svc.PluginInterface.ConfigDirectory.FullName, "characters"));
 
         this.log = new RunLog();
-        this.services = new Services(this.config, this.log);
+        this.services = new Services(this.config, this.log, this.global.LogDirectory);
         this.window = new MainWindow(this.config, this.log, this.services);
 
         this.windows.AddWindow(this.window);
@@ -63,7 +80,7 @@ public sealed class Plugin : IDalamudPlugin
 
         this.log.Write("Info", "読み込みました");
 
-        if (this.config.OpenOnStartup)
+        if (this.global.OpenOnStartup)
             this.window.IsOpen = true;
     }
 

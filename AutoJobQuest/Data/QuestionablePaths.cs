@@ -50,6 +50,7 @@ public static class QuestionablePaths
     private static DateTime loadedStamp;
     private static Dictionary<ushort, List<QuestionableCraftStep>> cache = [];
     private static Dictionary<ushort, List<QuestionableStep>> stepCache = [];
+    private static Dictionary<ushort, HashSet<uint>> gatherCache = [];
     private static Dictionary<ushort, string> entries = [];
 
     /// <summary>経路データの場所。</summary>
@@ -61,6 +62,23 @@ public static class QuestionablePaths
 
     /// <summary>そのクエストの全手順（段・手順の順）。経路データが読めない・経路が無ければ null。</summary>
     public static IReadOnlyList<QuestionableStep>? Steps(ushort shortId) => Steps(BundlePath, shortId);
+
+    /// <summary>
+    /// そのクエストの経路で、Questionable 自身が採集・釣りで採る品（手順の ItemsToGather）。経路が無ければ空。
+    /// 採集職の納品物は、こちらが先に集めきれなくても、受注後に Questionable が採る。
+    /// </summary>
+    public static IReadOnlySet<uint> GatheredItems(ushort shortId) => GatheredItems(BundlePath, shortId);
+
+    /// <summary>上と同じ。経路データの場所を渡す（試験用）。</summary>
+    public static IReadOnlySet<uint> GatheredItems(string bundlePath, ushort shortId)
+    {
+        lock (Gate)
+        {
+            if (CraftSteps(bundlePath, shortId) == null)
+                return new HashSet<uint>();
+            return gatherCache.TryGetValue(shortId, out var set) ? set : new HashSet<uint>();
+        }
+    }
 
     /// <summary>上と同じ。経路データの場所を渡す（試験用）。</summary>
     public static IReadOnlyList<QuestionableStep>? Steps(string bundlePath, ushort shortId)
@@ -98,6 +116,7 @@ public static class QuestionablePaths
                     entries = map;
                     cache = [];
                     stepCache = [];
+                    gatherCache = [];
                     loadedPath = bundlePath;
                     loadedStamp = stamp;
                 }
@@ -112,6 +131,7 @@ public static class QuestionablePaths
                 using var doc = JsonDocument.Parse(stream);
                 var list = new List<QuestionableCraftStep>();
                 var all = new List<QuestionableStep>();
+                var gathered = new HashSet<uint>();
                 if (doc.RootElement.TryGetProperty("QuestSequence", out var seqs))
                 {
                     foreach (var seq in seqs.EnumerateArray())
@@ -123,6 +143,12 @@ public static class QuestionablePaths
                         foreach (var st in steps.EnumerateArray())
                         {
                             all.Add(ReadStep(sequence, index++, st));
+
+                            // 採集・釣りの手順で Questionable 自身が採る品（ItemsToGather）
+                            if (st.TryGetProperty("ItemsToGather", out var tg) && tg.ValueKind == JsonValueKind.Array)
+                                foreach (var g in tg.EnumerateArray())
+                                    if (g.ValueKind == JsonValueKind.Object && g.TryGetProperty("ItemId", out var gi) && gi.ValueKind == JsonValueKind.Number)
+                                        gathered.Add(gi.GetUInt32());
                             if (!st.TryGetProperty("InteractionType", out var it) || it.GetString() != "Craft")
                                 continue;
                             uint? item = st.TryGetProperty("ItemId", out var iv) && iv.ValueKind == JsonValueKind.Number ? iv.GetUInt32() : null;
@@ -138,6 +164,7 @@ public static class QuestionablePaths
 
                 cache[shortId] = list;
                 stepCache[shortId] = all;
+                gatherCache[shortId] = gathered;
                 return list;
             }
             catch (Exception ex)

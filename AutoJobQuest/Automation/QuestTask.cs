@@ -45,6 +45,7 @@ public sealed unsafe class QuestTask : AutoTask
     private Vector3? turnInPos;
     private DateTime interactedAt = DateTime.MinValue;
     private int interactions;
+    private int interactAttempts;
     private bool textAdvanceWarned;
     private string? selectedMenu;
     private DateTime manualInteractionAt = DateTime.MinValue;
@@ -64,6 +65,9 @@ public sealed unsafe class QuestTask : AutoTask
 
     // 渡す操作を送った後の確かめ（求めた品が減ったか）
     private DateTime? submittedAt;
+
+    // 最後に渡した段（渡した直後に、受注後の製作の段の引き取りを誤って行わないため）
+    private int submittedInSequence = -1;
     private Dictionary<uint, int> countsBeforeSubmit = [];
 
     // 頼むまでの準備と進行中の見張り（着替え・受注できるか・優先リスト・TextAdvance・別のクエストへ移った）
@@ -73,10 +77,28 @@ public sealed unsafe class QuestTask : AutoTask
     private IReadOnlyList<QuestionableStep>? paths;
     private IReadOnlyList<QuestionableCraftStep>? pathCrafts;
 
+    // 受注後にクエストの材料から作る品を、こちらで HQ まで作っている（Lv61〜70 の製作職：QuestCraftTask）
+    private QuestCraftTask? questCraft;
+
+    // Questionable が手で行う手順（Instruction：漁師 Lv68 の刺突漁）で待っている間（その時間は上限に数えない）
+    private DateTime? manualWaitSince;
+    private TimeSpan manualWaitTotal;
+    private bool manualWaitNotified;
+
+    /// <summary>手で行う手順を待つ上限。</summary>
+    private static readonly TimeSpan ManualWaitLimit = TimeSpan.FromMinutes(60);
+
     // こちらで行う手順（Questionable から引き継いだ段の残り）と、いま行っている手順・引き継いだ段
     private Queue<QuestionableStep>? own;
-    private NpcStepTask? ownTask;
+    private AutoTask? ownTask;
+
+    // 受注前の段の新しいクラス向けの準備を確かめたか
+    private bool gearsetSetupChecked;
     private int ownFromSeq;
+
+    // Lv1 の受注をこちらで行う前の準備（着替え → 受注前の確かめ）
+    private QuestionableStep? lv1Accept;
+    private AutoTask? lv1Equip;
 
     public QuestTask(JobQuest quest)
     {
@@ -116,7 +138,12 @@ public sealed unsafe class QuestTask : AutoTask
                 : $"{this.quest} は納品物を途中まで渡しています（今の段 {seq}）。まだ要る品：{(needs.Needed.Count == 0 ? "なし" : string.Join("、", needs.Needed.Select(n => $"{CraftPlanner.ItemName(n.ItemId)}×{n.Count}")))}");
         }
 
-        foreach (var r in needs.Needed.Where(_ => !Jobs.IsGatherer(this.quest.ClassJobId)))
+        // 受注した後にしか手に入らない品（Lv61〜70 の取引できない納品物）は、始める時点では確かめない（受注後に Questionable が作る・採る）。
+        // 採集職の取引できる品（Lv1〜60）は計画で先に集めているので、製作職と同じく確かめる（以前は採集職を丸ごと飛ばし、
+        // 足りないまま納品窓や釣りで止まった）
+        // 採集職の納品物のうち、Questionable が経路の採集・釣りの手順で自分で採る品も確かめない（先に集めきれなかった品を任せる）
+        var questGathers = Jobs.IsGatherer(this.quest.ClassJobId) ? QuestionablePaths.GatheredItems(this.quest.ShortId) : new HashSet<uint>();
+        foreach (var r in needs.Needed.Where(n => !this.quest.AfterAcceptItems.Contains(n.ItemId) && !questGathers.Contains(n.ItemId)))
         {
             var have = r.Hq ? inv.CountHq(r.ItemId) : inv.CountAll(r.ItemId);
             if (have < r.Count)
@@ -157,6 +184,11 @@ public sealed unsafe class QuestTask : AutoTask
         if (this.paths == null)
             ctx.Log.Warn("クエスト", "Questionable の経路データを読めないので、材料の購入・既製リストの手順を引き継げません（Questionable にそのまま任せます）");
 
+        // Questionable の釣りの手順は AutoHook が無いと作業を作らず、そこで止まる（魚を持っていても手順の種類だけで止まる）。
+        // 理由の出ない失敗にしないよう、今の段より後に釣りの手順が残るなら始める前に止める
+        if (!ctx.AutoHook.IsLoaded && this.paths?.Any(s => s.Type == "Fish" && s.Sequence >= seq) == true)
+            return this.Fail($"{this.quest} には Questionable の釣りの手順があり、AutoHook が要ります。AutoHook を読み込んでから再開してください（続きから進みます）");
+
         // YesAlready の納品窓の自動入力は一覧の先頭を入れる（HQ 指定でも NQ が入りうる）。こちらが入れるので、
         // クエストの間は止めてもらう（止めるのは自分の停止要求を入れるだけで、設定は変えない）
         ctx.YesAlready.Suppress();
@@ -176,17 +208,47 @@ public sealed unsafe class QuestTask : AutoTask
         if (this.HandleRequest(ctx) is { } requestFailure)
             return this.Fail(requestFailure);
 
-        if (this.Elapsed > TimeSpan.FromMinutes(30))
-            return this.Fail("30分たってもクエストが完了しません");
+        // 上限：採集・釣りの手順があるクエストは長くする（時間限定の採集点で最長 ET10時間＝約29分待つ）。
+        // 手で行う手順を待った時間は数えない
+        var waited = this.manualWaitTotal + (this.manualWaitSince is { } ws ? DateTime.UtcNow - ws : TimeSpan.Zero);
+        var limit = TimeSpan.FromMinutes(this.paths?.Any(s => s.Type is "Gather" or "Fish") == true ? 90 : 30);
+        if (this.Elapsed - waited > limit)
+            return this.Fail($"{limit.TotalMinutes:0}分たってもクエストが完了しません");
+        if (waited > ManualWaitLimit)
+            return this.Fail($"手で行う手順を {ManualWaitLimit.TotalMinutes:0} 分待っても進みませんでした。手順を終えてから再開してください");
 
-        if ((this.own != null || this.manualTurnIn) && !ctx.TextAdvance.EnsureTurnInControl())
-            return this.Fail("TextAdvance の操作権を確保できないため、自前の会話・納品を止めました。操作権が空いてから再開してください");
+        // Lv1 の受注をこちらで行う前の準備（着替え → Questionable に頼むときと同じ受注前の確かめ）
+        if (this.lv1Accept != null)
+            return this.PrepareOwnAccept(ctx);
+
+        if ((this.own != null || this.manualTurnIn || this.questCraft != null) && !ctx.TextAdvance.EnsureTurnInControl())
+            return this.Fail($"TextAdvance の操作権を確保できないため、自前の会話・納品を止めました（{ctx.TextAdvance.LossReason ?? "理由を読めません"}）。操作権が空いてから再開してください");
 
         if (this.own != null)
             return this.RunOwnSteps(ctx);
 
+        if (this.questCraft != null)
+            return this.RunQuestCraft(ctx);
+
         if (this.manualTurnIn)
             return this.ManualTurnIn(ctx);
+
+        // Lv1 の「My First ～」：受注前の段の新しいクラス向けの準備（ギアセットの作成・上書き）をさせず、受注だけこちらで行う
+        if (!this.started && !this.gearsetSetupChecked)
+        {
+            this.gearsetSetupChecked = true;
+            var qm = QuestManager.Instance();
+            if (qm != null && !qm->IsQuestAccepted(this.quest.RowId) && this.paths != null && QuestTakeOver.GearsetSetupAccept(this.paths) is { } accept)
+            {
+                ctx.Log.Write("クエスト", $"{this.quest} の受注前の段には、新しいクラス向けの準備（道具の装備・ギアセットの作成と上書き）があります。"
+                                     + $"Lv70 の職では要らず、ギアセットを書き換えるので、受注だけこちらで行います（{NpcStepTask.NpcName(accept.DataId)} に話しかける）");
+                if (Unlocks.PickJobFor(this.quest.RowId) is { } job && job != Jobs.CurrentClassJob)
+                    this.lv1Equip = new EquipJobTask(job);
+                this.lv1Accept = accept;
+                this.NextPhase("受注の前の確かめ");
+                return TaskResult.Running;
+            }
+        }
 
         if (!this.started)
         {
@@ -215,6 +277,82 @@ public sealed unsafe class QuestTask : AutoTask
         if (stepData != null && stepData.QuestId == QuestionableIpc.ToQuestId(this.quest.RowId))
         {
             this.Status = $"Questionable: 手順 {stepData.Sequence}-{stepData.Step} {stepData.InteractionType}";
+
+            // 手で行う手順（Instruction）：Questionable は段が変わるまで待つ。知らせて待つ（その間は上限に数えない）。
+            // この段で渡す品がそろい、残りが話しかけるだけなら、渡すところからこちらで行う
+            if (stepData.InteractionType == "Instruction")
+            {
+                this.manualWaitSince ??= DateTime.UtcNow;
+                var handIn = this.paths?.Where(s => s.Sequence == stepData.Sequence && s.Index > stepData.Step && s.Type is "Interact" or "CompleteQuest")
+                    .Select(s => s.DataId).FirstOrDefault(d => d != null);
+                var wanted = QuestTakeOver.InstructionItems(this.quest, stepData.Sequence);
+                if (!this.manualWaitNotified)
+                {
+                    this.manualWaitNotified = true;
+                    var what = wanted.Count > 0 ? $"（そろえる品：{string.Join("、", wanted.Select(w => $"{CraftPlanner.ItemName(w.ItemId)}×{w.Count}"))}）" : string.Empty;
+                    var msg = $"{Jobs.Name(this.quest.ClassJobId)} {this.quest} は、手で行う手順（段 {stepData.Sequence}）があります{what}。"
+                              + "Questionable の画面に出ている手順（刺突漁など）を手で行ってください。"
+                              + (handIn is { } npc && wanted.Count > 0
+                                  ? $"品がそろったら、{NpcStepTask.NpcName(npc)} に渡すところからこちらで続けます"
+                                  : "段が進むと自動で続けます");
+                    ctx.Log.Warn("クエスト", msg);
+                    Svc.Chat.Print($"[AutoJobQuest] {msg}");
+                }
+
+                var inv = Inventory.Snapshot();
+                var ready = wanted.Count > 0 && wanted.All(w => (w.Hq ? inv.CountHq(w.ItemId) : inv.CountAll(w.ItemId)) >= w.Count);
+                if (this.paths != null && GameUi.PlayerFree()
+                    && QuestTakeOver.AfterInstruction(this.paths, stepData.Sequence, stepData.Step, stepData.InteractionType, ready) is { } rest)
+                {
+                    this.manualWaitTotal += DateTime.UtcNow - this.manualWaitSince.Value;
+                    this.manualWaitSince = null;
+                    ctx.Questionable.Stop(Plugin.InternalNameConst);
+                    this.own = new Queue<QuestionableStep>(rest);
+                    this.ownFromSeq = stepData.Sequence;
+                    ctx.Log.Write("クエスト", $"手で行う手順の品がそろったので、Questionable を止め、段 {stepData.Sequence} の残り"
+                                         + $"（{string.Join("→", rest.Select(x => $"{x.Type}（{NpcStepTask.NpcName(x.DataId)}）"))}）をこちらで行います");
+                    this.NextPhase("手で行う手順の後をこちらで行います");
+                    return TaskResult.Running;
+                }
+
+                this.Status = $"手で行う手順を待っています（段 {stepData.Sequence}）";
+            }
+            else if (this.manualWaitSince is { } since)
+            {
+                this.manualWaitTotal += DateTime.UtcNow - since;
+                this.manualWaitSince = null;
+            }
+
+            // 受注後にクエストの材料から作る品（Lv61〜70 の製作職）の製作手順に入ったら、止めてこちらで HQ まで作る（QuestCraftTask）
+            // 釣りの手順は AutoHook が要る（途中で外された場合。始める前にも確かめている）
+            if (stepData.InteractionType == "Fish" && !ctx.AutoHook.IsLoaded)
+                return this.Fail($"Questionable が釣りの手順（段 {stepData.Sequence}）に入りましたが、AutoHook が読み込まれていません。AutoHook を読み込んでから再開してください（続きから進みます）");
+
+            // 必要数を持っていれば引き取らない（Questionable が「持っていれば飛ばす」で先へ進む）
+            // 製作の手順でなくても、その段の品の HQ が足りなければ引き取る（Questionable は NQ を持っていると製作を飛ばすため）
+            if (this.quest.QuestCrafts.Count > 0 && (stepData.InteractionType == "Craft" || this.paths != null))
+            {
+                var stepItem = this.paths?.FirstOrDefault(p => p.Sequence == stepData.Sequence && p.Index == stepData.Step)?.ItemId;
+                var inv = Inventory.Snapshot();
+                Func<uint, bool, int> held = (item, hq) => hq ? inv.CountHq(item) : inv.CountAll(item);
+                // 段の単位の引き取りは、動ける状態で、この段でまだ何も渡しておらず、NQ と HQ を合わせた数は足りているのに HQ が足りないときだけ
+                // （Questionable が製作を飛ばす形そのもの。渡した直後〔品が消えて段が進む前〕に誤って引き取らない）
+                var qc = QuestTakeOver.QuestCraftToTake(stepData.InteractionType, stepItem, this.quest.QuestCrafts, held);
+                if (qc == null && this.paths != null && GameUi.PlayerFree() && this.submittedInSequence != stepData.Sequence
+                    && QuestTakeOver.QuestCraftInSequence(stepData.Sequence, this.paths, this.quest.QuestCrafts, held) is { } skipped
+                    && inv.CountAll(skipped.ItemId) >= skipped.Count)
+                    qc = skipped;
+                if (qc != null)
+                {
+                    ctx.Questionable.Stop(Plugin.InternalNameConst);
+                    this.questCraft = new QuestCraftTask(this.quest, qc, this.paths);
+                    ctx.Log.Write("クエスト", $"Questionable が {CraftPlanner.ItemName(qc.ItemId)} の製作の段（段 {stepData.Sequence}・手順 {stepData.InteractionType}）に入ったので止め、"
+                                         + $"こちらで{(qc.Hq ? " HQ になるまで" : string.Empty)}作ります"
+                                         + "（Questionable の製作は品質を見ないため。製作は Artisan に任せます）");
+                    this.NextPhase("受注後の品をこちらで作ります");
+                    return TaskResult.Running;
+                }
+            }
 
             // 材料の購入・製作の手順に入ったら、止めて残りをこちらで行う（既製リストが動く・材料を買い足すのを防ぐ）
             if (this.paths != null && this.pathCrafts != null)
@@ -350,8 +488,8 @@ public sealed unsafe class QuestTask : AutoTask
             return null;
         }
 
-        if (!ctx.TextAdvance.EnsureTurnInControl())
-            return "TextAdvance の操作権を確認できないため、納品窓には入力せず止めました";
+        if (!ctx.TextAdvance.VerifyTurnInControlNow())
+            return $"TextAdvance の操作権を確認できないため、納品窓には入力せず止めました（{ctx.TextAdvance.LossReason ?? "理由を読めません"}）";
 
         var result = this.filler.Tick(GameRequestWindow.Instance, (nint)request, openedAt, this.questItems, out var detail);
         if (this.filler.MateriaNote is { } note && !this.materiaNoteLogged)
@@ -364,11 +502,12 @@ public sealed unsafe class QuestTask : AutoTask
         {
             case RequestFiller.Outcome.Submitted:
                 this.submittedAt = DateTime.UtcNow;
+                this.submittedInSequence = QuestManager.GetQuestSequence(this.quest.RowId);
                 this.countsBeforeSubmit = new Dictionary<uint, int>(this.filler.CountsBeforeSubmit);
                 ctx.Log.Write("納品", detail);
                 break;
             case RequestFiller.Outcome.NotOurs:
-                return $"{detail}。対象クエストの品と照合できないため入力しません。クエストのスクリプトと要求品を確認してください";
+                return $"{detail}。この納品窓は、このクエストの品と照合できないので自動では入れません。手で渡すか窓を閉じてから、もう一度開始してください（続きから進みます）";
             case RequestFiller.Outcome.Failed:
                 return detail;
             case RequestFiller.Outcome.Busy:
@@ -377,6 +516,56 @@ public sealed unsafe class QuestTask : AutoTask
         }
 
         return null;
+    }
+
+    /// <summary>Lv1 の受注をこちらで行う前の準備（着替え → 受注前の確かめ）。済めば受注の手順をこちらの手順に積む。</summary>
+    private TaskResult PrepareOwnAccept(TaskContext ctx)
+    {
+        if (this.lv1Equip != null)
+        {
+            var r = this.lv1Equip.Step(ctx);
+            this.Status = this.lv1Equip.Status;
+            if (r == TaskResult.Running)
+                return TaskResult.Running;
+            this.lv1Equip.Cleanup(ctx);
+            var failed = r == TaskResult.Failed ? this.lv1Equip.FailReason : null;
+            this.lv1Equip = null;
+            if (failed != null)
+                return this.Fail(failed);
+        }
+
+        var ready = this.starter.ReadyForOwnAccept(ctx, out var fail, out var status);
+        if (status.Length > 0)
+            this.Status = status;
+        if (ready == TaskResult.Failed)
+            return this.Fail(fail ?? "受注前の確かめで止めました");
+        if (ready == TaskResult.Running)
+            return TaskResult.Running;
+
+        this.own = new Queue<QuestionableStep>([this.lv1Accept!]);
+        this.ownFromSeq = 0;
+        this.lv1Accept = null;
+        this.NextPhase("受注だけこちらで行います");
+        return TaskResult.Running;
+    }
+
+    /// <summary>受注後の品の製作（QuestCraftTask）を進める。終われば Questionable に戻す（製作手順は、作った品を見て飛ばす）。</summary>
+    private TaskResult RunQuestCraft(TaskContext ctx)
+    {
+        var r = this.questCraft!.Step(ctx);
+        this.Status = this.questCraft.Status;
+        if (r == TaskResult.Running)
+            return TaskResult.Running;
+        var failed = r == TaskResult.Failed ? this.questCraft.FailReason : null;
+        this.questCraft.Cleanup(ctx);
+        this.questCraft = null;
+        if (failed != null)
+            return this.Fail(failed);
+
+        this.started = false;
+        this.notRunningFrames = 0;
+        this.NextPhase("Questionable に戻します");
+        return TaskResult.Running;
     }
 
     /// <summary>
@@ -418,6 +607,7 @@ public sealed unsafe class QuestTask : AutoTask
                     this.own.Dequeue();
                     continue;
                 case "Interact":
+                case "AcceptQuest":
                 case "CompleteQuest":
                     this.own.Dequeue();
                     this.ownTask = new NpcStepTask(step, this.quest.RowId);
@@ -526,11 +716,15 @@ public sealed unsafe class QuestTask : AutoTask
 
         if (this.interactions >= MaxInteractions)
             return this.Fail($"報告先の {npc.Name} に {MaxInteractions} 回話しかけても、クエストが完了しません");
+        if (++this.interactAttempts > MaxInteractions * 3)
+            return this.Fail($"報告先の {npc.Name} に話しかけられません（{this.interactAttempts - 1} 回試して受け付けられませんでした）。距離・壁・高低差を確認してください");
 
+        // 着いた後は視線判定なし（Questionable と同じ）。話しかけた回数は受け付けられたときだけ数える
+        // （ターゲットを合わせただけの呼び出しを数えると、上限の文言が実際とずれた）
         this.interactedAt = DateTime.UtcNow;
-        this.interactions++;
-        if (GameUi.Interact(npc, checkLineOfSight: true))
+        if (GameUi.Interact(npc))
         {
+            this.interactions++;
             this.manualInteractionAt = this.interactedAt;
             this.selectedMenu = null;
         }
@@ -544,6 +738,10 @@ public sealed unsafe class QuestTask : AutoTask
         this.moving = null;
         this.ownTask?.Cleanup(ctx);
         this.ownTask = null;
+        this.lv1Equip?.Cleanup(ctx);
+        this.lv1Equip = null;
+        this.questCraft?.Cleanup(ctx);
+        this.questCraft = null;
 
         // 自分が始めた進行（または別のクエストへ移ったのを見た進行）がまだ動いていれば止め、Questionable の優先リストを元に戻す
         this.starter.Cleanup(ctx);

@@ -158,7 +158,7 @@ public static class CharacterReport
             }
         });
 
-        Add("秘伝書（8職のジョブクエ Lv60 までで要るもの）", lines =>
+        Add("秘伝書（8職のジョブクエ Lv70 までで要るもの）", lines =>
         {
             if (data.AllBooks == null)
             {
@@ -198,7 +198,7 @@ public static class CharacterReport
                 : new ReportLine(Severity.Ok, $"納品・交換に使う街：{TeleportTask.TerritoryName(town.Value.Collect.Territory)}"));
         });
 
-        Add("ジョブクエの進み具合（Lv60 まで）", lines =>
+        Add("ジョブクエの進み具合（Lv70 まで）", lines =>
         {
             if (data.Quests == null)
             {
@@ -206,7 +206,8 @@ public static class CharacterReport
                 return;
             }
 
-            foreach (var job in Jobs.Crafters)
+            // 採集3職も出す（以前は製作8職だけだった）
+            foreach (var job in Jobs.QuestJobs)
             {
                 var qs = data.Quests.Quests.Where(q => q.ClassJobId == job).ToList();
                 var done = qs.Count(q => QuestManager.IsQuestComplete(q.RowId));

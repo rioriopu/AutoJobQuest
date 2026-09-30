@@ -146,6 +146,13 @@ public static class Unlocks
                     return false;
             }
 
+            // 受注の場面で台本が完了を確かめるクエスト（シートの前提の欄に出ない。彫金 Lv63 ← その声に押されて 等6本：MainQuestGate の規則B）
+            foreach (var r in MainQuestGate.AcceptRequirements(id))
+            {
+                if (!Visit(r, depth + 1))
+                    return false;
+            }
+
             order.Add(id); // 前提を先に入れてから自分（＝古い順）
             return true;
         }

@@ -43,11 +43,14 @@ public sealed class Services : IDisposable
     private DateTime nextJournalRestore = DateTime.MinValue;
     private DateTime nextHeartbeat = DateTime.MinValue;
 
-    public Services(Configuration config, RunLog log)
+    /// <summary>ログインしているキャラクターが替わった（設定の中身を入れ替えた後）。画面の控えを消すのに使う。</summary>
+    public event Action? CharacterChanged;
+
+    public Services(Configuration config, RunLog log, string? logDirectory)
     {
         this.Config = config;
         this.Log = log;
-        this.Debug = new DebugLog(config.LogDirectory);
+        this.Debug = new DebugLog(logDirectory);
         this.GbrReflection = new GbrReflection();
 
         this.Ctx = new TaskContext
@@ -123,22 +126,122 @@ public sealed class Services : IDisposable
         };
 
         this.addonRecorder = new Automation.AddonRecorder(() => this.Runner.IsRunning || this.Config.AlwaysRecordAddons);
+    }
 
+    /// <summary>
+    /// ログインしているキャラクターを毎フレーム見て、替わったら設定の中身を入れ替える。
+    /// 知らせ（Login・Logout）に頼らず状態で見る（ログインした後に読み込んだときも、同じ形で読み込める）。
+    /// 替わる前に：実行中なら止める（前のキャラクターの控えに書いてから切り替えるため）。前のキャラクターで他のプラグインに頼んだことの
+    /// 戻し（RSR・GBR・Artisan・AutoRetainer。どれもこのゲームの中の状態）を1回ずつ試し、戻しきれなければ知らせる
+    /// （控えは前のキャラクターのファイルに残り、そのキャラクターでログインし直すと戻す）。
+    /// </summary>
+    private void WatchCharacter()
+    {
+        var id = Svc.ClientState.IsLoggedIn ? Svc.PlayerState.ContentId : 0UL;
+        if (id == this.Config.OwnerContentId)
+            return;
+
+        var before = this.Config.OwnerContentId;
+        var beforeName = this.Config.CharacterName;
+        if (before != 0)
+        {
+            if (this.Runner.IsRunning)
+                this.Runner.StopNow(id == 0 ? "ログアウト" : "キャラクターの切り替え");
+            this.Inspection?.Dispose();
+            this.Inspection = null;
+            this.InspectionRequested = false;
+
+            var left = this.RestoreBeforeSwitch();
+            if (left.Count > 0)
+            {
+                var msg = $"{beforeName} で他のプラグインに頼んだことのうち、戻しきれていないものがあります：{string.Join("、", left)}。"
+                          + $"{beforeName} でログインし直すと、こちらで戻します";
+                this.Log.Warn("設定", msg);
+                Svc.Chat.Print($"[AutoJobQuest] {msg}");
+            }
+        }
+
+        var name = id != 0 ? Svc.PlayerState.CharacterName : string.Empty;
+        var world = id != 0 ? Svc.PlayerState.HomeWorld.ValueNullable?.Name.ExtractText() ?? string.Empty : string.Empty;
+        var note = this.Config.SwitchTo(id, name, world);
+        this.Debug.SetCharacter(id != 0 ? name : null);
+        this.Debug.Line("設定", id != 0
+            ? $"{name}（{world}）の設定を読みました（{Core.CharacterConfigStore.PathFor(System.IO.Path.Combine(Svc.PluginInterface.ConfigDirectory.FullName, "characters"), id)}）"
+            : "ログアウトしました。設定は既定の値に戻し、ログインするまで保存しません");
+        if (note != null)
+        {
+            this.Log.Warn("設定", note);
+            Svc.Chat.Print($"[AutoJobQuest] {note}");
+        }
+
+        this.nextRetainerRestore = DateTime.MinValue;
+        this.nextLeftoverTry = DateTime.MinValue;
+        this.nextRsrLeftoverTry = DateTime.MinValue;
+        this.nextConsumableTry = DateTime.MinValue;
+        this.nextJournalRestore = DateTime.MinValue;
+        this.CharacterChanged?.Invoke();
+        if (id != 0)
+            this.AfterCharacterLoaded();
+    }
+
+    /// <summary>
+    /// キャラクターを切り替える前に、他のプラグインに頼んだことの戻しを1回ずつ試す。戻しきれなかったものの名前を返す。
+    /// ジャーナルの非表示とマーケットの購入の控えはキャラクターのものなので、ここでは扱わない（そのキャラクターでログインしたときに扱う）。
+    /// </summary>
+    private List<string> RestoreBeforeSwitch()
+    {
+        this.Safe("RSR の戻し", () =>
+        {
+            if (this.Ctx.Rotation.RestorePending && this.Ctx.Rotation.IsLoaded && this.Ctx.Rotation.RestoreLeftover() is { } done)
+                this.Log.Write("RSR", done);
+        });
+        this.Safe("GBR の戻し", () =>
+        {
+            if (this.Ctx.Gbr.HasLeftovers)
+                this.Ctx.Gbr.RestoreIfIdle(this.Ctx.GatherBuddy.IsAutoGatherEnabled(), this.Ctx.Gbr.VendorIsBusy());
+        });
+        this.Safe("Artisan の食事・薬の戻し", () =>
+        {
+            if (this.Config.ArtisanTempConsumableRecipes.Count > 0 && this.Ctx.Artisan.IsLoaded && this.Ctx.Artisan.IsBusy() == false)
+                this.Ctx.Artisan.RestoreLeftoverConsumables(this.Config);
+        });
+        this.Safe("AutoRetainer の一時停止の戻し", () =>
+        {
+            if (this.Config.RetainerSuppressionPendingRestore && !Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.OccupiedSummoningBell])
+                this.retainerControl.Release(this.Config);
+        });
+
+        var left = new List<string>();
+        if (this.Ctx.Rotation.RestorePending)
+            left.Add("RSR のモード・範囲攻撃の設定");
+        if (this.Ctx.Gbr.HasLeftovers)
+            left.Add("GBR の設定・自動採集リスト");
+        if (this.Config.ArtisanTempConsumableRecipes.Count > 0)
+            left.Add($"Artisan の食事・薬の一時指定（{this.Config.ArtisanTempConsumableRecipes.Count} レシピ）");
+        if (this.Config.RetainerSuppressionPendingRestore)
+            left.Add("AutoRetainer の一時停止");
+        return left;
+    }
+
+    /// <summary>キャラクターの設定を読んだ後にすること。</summary>
+    private void AfterCharacterLoaded()
+    {
         // 前の読み込みを解除（更新・無効化）で止めたとき、Artisan の見張りが残っていたなら置き直す
         // （解除の後はフレームが来ないので見張れなかった。見張りが終わるまで開始は受け付けない：Runner.StartBlocker）。
         // 置き直すのは、元の見張りの期限（控えてある）までの残りだけ。長く置くと、その間に利用者が
         // 自分で始めた Artisan の製作まで止めてしまう（以前は5分以内なら30秒置き直していた）
-        if (config.PendingArtisanWatchUtc is { } pending)
+        if (this.Config.PendingArtisanWatchUtc is { } pending)
         {
-            config.PendingArtisanWatchUtc = null;
-            config.Save();
+            this.Config.PendingArtisanWatchUtc = null;
+            this.Config.Save();
             var left = pending - DateTime.UtcNow;
             if (left > ArtisanWatchLength)
                 left = ArtisanWatchLength; // 控えが壊れていても30秒より長くしない
             if (left > TimeSpan.Zero)
             {
+                this.Ctx.AfterStop.RemoveAll(a => a.Name == Automation.CraftOneTask.ArtisanWatchName);
                 this.Ctx.AfterStop.Add(Automation.CraftOneTask.ArtisanStopWatch(this.Ctx.Artisan, left));
-                log.Write("見張り", $"前の読み込みで止めた Artisan の製作が遅れて始まらないか、残りの {left.TotalSeconds:0} 秒見張ります");
+                this.Log.Write("見張り", $"前の読み込みで止めた Artisan の製作が遅れて始まらないか、残りの {left.TotalSeconds:0} 秒見張ります");
             }
         }
     }
@@ -153,6 +256,9 @@ public sealed class Services : IDisposable
     {
         // 経路探索を「頼んだのと同じフレームで取り消さない」ためのフレームの番号（OwnPath）
         Automation.OwnPath.Frame++;
+
+        // ログインしているキャラクターが替わったら、設定の中身を入れ替える
+        this.WatchCharacter();
         if (this.Runner.IsRunning)
         {
             this.Inspection?.Dispose();
@@ -170,10 +276,25 @@ public sealed class Services : IDisposable
             this.Inspection?.Tick(this.Ctx);
         }
 
-        if (!this.Runner.IsRunning && this.Config.RetainerSuppressionPendingRestore && DateTime.UtcNow >= this.nextRetainerRestore)
+        // 呼び鈴が開いている間は、AutoRetainer の一時停止の控えの期限を数えない（期限は呼び鈴が閉じてから数える。
+        // 以前はこちらが立てた時刻から数えたので、止まった後に呼び鈴が10分以上開いたままだと、自分で立てた一時停止を戻さなかった。
+        // 呼び鈴が開いている間は、ほかのプラグインも呼び鈴の操作を始めないので、この間を数えなくても取り違えは増えない）
+        if (this.Config.RetainerSuppressionPendingRestore && Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.OccupiedSummoningBell]
+            && DateTime.UtcNow - this.Config.RetainerSuppressionSetAt > TimeSpan.FromSeconds(30))
+        {
+            this.Config.RetainerSuppressionSetAt = DateTime.UtcNow;
+            this.Config.Save();
+        }
+
+        // AutoRetainer の一時停止の戻しの控え（呼び鈴を閉じてから戻す。開いたまま戻すと AutoRetainer が呼び鈴で動き出す）。
+        // 期限を過ぎた控えは、ほかのプラグインの一時停止を外さないよう戻しを送らずに消し、まだ立っていれば知らせる
+        if (!this.Runner.IsRunning && this.Config.RetainerSuppressionPendingRestore && DateTime.UtcNow >= this.nextRetainerRestore
+            && !Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.OccupiedSummoningBell])
         {
             this.nextRetainerRestore = DateTime.UtcNow.AddSeconds(10);
-            this.retainerControl.Release(this.Config);
+            if (this.retainerControl.RetryRelease(this.Config))
+                Svc.Chat.Print("[AutoJobQuest] 前回こちらが立てた AutoRetainer の一時停止（抑制）を、10分たっても戻せませんでした。"
+                               + "ほかのプラグインが立てたものかもしれないので、こちらからは外しません。AutoRetainer が動かないときは、AutoRetainer を読み込み直してください");
         }
 
         // GBR の一時変更（リスト・設定）が残っていれば、こちらが止まっていて GBR も止まっている間に戻す。
@@ -377,6 +498,11 @@ public sealed class Services : IDisposable
                     Svc.Chat.Print("[AutoJobQuest] Artisan の食事・薬は復元待ちです。次回読み込み時に再試行します");
             });
         }
+
+        // こちらが立てた AutoRetainer の一時停止は、読み込みの解除のときに戻す（呼び鈴を開いたまま解除されると、
+        // 後始末は呼び鈴が閉じるまで戻さないので、控えが残って AutoRetainer が止まったままになっていた。
+        // 解除した後はこちらが呼び鈴を操作しないので、AutoRetainer が動き出しても取り合わない）
+        this.Safe("AutoRetainer の一時停止を戻す", () => this.retainerControl.Release(this.Config));
 
         // 他プラグインの状態（GBR の ON/OFF・リスト・Questionable 等）は、上の停止の後始末でしか触らない。
         // 停止要求の共有データ（YesAlready）は自分の要求を外して手放す（残すと相手が止まったままになる）。

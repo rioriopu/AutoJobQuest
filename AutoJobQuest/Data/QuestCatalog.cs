@@ -22,6 +22,22 @@ public sealed record QuestItemReq(uint ItemId, int Count, bool Hq, string Eviden
 /// </summary>
 public sealed record QuestHandover(byte Seq, byte Todo, uint Npc, IReadOnlyList<uint> Items);
 
+/// <summary>
+/// 受注した後に、クエストがくれる材料から作る品（Lv61〜70 の製作職のジョブクエ：各職4本・計32本）。
+/// 材料（「〇〇の材料」）は受注後に NPC からもらう取引できない品で、レシピはクエスト専用（材料1個＋クリスタル）。納品は HQ が要る。
+/// </summary>
+/// <param name="RecipeId">レシピ。</param>
+/// <param name="ItemId">作る品（納品物）。</param>
+/// <param name="Count">納品する数。</param>
+/// <param name="Hq">HQ 指定か。</param>
+/// <param name="Crafts">作る回数（出来高で割った数）。</param>
+/// <param name="Prepared">事前に用意する材料（1回分。クリスタルなど、クエストがくれない品）。</param>
+/// <param name="Materials">クエストがくれる材料（取引できない品）。</param>
+/// <param name="Giver">材料をくれる相手（無くしたときに話しかけると、もう一度くれる。0 なら分からない）。</param>
+/// <param name="GiverSeq">その相手のいる段。</param>
+public sealed record QuestCraft(uint RecipeId, uint ItemId, int Count, bool Hq, int Crafts,
+    IReadOnlyList<(uint Item, int Amount)> Prepared, IReadOnlyList<uint> Materials, uint Giver, byte GiverSeq);
+
 /// <summary>マテリア装着の条件。</summary>
 /// <param name="TargetItemId">マテリアを付けるアイテム。</param>
 /// <param name="MateriaItemId">指定のマテリア。null なら種類不問。</param>
@@ -63,6 +79,16 @@ public sealed class JobQuest
     /// 同じ段で複数の相手に渡すクエスト（Q65601 段2・Q65677 段2）で、どの相手に渡し済みかを見て、残りの相手の品だけを用意するのに使う。
     /// </summary>
     public IReadOnlyList<QuestHandover> Handovers { get; init; } = [];
+
+    /// <summary>
+    /// 受注した後にしか手に入らない納品物（取引できない品）。事前に用意しない・所持を確かめない。
+    /// ゲームデータの調査：Lv1〜60 の納品物に取引できない品は0件、Lv61〜70 は76品すべて取引できない
+    /// （製作の完成品32・クエストがくれる材料32・採集品12）。取引できるかだけで完全に分かれる。
+    /// </summary>
+    public IReadOnlySet<uint> AfterAcceptItems { get; init; } = new HashSet<uint>();
+
+    /// <summary>受注後にクエストの材料から作る品（Lv61〜70 の製作職）。</summary>
+    public IReadOnlyList<QuestCraft> QuestCrafts { get; init; } = [];
 
     /// <summary>画面・記録用の短い表記。</summary>
     public override string ToString() => $"Lv{this.Level} {this.Name}";
@@ -121,6 +147,13 @@ public sealed class QuestCatalog
         var notes = new List<string>();
         var quests = Svc.Data.GetExcelSheet<Quest>();
         var questsJa = Svc.Data.GetExcelSheet<Quest>(ClientLanguage.Japanese);
+
+        // 受注後に作る品のレシピを引くための索引（完成品 → レシピ）
+        var itemSheet = Svc.Data.GetExcelSheet<Item>();
+        var recipesByResult = Svc.Data.GetExcelSheet<Recipe>()
+            .Where(r => r.RowId != 0 && r.ItemResult.RowId != 0)
+            .GroupBy(r => r.ItemResult.RowId)
+            .ToDictionary(g => g.Key, g => g.ToList());
 
         // マテリアとみなすアイテム（Materia シートの Item 列に載っているもの）
         var materiaItems = new HashSet<uint>();
@@ -190,6 +223,10 @@ public sealed class QuestCatalog
             var (firstSeq, lastSeq) = FindItemSeqs(q, texts, ritems, notes);
             var handovers = FindHandovers(q, texts, ritems);
 
+            // 受注後にしか手に入らない品（取引できない納品物）と、その中でクエストの材料から作る品
+            var afterAccept = ritems.Distinct().Where(it => itemSheet.TryGetRow(it, out var row) && row.IsUntradable).ToHashSet();
+            var questCrafts = FindQuestCrafts(q, job, items, afterAccept, recipesByResult, notes);
+
             var name = questsJa.TryGetRow(q.RowId, out var ja) ? ja.Name.ExtractText() : q.Name.ExtractText();
             result.Add(new JobQuest
             {
@@ -202,6 +239,8 @@ public sealed class QuestCatalog
                 FirstItemSeq = firstSeq,
                 LastItemSeq = lastSeq,
                 Handovers = handovers,
+                AfterAcceptItems = afterAccept,
+                QuestCrafts = questCrafts,
             });
         }
 
@@ -212,6 +251,14 @@ public sealed class QuestCatalog
             .ToList();
 
         return new QuestCatalog(result, notes);
+    }
+
+    /// <summary>クエスト本文シート（日本語。鍵と本文〔マクロ込み〕の組）。読めなければ空。</summary>
+    public static List<KeyValuePair<string, string>> ReadQuestText(uint rowId)
+    {
+        if (!Svc.Data.GetExcelSheet<Quest>().TryGetRow(rowId, out var q))
+            return [];
+        return ReadQuestText(q.Id.ExtractText(), [], rowId);
     }
 
     /// <summary>
@@ -403,13 +450,67 @@ public sealed class QuestCatalog
                 return new MateriaReq(target, materiaItems.Contains(materiaId) ? materiaId : null);
         }
 
-        // 形が読めなければ、装備品（マテリア穴のあるもの）を対象にする
+        // 形が読めなければ、装備品（マテリア穴のあるもの）を対象にする。納品物の無いクエスト（採集職の導入など）では付ける品が無い
+        // （以前は範囲外の添字で一覧全体が作れなくなりえた）
+        if (ritems.Count == 0)
+            return null;
         var items = Svc.Data.GetExcelSheet<Item>();
         var equip = ritems.FirstOrDefault(x => items.TryGetRow(x, out var r) && r.MateriaSlotCount > 0);
         if (equip == 0)
             equip = ritems[0];
 
         return new MateriaReq(equip, inText.Count == 1 ? inText[0] : null);
+    }
+
+    /// <summary>
+    /// 受注後にクエストの材料から作る品（Lv61〜70 の製作職）。取引できない納品物のうち、その職のレシピがあるもの。
+    /// レシピの材料のうち、ほかの取引できない納品物（クエストがくれる材料）を除いた品（クリスタル）が、事前に用意する品。
+    /// 材料をくれる相手：品を受け取る相手（ItemBool）と同じ段・同じ手順番号で、品を受け取らない相手（32本すべてで本文の名前と一致）。
+    /// </summary>
+    private static List<QuestCraft> FindQuestCrafts(Quest q, uint job, List<QuestItemReq> items, HashSet<uint> afterAccept,
+        Dictionary<uint, List<Recipe>> recipesByResult, List<string> notes)
+    {
+        var result = new List<QuestCraft>();
+        if (!Jobs.IsCrafter(job) || afterAccept.Count == 0)
+            return result;
+
+        foreach (var req in items.Where(i => afterAccept.Contains(i.ItemId)))
+        {
+            if (!recipesByResult.TryGetValue(req.ItemId, out var recipes))
+                continue;
+            var recipe = recipes.FirstOrDefault(r => Jobs.CraftTypeToClassJob(r.CraftType.RowId) == job);
+            if (recipe.RowId == 0)
+            {
+                notes.Add($"Quest {q.RowId}: 受注後に作る品 {req.ItemId} の {Jobs.Name(job)} のレシピが見つかりません");
+                continue;
+            }
+
+            var ingredients = CraftPlanner.Ingredients(recipe).ToList();
+            var materials = ingredients.Where(x => afterAccept.Contains(x.Item)).Select(x => x.Item).ToList();
+            var prepared = ingredients.Where(x => !afterAccept.Contains(x.Item)).ToList();
+            var yield = Math.Max(1, (int)recipe.AmountResult);
+            var crafts = (req.Count + yield - 1) / yield;
+
+            // 材料をくれる相手（品を受け取る相手と同じ段・同じ手順番号で、品を受け取らない相手）
+            uint giver = 0;
+            byte giverSeq = 0;
+            foreach (var receiver in q.QuestListenerParams.Where(l => l.ItemBool && l.Listener != 0))
+            {
+                var g = q.QuestListenerParams.FirstOrDefault(l => !l.ItemBool && l.Listener != 0
+                    && l.ActorSpawnSeq == receiver.ActorSpawnSeq && l.ActorDespawnSeq == receiver.ActorDespawnSeq);
+                if (g.Listener == 0)
+                    continue;
+                giver = g.Listener;
+                giverSeq = g.ActorSpawnSeq;
+                break;
+            }
+
+            if (giver == 0)
+                notes.Add($"Quest {q.RowId}: 受注後に作る品 {req.ItemId} の材料をくれる相手が見つかりません（HQ にならなかったときの作り直しはできません）");
+            result.Add(new QuestCraft(recipe.RowId, req.ItemId, req.Count, req.Hq, crafts, prepared, materials, giver, giverSeq));
+        }
+
+        return result;
     }
 
     private static int ZenToInt(string s)

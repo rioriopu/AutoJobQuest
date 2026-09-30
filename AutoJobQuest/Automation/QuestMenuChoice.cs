@@ -6,6 +6,9 @@ namespace AutoJobQuest.Automation;
 /// <summary>クエスト名の完全一致が1件だけあるときに選ぶ。装飾は読出し側のSeString展開で除く。</summary>
 public static class QuestMenuChoice
 {
+    /// <summary>選択肢を送ってから、窓が閉じるのを待つ上限。</summary>
+    public static readonly TimeSpan SentLimit = TimeSpan.FromSeconds(5);
+
     /// <summary>自分の話しかけ以降の窓だけを操作する。1つの窓・内容・生成時刻につき1回だけ送る。</summary>
     public static unsafe bool Handle(Core.TaskContext ctx, uint quest, DateTime interactedAt, ref string? selected, out string? failure)
     {
@@ -29,15 +32,21 @@ public static class QuestMenuChoice
             return true;
         }
         var signature = $"{(nint)menu}|{opened.Value.Ticks}|{string.Join("|", entries)}";
-        if (selected == signature)
-            return true;
-        if (!ctx.TextAdvance.EnsureTurnInControl())
+        // 送った窓（控えは「署名@送った時刻」）。同じ窓が上限を過ぎても開いたままなら、理由を出して止める
+        // （以前は理由を出さずに、クエストの上限の10〜30分まで待ち続けた。上限は送りすぎを防ぐためで、進む条件は窓が閉じたか）
+        if (selected is { } sent && sent.StartsWith(signature + "@", StringComparison.Ordinal))
         {
-            failure = "会話の操作権が失われたため止めました";
+            if (long.TryParse(sent[(signature.Length + 1)..], out var at) && DateTime.UtcNow - new DateTime(at, DateTimeKind.Utc) > SentLimit)
+                failure = $"選択肢「{entries[Unique(entries, Data.Unlocks.QuestName(quest)) is var i and >= 0 ? i : 0]}」を送りましたが、{SentLimit.TotalSeconds:0} 秒たっても窓が閉じません";
+            return true;
+        }
+        if (!ctx.TextAdvance.VerifyTurnInControlNow())
+        {
+            failure = $"会話の操作権が失われたため止めました（{ctx.TextAdvance.LossReason ?? "理由を読めません"}）";
             return true;
         }
         GameUi.Fire(menu, true, index);
-        selected = signature;
+        selected = $"{signature}@{DateTime.UtcNow.Ticks}";
         ctx.Log.Write("クエスト", $"選択肢「{entries[index]}」を選びました。段の変化を待ちます");
         return true;
     }

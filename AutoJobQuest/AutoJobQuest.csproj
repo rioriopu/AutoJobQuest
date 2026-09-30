@@ -9,7 +9,7 @@
     <Version>0.1.0.0</Version>
     <RootNamespace>AutoJobQuest</RootNamespace>
     <AssemblyName>AutoJobQuest</AssemblyName>
-    <Description>製作系ジョブクエ（Lv1〜60）の素材集め・製作・マテリア装着・クエスト進行を自動で行う</Description>
+    <Description>製作系・採集系のジョブクエ（Lv1〜70）の素材集め・製作・マテリア装着・クエスト進行を自動で行う</Description>
     <Authors>rioriopu</Authors>
   </PropertyGroup>
 

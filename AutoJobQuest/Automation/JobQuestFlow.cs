@@ -12,8 +12,11 @@ namespace AutoJobQuest.Automation;
 /// <summary>
 /// 全体の流れ。
 ///
-///   ① ゲームデータの読み込みを待つ
+///   ① ゲームデータの読み込みを待つ。選んだ職のジョブクエに要るメインクエストが未完了なら始めない
 ///   ② 事前点検（レベル・装備・プラグイン等）。動作保証外の項目があれば確認窓を出す
+///   ②" 区切り（鞄があふれないよう、職ごとに。見積もりが鞄の空きに入らなければ、その職の前から何本かに縮める）。
+///      区切りごとに ②r〜⑧ を行い、終わったら次の区切りへ
+///   ②r 呼び鈴でリテイナーの在庫を読み、区切りに要る分を引き出す（事前点検と確認の後。何も集め・作らない区切りでは行かない）
 ///   ②' 機能の解放：マテリア装着（付けるマテリアが残っていれば必須）・精選（霊砂を精選で集める計画なら）が
 ///      未解放なら、解放クエストを Questionable で進める（前提のメインクエスト等が未完了なら自動では進めない）
 ///   ③ 秘伝書が要るか調べる（要るなら、紫貨のための収集品の個数を逆算して素材の計画に足す）
@@ -29,9 +32,10 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
     private enum Stage
     {
         WaitData,
-        Retainers,
         Preflight,
         WaitPreflightAnswer,
+        NextBatch,
+        Retainers,
         Unlock,
         WaitSwitchAnswer,
         BookPrep,
@@ -46,6 +50,10 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
 
     private readonly bool[] selected;
     private Stage stage = Stage.WaitData;
+
+    // 今の区切りのジョブクエ。null の間は選んだ職の残り全部（事前点検で使う）
+    private HashSet<uint>? batch;
+    private int batchNo;
     private AutoTask? child;
     private int confirmTicket = -1;
     // 周回の上限（素材集め・製作）。決まりは RoundPolicy に1か所でまとめ、ゲームなしで試している（検証の仕組み）。
@@ -62,8 +70,11 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
     private readonly Dictionary<uint, HashSet<Route>> excluded = [];
 
     // 採集・戦闘などで集めきれず、マーケット購入への切り替えを利用者が「はい」と答えた品目
-    private readonly HashSet<uint> marketSwitchApproved = [];
-    private List<uint> pendingSwitch = [];
+    // マーケットへの切り替えを了承された品と、了承した数の合計（区切りごとに聞き直す。了承した数を超えたら聞き直す）。
+    // 比べるのは、この区切りでその品を買いに行った数の合計（以前はその周回の不足数と比べたので、作り直しのたびに聞かずに買った）
+    private readonly Dictionary<uint, int> marketSwitchApproved = [];
+    private readonly Dictionary<uint, int> marketSwitchUsed = [];
+    private List<(uint Item, int Need)> pendingSwitch = [];
 
     // 今の周回で作った作業（終わったあとに失敗した品目を集めるため）
     private readonly List<AutoTask> roundTasks = [];
@@ -112,8 +123,12 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         MarketBoardTask.SpentThisRun = 0;
         MarketBoardTask.RunApprovedUpTo = Math.Max(0, ctx.Config.ConfirmRunTotalAboveGil);
         Unlocks.GaveUp.Clear();
+
+        // ギアセットの品を守る数は、始めに手持ちにあった分まで
+        Inventory.GearsetKeepCap = Inventory.GearsetKeepInBags();
         this.rounds = new RoundPolicy(ctx.Config.MaxRetryRounds + 2, ctx.Config.MaxRetryRounds + 4);
         this.hqFailures = new HqFailureTally(ctx.Config.MaxRetryRounds);
+        PlanBuilder.QuestCraftSpare = Math.Max(0, ctx.Config.MaxRetryRounds);
         Unlocks.UnlockStagePassed = false;
         ctx.Data.EnsureBuilding();
         return TaskResult.Running;
@@ -193,8 +208,11 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
                     return this.Elapsed > TimeSpan.FromMinutes(3) ? this.Fail("ゲームデータの読み込みが終わりません") : TaskResult.Running;
                 }
 
-                this.stage = Stage.Retainers;
-                this.child = new RetainerStockTask(() => this.Plan(ctx));
+                // 選んだ職のジョブクエ（Lv70 まで）に要るメインクエストが未完了なら始めない（画面の開始ボタンと同じ判定）
+                if (MainQuestGate.StartProblem(ctx.Data, this.selected) is { } msqProblem)
+                    return this.Fail(msqProblem);
+
+                this.stage = Stage.Preflight;
                 return TaskResult.Running;
 
             case Stage.Preflight:
@@ -208,7 +226,8 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
                 if (ans == false)
                     return this.Fail("事前点検の確認で「いいえ」が選ばれました");
 
-                if (this.hqCheck?.IsCurrent() != true || this.preflightPlan == null
+                // HQ の見込みを計算できなかったとき（注意として確認済み）は、その照合はしない
+                if ((this.hqCheck?.Error == null && this.hqCheck?.IsCurrent() != true) || this.preflightPlan == null
                     || PreflightSession.PlanKey(this.preflightPlan) != PreflightSession.PlanKey(this.Plan(ctx)))
                     return this.Fail("確認待ちの間に HQ 計算の条件が変わりました。もう一度開始して点検し直してください");
 
@@ -220,9 +239,15 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
                     ctx.Config.Save();
                 }
 
-                this.stage = Stage.Unlock;
+                this.stage = Stage.NextBatch;
                 return TaskResult.Running;
             }
+
+            case Stage.NextBatch:
+                return this.StartNextBatch(ctx);
+
+            case Stage.Retainers:
+                return this.StartRetainers(ctx);
 
             case Stage.Unlock:
                 return this.StartUnlock(ctx);
@@ -234,9 +259,9 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
                     return TaskResult.Running;
                 if (ans == false)
                     return this.Fail("マーケット購入への切り替えの確認で「いいえ」が選ばれました");
-                foreach (var id in this.pendingSwitch)
-                    this.marketSwitchApproved.Add(id);
-                ctx.Log.Write("素材", $"マーケット購入への切り替えが了承されました：{string.Join("、", this.pendingSwitch.Select(CraftPlanner.ItemName))}");
+                foreach (var (id, need) in this.pendingSwitch)
+                    this.marketSwitchApproved[id] = this.marketSwitchUsed.GetValueOrDefault(id) + need;
+                ctx.Log.Write("素材", $"マーケット購入への切り替えが了承されました：{string.Join("、", this.pendingSwitch.Select(p => $"{CraftPlanner.ItemName(p.Item)}×{p.Need}"))}");
                 this.pendingSwitch = [];
                 this.stage = Stage.Acquire;
                 return TaskResult.Running;
@@ -270,7 +295,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         return TaskResult.Running;
     }
 
-    private JobQuestPlan Plan(TaskContext ctx) => PlanBuilder.Build(ctx.Data, this.selected, this.excluded);
+    private JobQuestPlan Plan(TaskContext ctx) => PlanBuilder.Build(ctx.Data, this.selected, this.excluded, this.batch);
 
     /// <summary>前提が未達で外したクエストを残して終わったか（結果の分類）。</summary>
     public bool HasExclusions { get; private set; }
@@ -328,7 +353,111 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
             return TaskResult.Running;
         }
 
-        this.stage = Stage.Unlock;
+        this.stage = Stage.NextBatch;
+        return TaskResult.Running;
+    }
+
+    // ------------------------------------------------------------------
+    // ②" 区切り（全11職を選ぶと鞄があふれるので、職ごとに区切って進める）
+
+    /// <summary>
+    /// 次の区切りを決める。選んだ職の並び（木工→…→漁師）で、残りのジョブクエがある最初の職を取り、その職の残りを前から順に入れる。
+    /// 見積もり（<see cref="BagEstimate"/>）が鞄の空き（設定の「残しておく空き」を除く）に入らなければ、本数を半分ずつに縮める。
+    /// 1本でも入らなければ、正しい理由（鞄の空き）を出して止める（以前は時間切れや別の理由で止まった）。
+    /// 区切りが変わるたびに、周回の数・秘伝書の段・機能の解放の段をやり直す。
+    /// </summary>
+    private TaskResult StartNextBatch(TaskContext ctx)
+    {
+        this.batch = null;
+        var all = this.Plan(ctx);
+        if (all.NothingToDo)
+        {
+            // 前提が未達で飛ばしたクエストがあれば、終わりに改めて知らせる。
+            // 結果は「前提未達のため一部除外して完了」になる
+            var blockedLines = all.BlockedSummary();
+            this.HasExclusions = blockedLines.Count > 0;
+            foreach (var line in blockedLines)
+            {
+                ctx.Log.Warn("クエスト", $"前提のクエストが未完了のため進めていません：{line}");
+                Svc.Chat.Print($"[AutoJobQuest] 前提のクエストが未完了のため進めていません：{line}");
+            }
+
+            this.stage = Stage.Done;
+            return TaskResult.Running;
+        }
+
+        var room = Inventory.FreeBagSlots() - ctx.Config.KeepFreeBagSlots;
+        var chosen = BatchSizing.Choose(Jobs.QuestJobs, all.RemainingQuests, ids =>
+        {
+            var plan = PlanBuilder.Build(ctx.Data, this.selected, this.excluded, ids);
+            return BagEstimate.Slots(plan.Craft, BagEstimate.RewardSlots(plan.RemainingQuests), plan.Craft.LockedBySecretBook.Count > 0);
+        }, room)!.Value;
+        var job = chosen.Job;
+        var quests = all.RemainingQuests.Where(q => q.ClassJobId == job).ToList();
+        var n = chosen.Count;
+        var need = chosen.Need;
+        if (!chosen.Fits)
+            return this.Fail($"鞄の空きが足りません（{Jobs.Name(job)} {quests[0]} に要る見積もり {need} 枠・使える空き {Math.Max(0, room)} 枠"
+                             + $"〔空き {Inventory.FreeBagSlots()} 枠から、残しておく空き {ctx.Config.KeepFreeBagSlots} 枠を除く〕）。"
+                             + "報酬の装備や余った素材を整理して鞄を空けてから、もう一度開始してください（続きから進みます）。残しておく空きは設定タブで減らせます");
+        this.batch = quests.Take(n).Select(q => q.RowId).ToHashSet();
+
+        this.batchNo++;
+        var inBatch = quests.Take(n).ToList();
+        ctx.Log.Write("計画", $"区切り {this.batchNo}：{Jobs.Name(job)} の {inBatch.First()}〜{inBatch.Last()}（{n} 本／この職の残り {quests.Count} 本）。"
+                             + $"鞄の見積もり {need} 枠・使える空き {room} 枠");
+
+        // 区切りごとにやり直すもの（周回の数・秘伝書の段・機能の解放の段・製作の打ち切り・HQ の失敗の数）
+        this.rounds = new RoundPolicy(ctx.Config.MaxRetryRounds + 2, ctx.Config.MaxRetryRounds + 4);
+        this.hqFailures = new HqFailureTally(ctx.Config.MaxRetryRounds);
+        this.books = null;
+        this.bookBuild = null;
+        this.requiredBookItems = [];
+        this.booksToBuy = [];
+        this.collectablesNeeded = 0;
+        this.booksDone = false;
+        this.booksReopened = false;
+        this.booksRound = 0;
+        this.booksCut = null;
+        this.craftCut = null;
+        this.craftTasks.Clear();
+        this.marketFailures.Clear();
+        // マーケットへの切り替えの了承は区切りごと（前の区切りで了承した品でも、この区切りの数で聞き直す）
+        this.marketSwitchApproved.Clear();
+        this.marketSwitchUsed.Clear();
+        Unlocks.UnlockStagePassed = false;
+        this.stage = Stage.Retainers;
+        return TaskResult.Running;
+    }
+
+    // ------------------------------------------------------------------
+    // ②r リテイナー（開始時にリテイナーの在庫も見る。事前点検と確認の後に行う）
+
+    /// <summary>
+    /// 区切りに要る品をリテイナーから引き出す。次のときは呼び鈴へ行かない：
+    ///  ・設定で切っている（UseRetainerStock）
+    ///  ・この区切りで集める・作る・買う品が何も無い（手持ちで足りている）
+    /// </summary>
+    private TaskResult StartRetainers(TaskContext ctx)
+    {
+        if (!ctx.Config.UseRetainerStock)
+        {
+            ctx.Log.Write("リテイナー", "設定で切っているので、リテイナーの在庫は見ません（手持ちだけで計画します）");
+            this.stage = Stage.Unlock;
+            return TaskResult.Running;
+        }
+
+        var plan = this.Plan(ctx);
+        var nothingToGet = plan.Craft.Crafts.Count == 0 && plan.Craft.RawShortfall.Count == 0
+                           && MateriaMarketNeeds(ctx.Config, plan).Count == 0 && plan.Craft.LockedBySecretBook.Count == 0;
+        if (nothingToGet)
+        {
+            ctx.Log.Write("リテイナー", "この区切りで集める・作る品は手持ちで足りているので、呼び鈴へは行きません");
+            this.stage = Stage.Unlock;
+            return TaskResult.Running;
+        }
+
+        this.child = new RetainerStockTask(() => this.Plan(ctx));
         return TaskResult.Running;
     }
 
@@ -347,7 +476,8 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         // 精選：霊砂などを精選で集められる計画なら試す（解放できなければ、霊砂はマーケットに回す。確認窓あり）
         var sources = ctx.Data.Sources!;
         var wantsReduce = plan.Craft.RawShortfall.Keys.Any(k => sources.Get(k).CanReduce && ReduceTask.UsableSources(sources, k).Count > 0);
-        if (wantsReduce && !Unlocks.IsUnlocked(Unlocks.Reduction))
+        // この実行で解放をあきらめたなら、区切りが変わってもやり直さない（計画でも精選を手段から外している）
+        if (wantsReduce && !Unlocks.IsUnlocked(Unlocks.Reduction) && !Unlocks.GaveUp.Contains(Unlocks.Reduction))
             steps.Add(_ => new UnlockFeatureTask(Unlocks.Reduction, required: false));
 
         if (steps.Count == 0)
@@ -529,11 +659,11 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         var switched = raw
             .Where(r => r.Routes.Count > 0 && r.Routes[0] == Route.MarketBoard
                         && PlanBuilder.ChooseRoutes(sourcesIdx, r.Item).FirstOrDefault() != Route.MarketBoard
-                        && !this.marketSwitchApproved.Contains(r.Item))
+                        && !MarketSwitch.Approved(this.marketSwitchApproved, this.marketSwitchUsed, r.Item, r.Need))
             .ToList();
         if (switched.Count > 0)
         {
-            this.pendingSwitch = switched.Select(r => r.Item).ToList();
+            this.pendingSwitch = switched.Select(r => (r.Item, r.Need)).ToList();
             var lines = switched.Select(r => $"・{CraftPlanner.ItemName(r.Item)}×{r.Need}（{this.WhyMarket(ctx, r.Item)}）");
             this.confirmTicket = ctx.Confirm.Ask(
                 "マーケット購入への切り替えの確認",
@@ -566,12 +696,15 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         this.roundTasks.Clear();
         var steps = new List<Func<TaskContext, AutoTask?>>();
 
-        // 1) マーケット（クリスタル・クラスター・霊砂・デミマテリラ・マテリアなど）
+        // 1) マーケット（クリスタル・クラスター・霊砂・デミマテリラ・マテリアなど）。
+        //    マテリアを先に買う（出品が無ければその場で止めるので、ほかの品にギルを使う前に止まる）
         var inv = Inventory.Snapshot();
-        var market = raw.Where(r => r.Routes[0] == Route.MarketBoard)
-            .Select(r => new MarketNeed([r.Item], r.Need, CraftPlanner.ItemName(r.Item), inv.CountAll(r.Item) + r.Need))
-            .Concat(marketMateria)
-            .ToList();
+        var market = MarketOrder(marketMateria, raw.Where(r => r.Routes[0] == Route.MarketBoard)
+            .Select(r => new MarketNeed([r.Item], r.Need, CraftPlanner.ItemName(r.Item), inv.CountAll(r.Item) + r.Need)));
+
+        // 切り替えを了承した品は、この周回で買いに行く数を足しておく（了承した数と比べる）
+        foreach (var r in raw.Where(r => r.Routes[0] == Route.MarketBoard && PlanBuilder.ChooseRoutes(sourcesIdx, r.Item).FirstOrDefault() != Route.MarketBoard))
+            this.marketSwitchUsed[r.Item] = this.marketSwitchUsed.GetValueOrDefault(r.Item) + r.Need;
         if (market.Count > 0)
             steps.Add(c => this.Track(new MarketBoardTask(market, c.MarketWatcher)));
 
@@ -594,6 +727,11 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
             // （以前は買い物や採集を済ませた後、戦闘の作業の始めで止まっていた）
             if (!ctx.Rotation.IsLoaded)
                 return this.Fail($"戦闘で集める素材（{string.Join("、", combat.Select(kv => $"{CraftPlanner.ItemName(kv.Key)}×{kv.Value}"))}）がありますが、RotationSolverReborn が読み込まれていません");
+
+            // 事前点検はリテイナーから引き出す前の計画で行うので、外部ターゲット指定を注意にとどめた場合がある。ここでもう一度確かめる
+            if (Ipc.RsrStateReader.ReadTargetFreelyOverride() != false)
+                return this.Fail($"戦闘で集める素材（{string.Join("、", combat.Select(kv => $"{CraftPlanner.ItemName(kv.Key)}×{kv.Value}"))}）がありますが、"
+                                 + "RSR の外部ターゲット指定が有効、または読めません。指定外を狙わないと確認できるまで戦闘は始められません");
 
             var combatPlan = CombatPlanner.Plan(ctx.Data.Sources!, combat, out var unreachable);
             foreach (var id in unreachable)
@@ -659,6 +797,13 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         return TaskResult.Running;
     }
 
+    /// <summary>
+    /// マーケットの買い物の並び。装着するマテリア（買えなければ止める品）を先頭にする（出品が無ければ、
+    /// ほかの品にギルを使う前に止める。試験できるように分けた）。
+    /// </summary>
+    public static List<MarketNeed> MarketOrder(IEnumerable<MarketNeed> materia, IEnumerable<MarketNeed> others)
+        => materia.Concat(others).ToList();
+
     /// <summary>本来の手段ではなくマーケットに回った理由（確認窓の文言用）。</summary>
     private string WhyMarket(TaskContext ctx, uint item)
     {
@@ -717,7 +862,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         {
             var owned = Inventory.CountNow(mid);
             if (owned < count)
-                list.Add(new MarketNeed([mid], count - owned, CraftPlanner.ItemName(mid), count));
+                list.Add(new MarketNeed([mid], count - owned, CraftPlanner.ItemName(mid), count, StopIfUnavailable: true));
         }
 
         return list;
@@ -1050,17 +1195,9 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         var plan = this.Plan(ctx);
         if (plan.NothingToDo)
         {
-            // 前提が未達で飛ばしたクエストがあれば、終わりに改めて知らせる。
-            // 結果は「前提未達のため一部除外して完了」になる
-            var blockedLines = plan.BlockedSummary();
-            this.HasExclusions = blockedLines.Count > 0;
-            foreach (var line in blockedLines)
-            {
-                ctx.Log.Warn("クエスト", $"前提のクエストが未完了のため進めていません：{line}");
-                Svc.Chat.Print($"[AutoJobQuest] 前提のクエストが未完了のため進めていません：{line}");
-            }
-
-            this.stage = Stage.Done;
+            // この区切りは終わった。次の区切りへ（残りが無ければ、そこで終わりの知らせを出す）
+            ctx.Log.Write("計画", $"区切り {this.batchNo} のジョブクエを終えました");
+            this.stage = Stage.NextBatch;
             return TaskResult.Running;
         }
 
@@ -1068,6 +1205,15 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         if (plan.Craft.Crafts.Count > 0)
         {
             this.stage = Stage.Craft;
+            return TaskResult.Running;
+        }
+
+        // 作る物は無いが、先に用意する素材（受注後に作る品のクリスタル・採集職の納品物など）が足りなければ、素材集めへ戻る
+        // （製作の段は作る物が無ければ素材の不足を見ずに次へ進むので、ここで見る。集めきれなければ素材集めの周回の上限で止まる）
+        if (plan.Craft.RawShortfall.Count > 0)
+        {
+            ctx.Log.Write("素材", $"クエストの前に、足りない素材を集め直します：{string.Join("、", plan.Craft.RawShortfall.Select(kv => $"{CraftPlanner.ItemName(kv.Key)}×{kv.Value}"))}");
+            this.stage = Stage.Acquire;
             return TaskResult.Running;
         }
 
@@ -1112,9 +1258,8 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         switch (this.stage)
         {
             case Stage.Retainers:
-                this.preflightPlan = null;
-                this.stage = Stage.Preflight;
-                ctx.Log.Write("計画", "引き出し後の実在庫から製作・素材の計画を作り直します。この実行中は呼び鈴へ戻りません");
+                this.stage = Stage.Unlock;
+                ctx.Log.Write("計画", "引き出した後の手持ちから、製作・素材の計画を作り直します（この区切りの間は呼び鈴へ戻りません）");
                 break;
             case Stage.Unlock:
                 // 解放の段は1回だけ。ここから先は、解放済みの機能だけを入手手段にする（ReduceTask.Usable）
@@ -1188,6 +1333,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         ctx.CombatInProgress = false;
         ctx.InOwnConversation = false;
         Unlocks.UnlockStagePassed = false;
+        Inventory.GearsetKeepCap = null;
     }
 
     private static void Safe(TaskContext ctx, string what, Action action)
@@ -1200,6 +1346,63 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         {
             ctx.Log.Warn("後始末", $"{what}で例外：{ex.GetType().Name}: {ex.Message}");
             Svc.Log.Error(ex, $"[AutoJobQuest] 後始末（{what}）で例外");
+        }
+    }
+}
+
+/// <summary>マーケットへの切り替えの了承の判断（ゲームを起動せずに試せるように分けた）。</summary>
+public static class MarketSwitch
+{
+    /// <summary>
+    /// 聞かずに買ってよいか：この区切りでその品を買いに行った数の合計に、今回の不足数を足しても、了承した数の合計を超えないとき。
+    /// </summary>
+    public static bool Approved(IReadOnlyDictionary<uint, int> approved, IReadOnlyDictionary<uint, int> used, uint item, int need)
+        => approved.TryGetValue(item, out var total) && used.GetValueOrDefault(item) + need <= total;
+}
+
+/// <summary>区切りの決め方（ゲームを起動せずに試せるように分けた）。</summary>
+public static class BatchSizing
+{
+    /// <summary>決めた区切り。</summary>
+    /// <param name="Job">職。</param>
+    /// <param name="Count">その職の残りのうち、並びの先頭から何本か。</param>
+    /// <param name="Need">その本数の鞄の見積もり（枠）。</param>
+    /// <param name="Fits">使える空きに入るか（1本でも入らなければ false）。</param>
+    public readonly record struct Result(uint Job, int Count, int Need, bool Fits);
+
+    /// <summary>
+    /// 職の並び（<paramref name="jobOrder"/>）で、残りのある最初の職を選ぶ。その職の残りのクエストを並びの順に全部とし、
+    /// 鞄の見積もりが使える空きに入るまで半分ずつ（切り上げ）減らす。1本でも入らなければ Fits＝false（1本とその見積もり）。
+    /// 残りが無ければ null。
+    /// </summary>
+    /// <param name="jobOrder">職の並び（Jobs.QuestJobs）。</param>
+    /// <param name="remaining">残りのクエスト（計画の並び）。</param>
+    /// <param name="estimate">クエストの組 → 鞄の見積もり（枠）。</param>
+    /// <param name="room">使える空き（鞄の空き − 残しておく空き）。</param>
+    public static Result? Choose(IReadOnlyList<uint> jobOrder, IReadOnlyList<JobQuest> remaining, Func<IReadOnlySet<uint>, int> estimate, int room)
+    {
+        uint? job = null;
+        foreach (var j in jobOrder)
+        {
+            if (remaining.Any(q => q.ClassJobId == j))
+            {
+                job = j;
+                break;
+            }
+        }
+
+        if (job == null)
+            return null;
+        var quests = remaining.Where(q => q.ClassJobId == job.Value).ToList();
+        var n = quests.Count;
+        while (true)
+        {
+            var need = estimate(quests.Take(n).Select(q => q.RowId).ToHashSet());
+            if (need <= room)
+                return new Result(job.Value, n, need, true);
+            if (n == 1)
+                return new Result(job.Value, 1, need, false);
+            n = (n + 1) / 2;
         }
     }
 }

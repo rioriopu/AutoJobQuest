@@ -1,25 +1,50 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using Dalamud.Configuration;
+using Newtonsoft.Json;
 
 namespace AutoJobQuest;
 
 /// <summary>
-/// 設定。
+/// 設定（キャラクターごと）。
 ///
-/// 【Dalamud の設定ファイルは1プラグイン1ファイル】
-/// キャラクターごとには分かれない（別のプラグインで4キャラ共有の事故が起きている）。
-/// ここに置くのは「どのジョブを回すか」のような利用者の好みだけにして、
+/// 【キャラクターごとに保存する】
+/// Dalamud の設定ファイルは1プラグイン1ファイルで、ゲームを2つ起動すると、2つのゲームが同じファイルを保存し合い、
+/// 他のプラグインを一時的に変えた控え（戻しの手がかり）を古い中身で上書きしえた（別のプラグインでも4キャラ共有の事故が起きている）。
+/// そこで、ログインしているキャラクターごとのファイル（設定フォルダ\characters\&lt;ContentId&gt;.json。<see cref="Core.CharacterConfigStore"/>）に置く。
+/// 同じキャラクターは2つのゲームに同時にログインできないので、取り合わない。
+/// ログインしていない間は既定の値で、保存しない。キャラクターが替わったら、前のキャラクターの分を保存してから中身を入れ替える（<see cref="SwitchTo"/>）。
+/// ログインの前に使う設定（起動時に画面を開く・記録の置き場所）だけは、全体で1つ（<see cref="GlobalConfiguration"/>）。
 /// キャラクターの進み具合（どのクエストが済んだか等）は保存せず、毎回ゲームから読む。
 /// </summary>
 [Serializable]
-public sealed class Configuration : IPluginConfiguration
+public sealed class Configuration
 {
-    public int Version { get; set; } = 1;
+    public int Version { get; set; } = 2;
+
+    /// <summary>この設定の持ち主のキャラクター名（ファイルを開いた人が分かるように書くだけ。読み込みには使わない）。</summary>
+    public string CharacterName { get; set; } = string.Empty;
+
+    /// <summary>持ち主のホームワールド名（同上）。</summary>
+    public string HomeWorld { get; set; } = string.Empty;
 
     /// <summary>AutoRetainerの抑制をこちらが変更し、まだ復元を確認できていないか。</summary>
     public bool RetainerSuppressionPendingRestore { get; set; }
+
+    /// <summary>上の抑制をこちらが立てた時刻（UTC。戻しの再試行の期限に使う）。</summary>
+    public DateTime RetainerSuppressionSetAt { get; set; } = DateTime.MinValue;
+
+    /// <summary>
+    /// 開始時に呼び鈴でリテイナーの在庫を読み、足りない分を引き出すか（既定 true）。
+    /// 切ると、手持ちだけで計画する（リテイナーにある品もマーケット等で集める）。
+    /// </summary>
+    public bool UseRetainerStock { get; set; } = true;
+
+    /// <summary>
+    /// 鞄に残しておく空き枠（既定 5）。リテイナーから引き出すとき・職ごとに進めるかを決めるときに、これだけは空けておく
+    /// （製作・採集・購入でできた品や、クエストでもらう品を置く場所）。
+    /// </summary>
+    public int KeepFreeBagSlots { get; set; } = 5;
 
     /// <summary>ジョブクエを回すか（木工→調理→採掘・園芸・漁師。保存済み設定との互換のためプロパティ名を維持）。</summary>
     public bool[] SelectedCrafters { get; set; } = new bool[11];
@@ -92,16 +117,8 @@ public sealed class Configuration : IPluginConfiguration
         [7] = 41785,
     };
 
-    /// <summary>
-    /// 記録（ログ）を残すフォルダ。既定は開発用のフォルダの ログ（作れなければプラグインの設定フォルダの ログ）。
-    /// </summary>
-    public string LogDirectory { get; set; } = Core.DebugLog.DefaultDirectory;
-
     /// <summary>実行していないときも、ショップ・マーケット等の画面を記録するか（手動操作の値を取りたいとき用）。</summary>
     public bool AlwaysRecordAddons { get; set; }
-
-    /// <summary>画面をゲーム起動時に開くか。</summary>
-    public bool OpenOnStartup { get; set; }
 
     // ---- 他プラグインを一時的に変えた控え（落ちたときに次回起動で戻すため） ----
     // GBR の Save() で一時状態がファイルに残るので、戻す手がかりをこちらにも書いておく。
@@ -202,12 +219,57 @@ public sealed class Configuration : IPluginConfiguration
     public Dictionary<string, bool> RsrBoolOriginals { get; set; } = [];
 
     [NonSerialized]
-    private Dalamud.Plugin.IDalamudPluginInterface? pluginInterface;
+    private string? charactersDirectory;
 
-    public void Initialize(Dalamud.Plugin.IDalamudPluginInterface pi)
+    [NonSerialized]
+    private ulong owner;
+
+    /// <summary>いまの持ち主のキャラクター（ContentId）。ログインしていなければ 0（保存しない）。</summary>
+    [JsonIgnore]
+    public ulong OwnerContentId => this.owner;
+
+    /// <summary>直近の保存の失敗の理由（無ければ null）。</summary>
+    [JsonIgnore]
+    public string? LastSaveProblem { get; private set; }
+
+    /// <summary>保存先のフォルダを決める（読み込みはキャラクターが決まってから：<see cref="SwitchTo"/>）。</summary>
+    public void Initialize(string charactersDirectoryPath)
     {
-        this.pluginInterface = pi;
+        this.charactersDirectory = charactersDirectoryPath;
+        this.Normalize();
+    }
 
+    /// <summary>
+    /// 持ち主のキャラクターを切り替える。今の持ち主の分を保存してから、新しい持ち主のファイルを読む（無ければ既定の値で作る）。
+    /// <paramref name="contentId"/> が 0（ログアウト）なら既定の値に戻し、保存しない状態にする（前のキャラクターの値を残さない）。
+    /// 読めないファイルがあったときは、その知らせを返す（無ければ null）。
+    /// </summary>
+    public string? SwitchTo(ulong contentId, string characterName, string homeWorld)
+    {
+        if (contentId == this.owner)
+            return null;
+        this.Save();
+
+        string? note = null;
+        var loaded = contentId == 0 || this.charactersDirectory == null
+            ? new Configuration()
+            : Core.CharacterConfigStore.Load(this.charactersDirectory, contentId, out note);
+        Core.CharacterConfigStore.CopyInto(this, loaded);
+        this.owner = contentId;
+        if (contentId != 0)
+        {
+            this.CharacterName = characterName;
+            this.HomeWorld = homeWorld;
+        }
+
+        this.Normalize();
+        this.Save();
+        return note;
+    }
+
+    /// <summary>読み込んだ後の整え（古い形の控えを新しい形へ・長さの合わない配列・静的な引き当て先の入れ直し）。</summary>
+    private void Normalize()
+    {
         // 旧形式の控え（名前だけ）を新形式へ移す。フォルダは分からないので空（＝一番上）として扱う
         foreach (var name in this.GbrDisabledLists)
             if (!this.GbrDisabledListRefs.Any(r => r.Name == name))
@@ -216,6 +278,9 @@ public sealed class Configuration : IPluginConfiguration
 
         // 特殊通貨の控えを引き当て係へ渡す
         Data.SpecialCurrency.Fallback = this.SpecialCurrencyFallback;
+
+        // 受注後に作る品の作り直しの予備（そのクリスタルを先に用意する）。開始するときにも入れ直す（JobQuestFlow）
+        Planning.PlanBuilder.QuestCraftSpare = Math.Max(0, this.MaxRetryRounds);
 
         // 古い設定ファイルで配列の長さが違うと、チェックボックスの描画で範囲外になる
         if (this.SelectedCrafters is not { Length: 11 })
@@ -227,8 +292,17 @@ public sealed class Configuration : IPluginConfiguration
         }
     }
 
-    public void Save()
-        => this.pluginInterface?.SavePluginConfig(this);
+    /// <summary>いまの持ち主のファイルに保存する。ログインしていなければ保存しない（false）。</summary>
+    public bool Save()
+    {
+        if (this.owner == 0 || this.charactersDirectory == null)
+            return false;
+        var ok = Core.CharacterConfigStore.Save(this, Core.CharacterConfigStore.PathFor(this.charactersDirectory, this.owner), out var problem);
+        this.LastSaveProblem = problem;
+        if (!ok)
+            Core.DebugLog.Current?.Line("設定", $"⚠ 設定を保存できませんでした：{problem}");
+        return ok;
+    }
 }
 
 /// <summary>

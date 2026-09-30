@@ -52,6 +52,8 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
     private readonly Configuration? store;
 
     private readonly Func<bool?> readTargetOverride;
+    private bool? lastTarget;
+    private DateTime lastTargetRead = DateTime.MinValue;
 
     public RotationSolverIpc(Configuration? store = null, Func<bool?>? readTargetOverride = null)
     {
@@ -339,7 +341,14 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
     /// </summary>
     public bool EnsureHenched()
     {
-        var externalTarget = this.readTargetOverride();
+        // 外部ターゲット指定は内部をリフレクションで読むので重い。入れる前（最初の1回）は必ず読み、入れた後は3秒に1回にする（以前は毎フレーム読んだ）
+        if (!this.tracker.HenchedByMe || DateTime.UtcNow - this.lastTargetRead >= HenchedTracker.ResendInterval)
+        {
+            this.lastTarget = this.readTargetOverride();
+            this.lastTargetRead = DateTime.UtcNow;
+        }
+
+        var externalTarget = this.lastTarget;
         this.safetyProblem = externalTarget == false ? null : externalTarget == true
             ? "RSR の外部ターゲット指定が有効です。指定外を狙う可能性があるため戦闘を止めます"
             : "RSR の外部ターゲット指定の状態を読めないため戦闘を止めます";

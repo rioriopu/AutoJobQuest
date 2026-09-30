@@ -17,8 +17,11 @@ public sealed record BookNeed(uint TomeId, uint BookItemId, List<uint> Items);
 /// </summary>
 public sealed class GameDataCache
 {
-    /// <summary>対象にするジョブクエの上限レベル（Lv60 まで）。</summary>
-    public const int MaxQuestLevel = 60;
+    /// <summary>
+    /// 対象にするジョブクエの上限レベル（Lv70 まで。ジョブクエは Lv70 までしかない。
+    /// ゲームデータの調査：Lv71 以上のジョブクエは0本）。
+    /// </summary>
+    public const int MaxQuestLevel = 70;
 
     private readonly Func<uint> collectableItemId;
     private Task? building;
@@ -42,7 +45,7 @@ public sealed class GameDataCache
     /// <summary>製作装備の基準値（ClassJob → 作業精度・加工精度）。</summary>
     public Dictionary<uint, (int Craftsmanship, int Control)>? GearBaselines => this.ready?.GearBaselines;
 
-    /// <summary>8職のジョブクエ（Lv60 まで）全部を作るのに要る秘伝書（完了済みかどうかに関わらず）。</summary>
+    /// <summary>8職のジョブクエ（Lv70 まで）全部を作るのに要る秘伝書（完了済みかどうかに関わらず）。受注後に作る品は除く。</summary>
     public List<BookNeed>? AllBooks => this.ready?.AllBooks;
 
     /// <summary>全ジョブクエの素材のうち、精選で得られる品（霊砂など）。</summary>
@@ -87,7 +90,8 @@ public sealed class GameDataCache
                 var baselines = GearCheck.ComputeBaselines();
 
                 // 全ジョブクエの製作で要る秘伝書（所持数を 0 とみなして全部作る前提で数える）
-                var all = planner.Build(quests.Quests.SelectMany(q => q.Items), new EmptyInventory(), _ => false);
+                // 受注後にしか手に入らない品（Lv61〜70 の取引できない納品物）は、事前に作らないので数えない
+                var all = planner.Build(quests.Quests.SelectMany(q => q.Items.Where(i => !q.AfterAcceptItems.Contains(i.ItemId))), new EmptyInventory(), _ => false);
                 var sheet = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.SecretRecipeBook>();
                 var allBooks = all.Crafts
                     .Where(c => c.SecretRecipeBookId != 0)
@@ -101,7 +105,7 @@ public sealed class GameDataCache
                 var questBooks = new Dictionary<uint, List<uint>>();
                 foreach (var q in quests.Quests)
                 {
-                    var tomes = planner.Build(q.Items, new EmptyInventory(), _ => false).Crafts
+                    var tomes = planner.Build(q.Items.Where(i => !q.AfterAcceptItems.Contains(i.ItemId)), new EmptyInventory(), _ => false).Crafts
                         .Where(c => c.SecretRecipeBookId != 0).Select(c => c.SecretRecipeBookId).Distinct().ToList();
                     if (tomes.Count > 0)
                         questBooks[q.RowId] = tomes;

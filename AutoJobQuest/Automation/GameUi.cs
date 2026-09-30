@@ -156,8 +156,10 @@ public static unsafe class GameUi
 
     /// <summary>
     /// オブジェクトに話しかける。ターゲットが違えば、まずターゲットだけして false を返す（次の呼び出しで話しかける）。
-    /// 視線判定なし（checkLineOfSight: false）で話しかける
-    /// （同じフレームでターゲットと話しかけを行うと効かないことがある）。
+    /// 既定は、Questionable・TextAdvance と同じく視線判定なし（checkLineOfSight: false）。
+    /// 視線判定ありは、経路の途中で早めに話しかけてみるとき（壁越しに話しかけない）だけに使う。
+    /// 受け付けたかは、Questionable と同じく「戻り値が 0 より大きく、7 でない」で見る（Questionable の GameFunctions は
+    /// 7 を失敗として扱う。以前は 0 以外を成功とみなした）。戻り値は記録に出す（実機の確認のため）。
     /// 呼び出し側は1秒程度の間隔を置いて繰り返し呼ぶこと。
     /// </summary>
     public static bool Interact(Dalamud.Game.ClientState.Objects.Types.IGameObject obj, bool checkLineOfSight = false)
@@ -174,8 +176,10 @@ public static unsafe class GameUi
         }
 
         var go = (GameObject*)obj.Address;
-        var ok = ts->InteractWithObject(go, checkLineOfSight) != 0;
-        Core.DebugLog.Current?.Line("操作", $"話しかけ: {obj.Name.TextValue}（BaseId {obj.BaseId}、距離 {System.Numerics.Vector3.Distance(obj.Position, Me.Position):0.0}m）→ {(ok ? "受け付け" : "受け付けられず")}");
+        var result = (long)ts->InteractWithObject(go, checkLineOfSight);
+        var ok = result > 0 && result != 7;
+        Core.DebugLog.Current?.Line("操作", $"話しかけ: {obj.Name.TextValue}（BaseId {obj.BaseId}、距離 {System.Numerics.Vector3.Distance(obj.Position, Me.Position):0.0}m、"
+                                          + $"視線判定{(checkLineOfSight ? "あり" : "なし")}）→ {(ok ? "受け付け" : "受け付けられず")}（戻り値 {result}）");
         return ok;
     }
 

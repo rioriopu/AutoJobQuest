@@ -420,8 +420,10 @@ public sealed class RequestFiller
             }
         }
 
-        // 渡す（ここで初めて「渡した」にする。二度は送らない）
-        foreach (var id in expectedItems)
+        // 渡す（ここで初めて「渡した」にする。二度は送らない）。
+        // 渡した後の「減った」は、この窓に入れた品だけで見る（以前はクエストの品すべてを控えたので、同じ会話で別の専用品が
+        // 回収されただけで「納品を確かめました」になりえた）
+        foreach (var id in this.putItems.Values.Select(i => i.BaseItemId).Distinct())
             this.CountsBeforeSubmit[id] = window.CountOwned(id);
 
         window.Submit();

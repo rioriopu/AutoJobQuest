@@ -38,6 +38,28 @@ public sealed class TextAdvanceIpc : IpcGate
     /// <summary>こちらが外部制御を取っているか（ジョブクエを進める間・手動の報告の間）。</summary>
     public bool OwnsControl => this.ownControl;
 
+    /// <summary>
+    /// 外部制御を失った理由（取り消された・ほかの依頼者が持っている・応答しない）。失っていなければ null。
+    /// 取り消された（こちらが持っていたはずなのに、誰も持っていない）ときは、取り直さない（利用者が TextAdvance の画面で
+    /// 「Cancel external control」を押しても、以前は1フレーム後に取り直していた）。解除（ReleaseControl）で消える。
+    /// </summary>
+    public string? LossReason { get; private set; }
+
+    // 取り消されたので、この実行の間は取り直さない
+    private bool lostExternally;
+
+    /// <summary>外部制御が取り消された（こちらの解除なしに誰も持っていない）か。実行を止める理由にする。</summary>
+    public bool CancelledExternally => this.lostExternally;
+
+    // 直前の照合の時刻（1秒に1回だけ問い合わせる。以前は毎フレーム問い合わせて、記録を1行ずつ書いていた）
+    private System.DateTime lastEnsure = System.DateTime.MinValue;
+
+    // 応答が読めなくなった時刻（読めない間は5秒まで待つ。以前は1回の失敗で実行全体が止まった）
+    private System.DateTime? unreadableSince;
+
+    /// <summary>応答が読めないまま待つ上限。</summary>
+    public static readonly System.TimeSpan UnreadableLimit = System.TimeSpan.FromSeconds(5);
+
     /// <summary>いま納品窓の入力を TextAdvance に任せているか（こちらが扱わない納品窓の間だけ）。</summary>
     public bool RequestAllowed => this.ownControl && this.requestAllowed;
 
@@ -73,21 +95,63 @@ public sealed class TextAdvanceIpc : IpcGate
             return true;
         this.lastCheck = System.DateTime.UtcNow;
 
+        // 持っていたのに TextAdvance が読み込まれていない＝読み直し・無効化の途中。どちらも依頼者の記録は消えるので、取り消しとして止める
+        // （以前は印を下ろすだけで進み続け、読み直しの後に Questionable が取った設定のまま納品窓まで進んだ）
         if (!this.IsLoaded)
         {
-            this.ownControl = false;
-            this.requestAllowed = false;
+            this.Lost("TextAdvance が読み直されました（または無効にされました）。取り直さずに止めます");
             return false;
         }
 
-        if (this.Apply(this.requestAllowed))
-            return true;
+        if (this.DetectCancel())
+            return false;
 
-        // 他者が持っている（こちらの設定にならない）。印を下ろし、呼び出し側が記録に出す
-        Core.DebugLog.Current?.Line("IPC", "TextAdvance の外部制御がほかの依頼者に移っていました（取り直せません）");
+        var result = this.ApplyResult(this.requestAllowed);
+        if (result == ApplyOutcome.Owned)
+        {
+            this.unreadableSince = null;
+            return true;
+        }
+
+        if (result == ApplyOutcome.HeldByOther)
+        {
+            // こちらが持っていたのに、ほかの依頼者が持っている
+            this.unreadableSince = null;
+            this.TakenOver();
+            return false;
+        }
+
+        // 読めない：入力の直前の照合（EnsureTurnInControl）と同じく、5秒までは持っているとみなす。続けば読み直しの途中とみなして止める
+        this.unreadableSince ??= System.DateTime.UtcNow;
+        if (System.DateTime.UtcNow - this.unreadableSince.Value < UnreadableLimit)
+            return true;
+        this.unreadableSince = null;
+        this.Lost($"TextAdvance が {UnreadableLimit.TotalSeconds:0} 秒応答しません（読み直し・無効化の途中の可能性）。取り直さずに止めます");
+        return false;
+    }
+
+    /// <summary>持っていた外部制御を、こちらの解除なしに失った。取り消しとして扱い、この実行の間は取り直さない。</summary>
+    private void Lost(string reason)
+    {
         this.ownControl = false;
         this.requestAllowed = false;
-        return false;
+        this.lostExternally = true;
+        this.LossReason = reason;
+        Core.DebugLog.Current?.Line("IPC", reason);
+    }
+
+    /// <summary>
+    /// こちらが持っていた外部制御を、ほかの依頼者が持っている。TextAdvance は「誰も持っていない」か「依頼者が同じ」ときしか受け付けないので、
+    /// これはこちらの解除なしに外され（TextAdvance の画面での取り消し・読み直し）、ほかのプラグイン（動いている Questionable は毎フレーム取りに行く）が
+    /// 取り直した形（以前は印を下ろすだけで進み続け、取り消しの検知がほとんど働かなかった）。取り消しとして扱い、取り直さずに止める。
+    /// </summary>
+    private void TakenOver()
+    {
+        this.ownControl = false;
+        this.requestAllowed = false;
+        this.lostExternally = true;
+        this.LossReason = "TextAdvance の外部制御が外され、ほかのプラグイン（Questionable など）が取り直しました。取り直さずに止めます";
+        Core.DebugLog.Current?.Line("IPC", this.LossReason);
     }
 
     /// <summary>
@@ -118,18 +182,96 @@ public sealed class TextAdvanceIpc : IpcGate
         return this.Apply(allow);
     }
 
-    /// <summary>重要な入力の直前に操作権を照合する。空いていれば取得し、他者の所有権は奪わない。</summary>
+    /// <summary>
+    /// 重要な入力の直前に操作権を照合する。空いていれば取得し、他者の所有権は奪わない。
+    /// 持っている間は1秒に1回だけ問い合わせる。応答が読めないときは、持っていたなら5秒まで持っているとみなす。
+    /// 取り消されたとき（こちらが持っていたはずなのに誰も持っていない）は取り直さずに false。理由は <see cref="LossReason"/>。
+    /// </summary>
     public bool EnsureTurnInControl()
     {
-        if (this.Apply(false))
+        if (this.lostExternally)
+            return false;
+        var now = System.DateTime.UtcNow;
+        if (this.ownControl && !this.requestAllowed && this.unreadableSince == null && now - this.lastEnsure < System.TimeSpan.FromSeconds(1))
             return true;
+        this.lastEnsure = now;
+
+        if (this.ownControl && this.DetectCancel())
+            return false;
+
+        var result = this.ApplyResult(false);
+        if (result == ApplyOutcome.Owned)
+        {
+            this.unreadableSince = null;
+            return true;
+        }
+
+        if (result == ApplyOutcome.Unreadable)
+        {
+            this.unreadableSince ??= now;
+            if (now - this.unreadableSince.Value < UnreadableLimit)
+                return this.ownControl;
+            this.LossReason = $"TextAdvance が {UnreadableLimit.TotalSeconds:0} 秒応答しません（読み込み中の可能性）";
+        }
+        else if (this.ownControl)
+        {
+            // こちらが持っていたのに、ほかの依頼者が持っている＝取り消しの後に他者が取り直した
+            this.unreadableSince = null;
+            this.TakenOver();
+            return false;
+        }
+        else
+        {
+            this.LossReason = "TextAdvance の外部制御をほかのプラグインが持っています";
+        }
+
+        this.unreadableSince = null;
         this.ownControl = false;
         this.requestAllowed = false;
         return false;
     }
 
-    private bool Apply(bool allowRequest)
+    /// <summary>
+    /// 入力（選択肢・納品窓）の直前に使う：間引かずに、いま照合する（入力の直前は毎回照合し、他者を奪わない）。
+    /// 毎フレームの見張りには <see cref="EnsureTurnInControl"/>（1秒に1回）を使う。
+    /// </summary>
+    public bool VerifyTurnInControlNow()
     {
+        this.lastEnsure = System.DateTime.MinValue;
+        return this.EnsureTurnInControl();
+    }
+
+    /// <summary>
+    /// こちらが持っていたはずの外部制御を、誰も持っていないか（利用者の取り消し、または TextAdvance の読み直し）。
+    /// そうなら持っている印を下ろし、この実行の間は取り直さない。読めなければ判断しない（false）。
+    /// </summary>
+    private bool DetectCancel()
+    {
+        if (this.IsInExternalControl() != false)
+            return false;
+        this.ownControl = false;
+        this.requestAllowed = false;
+        this.releasePending = false;
+        this.lostExternally = true;
+        this.LossReason = "TextAdvance の外部制御が外されました（TextAdvance の画面での取り消し、または TextAdvance の読み直し）。取り直さずに止めます";
+        Core.DebugLog.Current?.Line("IPC", this.LossReason);
+        return true;
+    }
+
+    private enum ApplyOutcome
+    {
+        Owned,
+        HeldByOther,
+        Unreadable,
+    }
+
+    private bool Apply(bool allowRequest) => this.ApplyResult(allowRequest) == ApplyOutcome.Owned;
+
+    private ApplyOutcome ApplyResult(bool allowRequest)
+    {
+        if (this.lostExternally)
+            return ApplyOutcome.HeldByOther;
+
         var cfg = new ExternalTerritoryConfig
         {
             EnableQuestAccept = true,
@@ -143,26 +285,32 @@ public sealed class TextAdvanceIpc : IpcGate
             EnableAutoInteract = false,
         };
 
-        this.Trace($"EnableExternalControl（納品窓の入力={(allowRequest ? "TextAdvance に任せる" : "こちらで行う")}）");
+        // 記録は、取る・設定を変えるときだけ書く（以前は毎フレーム1行ずつ書き、止まったときの「直前の記録」が埋まった）
+        if (!this.ownControl || this.requestAllowed != allowRequest)
+            this.Trace($"EnableExternalControl（納品窓の入力={(allowRequest ? "TextAdvance に任せる" : "こちらで行う")}）");
         this.releasePending = true;
         var received = this.TryInvoke("EnableExternalControl",
                      () => this.Func<string, ExternalTerritoryConfig, bool>("TextAdvance.EnableExternalControl")
                          .InvokeFunc(Plugin.InternalNameConst, cfg), out var accepted);
         if (received)
             this.releasePending = accepted;
-        var ok = received && accepted;
-        if (ok)
+        if (received && accepted)
         {
             this.ownControl = true;
             this.requestAllowed = allowRequest;
+            this.LossReason = null;
+            return ApplyOutcome.Owned;
         }
 
-        return ok;
+        return received ? ApplyOutcome.HeldByOther : ApplyOutcome.Unreadable;
     }
 
     /// <summary>こちらが取った外部制御を解除する。</summary>
     public void ReleaseControl()
     {
+        // 取り消しの印は、実行の終わり（後始末）で消す（次の実行ではまた取れる）
+        this.lostExternally = false;
+        this.unreadableSince = null;
         if (!this.ownControl && !this.releasePending)
             return;
 

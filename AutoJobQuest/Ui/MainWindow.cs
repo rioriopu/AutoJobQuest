@@ -45,6 +45,7 @@ public sealed class MainWindow : Window
         this.config = config;
         this.log = log;
         this.services = services;
+        this.services.CharacterChanged += this.OnCharacterChanged;
 
         this.SizeConstraints = new WindowSizeConstraints
         {
@@ -103,7 +104,11 @@ public sealed class MainWindow : Window
     {
         var runner = this.services.Runner;
         var anySelected = this.config.SelectedCrafters.Any(x => x);
-        var blocker = runner.IsRunning ? null : runner.StartBlocker() ?? Jobs.StartProblem(this.config.SelectedCrafters, Jobs.Level);
+        var blocker = runner.IsRunning
+            ? null
+            : this.config.OwnerContentId == 0
+                ? "キャラクターにログインしてから開始してください（設定はキャラクターごとに保存します）"
+                : runner.StartBlocker() ?? Jobs.StartProblem(this.config.SelectedCrafters, Jobs.Level) ?? this.DataBlocker(anySelected) ?? this.MainQuestProblem();
 
         // 一時停止：止めると他のプラグインに頼んだことを全部戻す（止めている間に Artisan・GBR・Questionable が
         // 勝手に動き続けないように）。進み具合は毎回ゲームから読み直すので、もう一度開始すれば続きから進む。
@@ -210,11 +215,13 @@ public sealed class MainWindow : Window
 
     private void DrawJobSelection()
     {
-        ImGui.TextWrapped("対象職はそれぞれLv70以上が必要です。開始時に呼び鈴で必要品を引き出し、実在庫から計画を更新します。");
+        ImGui.TextWrapped("対象職はそれぞれLv70以上が必要です（ジョブクエは Lv70 まで）。職ごとに区切って進め、区切りの始めに呼び鈴でリテイナーから必要品を引き出します"
+                          + "（チョコボかばん・リテイナーの収集品・装備中・出品中・マテリア付きの品は使いません）。");
         var sel = this.config.SelectedCrafters;
         var all = sel.All(x => x);
 
-        using (ImRaii.Disabled(this.services.Runner.IsRunning))
+        // 選んだ職はキャラクターごとに保存する。ログインしていない間は保存先が無いので変えさせない
+        using (ImRaii.Disabled(this.services.Runner.IsRunning || this.config.OwnerContentId == 0))
         {
             if (ImGui.Checkbox("全てON", ref all))
             {
@@ -263,11 +270,64 @@ public sealed class MainWindow : Window
         else if (blocked.Count > 0)
         {
             ImGui.PushTextWrapPos(0);
-            ImGui.TextColored(Yellow, "⚠ 前提のクエストが未完了のため、次のジョブクエは進められません（開始すると確認が出ます。続けた場合は飛ばします）：");
+            // メインクエストが未達の職があれば開始できない。そのときは「続けた場合は飛ばします」と案内しない
+            ImGui.TextColored(Yellow, this.MainQuestProblem() != null
+                ? "⚠ 前提のクエストが未完了のため、次のジョブクエは進められません（メインクエストが未達の職があるので、いまは開始できません。上の理由を見てください）："
+                : "⚠ 前提のクエストが未完了のため、次のジョブクエは進められません（開始すると確認が出ます。続けた場合は飛ばします）：");
             foreach (var line in JobQuestPlan.SummarizeBlocked(blocked))
                 ImGui.TextColored(Yellow, $"　・{line}");
             ImGui.PopTextWrapPos();
         }
+    }
+
+    /// <summary>
+    /// 選んだ職があれば、ゲームデータの読み込みを始め、読み終わるまで開始させない（以前は読み込み前に押せてしまい、
+    /// メインクエストの前提で止まるときも「失敗」として失敗の報告が書き出された）。読み込みに失敗していれば、その理由を出す
+    /// （作り直しはジョブの選び直しで行う。毎フレーム作り直さない）。
+    /// </summary>
+    private string? DataBlocker(bool anySelected)
+    {
+        var data = this.Ctx.Data;
+        if (!anySelected || data.IsReady)
+            return null;
+        if (data.BuildError is { } error)
+            return $"ゲームデータを読めませんでした（{error}）。ジョブの選び直しで読み直します";
+
+        // ログインの直後（エリアの読み込み中）には重い走査を始めない（起動時に開く設定だと、ログイン直後に走っていた）
+        if (!data.IsBuilding && (Automation.GameUi.BetweenAreas || !Automation.GameUi.PlayerFree()))
+            return "動ける状態になったら、ゲームデータを読み込みます（読み終わると開始できます）";
+        data.EnsureBuilding();
+        return "ゲームデータを読み込んでいます（読み終わると開始できます）";
+    }
+
+    // 選んだ職のジョブクエに要るメインクエストが未完了か（チェックを変えたとき・5秒ごとに調べ直す）
+    private string? msqProblem;
+    private string msqKey = string.Empty;
+    private DateTime msqAt = DateTime.MinValue;
+
+    private string? MainQuestProblem()
+    {
+        var data = this.Ctx.Data;
+        if (!data.IsReady || !Me.Available)
+            return null;
+        var key = string.Concat(this.config.SelectedCrafters.Select(x => x ? '1' : '0'));
+        if (key != this.msqKey || DateTime.UtcNow - this.msqAt > TimeSpan.FromSeconds(5))
+        {
+            try
+            {
+                this.msqProblem = MainQuestGate.StartProblem(data, this.config.SelectedCrafters);
+            }
+            catch (Exception ex)
+            {
+                this.log.Warn("計画", $"メインクエストの前提を調べられませんでした: {ex.Message}");
+                this.msqProblem = null;
+            }
+
+            this.msqKey = key;
+            this.msqAt = DateTime.UtcNow;
+        }
+
+        return this.msqProblem;
     }
 
     // 進められないジョブクエの控え（チェックを変えたとき・5秒ごとに調べ直す。毎フレームは調べない）
@@ -280,6 +340,7 @@ public sealed class MainWindow : Window
         // ゲームデータがまだなら読み始める（利用者がジョブを選んだとき＝使うと分かったときだけ。起動時には読まない）
         this.Ctx.Data.EnsureBuilding();
         this.blockedAt = DateTime.MinValue;
+        this.msqAt = DateTime.MinValue;
     }
 
     private List<BlockedQuest>? BlockedForSelection()
@@ -487,11 +548,37 @@ public sealed class MainWindow : Window
     /// 設定（購入の確認の基準・作り直しの上限などに絞る。入力の範囲を確かめる。内部の控えはここに出さない）。
     /// 動作中は変えられない（途中で基準が変わると、確認の判断が食い違うため）。
     /// </summary>
+    /// <summary>
+    /// ログインしているキャラクターが替わった（設定の中身が入れ替わった）。前のキャラクターの計画・前提の判定・キャラクター情報の控えを消す
+    /// </summary>
+    private void OnCharacterChanged()
+    {
+        this.plan = null;
+        this.planRequested = false;
+        this.msqKey = string.Empty;
+        this.msqAt = DateTime.MinValue;
+        this.msqProblem = null;
+        this.blockedCache = null;
+        this.blockedKey = string.Empty;
+        this.blockedAt = DateTime.MinValue;
+        this.report = null;
+        this.reportRequested = true;
+    }
+
     private void DrawSettingsTab()
     {
         var running = this.services.Runner.IsRunning;
         ImGui.PushTextWrapPos(0);
-        using (ImRaii.Disabled(running))
+
+        // 設定はキャラクターごと。ログインしていない間は保存先が無いので変えさせない
+        var loggedIn = this.config.OwnerContentId != 0;
+        ImGui.TextColored(Grey, loggedIn
+            ? $"この設定は {this.config.CharacterName}（{this.config.HomeWorld}）のものです（キャラクターごとに保存します）"
+            : "ログインしていないため、設定を変えられません（設定はキャラクターごとに保存します）");
+        if (this.config.LastSaveProblem is { } saveProblem)
+            ImGui.TextColored(Yellow, $"⚠ 設定を保存できませんでした：{saveProblem}");
+
+        using (ImRaii.Disabled(running || !loggedIn))
         {
             ImGui.TextUnformatted("マーケットボードの購入の確認");
 
@@ -538,6 +625,28 @@ public sealed class MainWindow : Window
             }
 
             ImGui.TextColored(Grey, "既定は 100,000。0 で確かめない。大きいまとまりしか出品が無いとき、余りの分の無駄に気づくための確認です");
+
+            // リテイナーの段の設定（以前は設定ファイルを手で書き換えないと変えられなかった）
+            ImGui.Separator();
+            ImGui.TextUnformatted("リテイナーと鞄");
+            var useRetainers = this.config.UseRetainerStock;
+            if (ImGui.Checkbox("区切りの始めに、呼び鈴でリテイナーから要る品を引き出す", ref useRetainers))
+            {
+                this.config.UseRetainerStock = useRetainers;
+                this.config.Save();
+            }
+
+            ImGui.TextColored(Grey, "既定は ON。切ると、手持ちだけで計画します（リテイナーにある品も、採集・購入などで集めます）");
+
+            var keepFree = this.config.KeepFreeBagSlots;
+            ImGui.SetNextItemWidth(160);
+            if (ImGui.InputInt("鞄に残しておく空き（枠）", ref keepFree, 1, 5))
+            {
+                this.config.KeepFreeBagSlots = Math.Clamp(keepFree, 0, 100);
+                this.config.Save();
+            }
+
+            ImGui.TextColored(Grey, "既定は 5。区切りの大きさ（一度に進める本数）と、リテイナーから引き出す量を、この空きを残す範囲に抑えます");
 
             ImGui.Separator();
             ImGui.TextUnformatted("製作");

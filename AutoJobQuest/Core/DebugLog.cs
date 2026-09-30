@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading;
 
@@ -11,10 +12,12 @@ namespace AutoJobQuest.Core;
 /// 不具合を調べるための記録をファイルに残す（細かく説明しなくても分かるように）。
 ///
 /// 置き場所（既定）：<c>DefaultDirectory</c>。作れなければプラグインの設定フォルダの <c>ログ\</c>。
-///   全体_yyyyMMdd.log        … その日の記録すべて（プラグインを読み込んでいる間ずっと）
-///   実行_yyyyMMdd_HHmmss.log … 「ジョブクエ開始」から止まるまでの記録（1回の実行で1つ）
-///   失敗_yyyyMMdd_HHmmss.md  … 止まったときの状況（状態の写し＋直前の記録）
-///   状態_yyyyMMdd_HHmmss.md  … 画面の「今の状態を書き出す」で作る写し
+///   全体_yyyyMMdd_キャラクター名.log        … その日の記録すべて（プラグインを読み込んでいる間ずっと）
+///   実行_yyyyMMdd_HHmmss_キャラクター名.log … 「ジョブクエ開始」から止まるまでの記録（1回の実行で1つ）
+///   失敗_yyyyMMdd_HHmmss_キャラクター名.md  … 止まったときの状況（状態の写し＋直前の記録）
+///   状態_yyyyMMdd_HHmmss_キャラクター名.md  … 画面の「今の状態を書き出す」で作る写し
+/// ファイル名の最後はログインしているキャラクターの名前（ログインする前は付けない）。ゲームを2つ起動していても、
+/// 2つのゲームが同じファイルに書き合わない（以前は同時に書くと片方の行が黙って捨てられ、どちらのゲームの行かも分からなかった）。
 ///
 /// 書き込みは別スレッドでまとめて行う（ゲームのフレームを止めないため）。
 /// 他のクラスからも書けるよう、読み込み中は <see cref="Current"/> で取れる。
@@ -81,7 +84,22 @@ public sealed class DebugLog : IDisposable
         return Svc.PluginInterface.ConfigDirectory.FullName;
     }
 
-    private string DailyFile => Path.Combine(this.Directory, $"全体_{DateTime.Now:yyyyMMdd}.log");
+    private volatile string suffix = string.Empty;
+
+    /// <summary>ログインしているキャラクターを記録のファイル名に付ける（null ならログインしていない＝付けない）。</summary>
+    public void SetCharacter(string? characterName) => this.suffix = FileSuffix(characterName);
+
+    /// <summary>ファイル名に付ける部分（「_キャラクター名」。空白とファイル名に使えない文字は「_」にする）。</summary>
+    public static string FileSuffix(string? characterName)
+    {
+        if (string.IsNullOrWhiteSpace(characterName))
+            return string.Empty;
+        var bad = Path.GetInvalidFileNameChars();
+        var chars = characterName.Trim().Select(c => char.IsWhiteSpace(c) || Array.IndexOf(bad, c) >= 0 ? '_' : c).ToArray();
+        return "_" + new string(chars);
+    }
+
+    private string DailyFile => Path.Combine(this.Directory, $"全体_{DateTime.Now:yyyyMMdd}{this.suffix}.log");
 
     /// <summary>1行書く（全体と、実行中なら実行の記録の両方へ）。</summary>
     public void Line(string category, string message)
@@ -127,7 +145,7 @@ public sealed class DebugLog : IDisposable
     /// <summary>実行の記録を始める。</summary>
     public string BeginRun(string name)
     {
-        var path = Path.Combine(this.Directory, $"実行_{DateTime.Now:yyyyMMdd_HHmmss}.log");
+        var path = Path.Combine(this.Directory, $"実行_{DateTime.Now:yyyyMMdd_HHmmss}{this.suffix}.log");
         lock (this.runGate)
             this.runFile = path;
         this.Line("実行", $"開始: {name}（この実行の記録: {path}）");
@@ -145,7 +163,7 @@ public sealed class DebugLog : IDisposable
     /// <summary>失敗したときの報告（状態の写し＋直前の記録）を書き出す。</summary>
     public string WriteFailureReport(string reason, string snapshot)
     {
-        var path = Path.Combine(this.Directory, $"失敗_{DateTime.Now:yyyyMMdd_HHmmss}.md");
+        var path = Path.Combine(this.Directory, $"失敗_{DateTime.Now:yyyyMMdd_HHmmss}{this.suffix}.md");
         var sb = new StringBuilder();
         sb.AppendLine($"# 止まった理由（{DateTime.Now:yyyy-MM-dd HH:mm:ss}）").AppendLine();
         sb.AppendLine(reason).AppendLine();
@@ -172,7 +190,7 @@ public sealed class DebugLog : IDisposable
     /// <summary>状態の写しをファイルに書き出す。</summary>
     public string WriteSnapshot(string snapshot)
     {
-        var path = Path.Combine(this.Directory, $"状態_{DateTime.Now:yyyyMMdd_HHmmss}.md");
+        var path = Path.Combine(this.Directory, $"状態_{DateTime.Now:yyyyMMdd_HHmmss}{this.suffix}.md");
         this.queue.Add((path, $"# 状態の写し（{DateTime.Now:yyyy-MM-dd HH:mm:ss}）\n\n```\n{snapshot}\n```\n"));
         this.Line("記録", $"状態を書き出しました: {path}");
         return path;

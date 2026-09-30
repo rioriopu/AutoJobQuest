@@ -392,6 +392,15 @@ public sealed class CraftPlanner
         => (r.RecipeLevelTable.ValueNullable?.Difficulty ?? 0) * r.DifficultyFactor / 100;
 
     /// <summary>アイテム名（クライアント言語）。</summary>
+    /// <summary>
+    /// 品の名前。200万番台はクエスト専用品（EventItem シート）から引く（以前は Item シートだけを引き、「#2001682」のように出た）。
+    /// </summary>
     public static string ItemName(uint itemId)
-        => Svc.Data.GetExcelSheet<Item>().TryGetRow(itemId, out var row) ? row.Name.ExtractText() : $"#{itemId}";
+    {
+        if (itemId >= 2_000_000)
+            return Svc.Data.GetExcelSheet<EventItem>().TryGetRow(itemId, out var ev) && ev.Singular.ExtractText() is { Length: > 0 } evName
+                ? evName
+                : $"#{itemId}";
+        return Svc.Data.GetExcelSheet<Item>().TryGetRow(itemId, out var row) ? row.Name.ExtractText() : $"#{itemId}";
+    }
 }

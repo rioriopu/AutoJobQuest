@@ -33,9 +33,10 @@ public static class Preflight
 {
     /// <summary>画面に常に出す前提の文言。</summary>
     public const string Premise =
-        "開始条件：選択した対象職はそれぞれ Lv70 以上。対象クエストは製作8職・採集3職の Lv60 までです。"
+        "開始条件：選択した対象職はそれぞれ Lv70 以上。対象クエストは製作8職・採集3職の Lv70 までです。"
         + "製作装備は、ショップで購入できる Lv60 装備（ノーマル品）以上を着けていること"
-        + "（主道具・副道具・頭・胴・手・脚・足）。満たしていない場合、動作は保証しません。";
+        + "（主道具・副道具・頭・胴・手・脚・足）。満たしていない場合、動作は保証しません。"
+        + "チョコボかばんの中身は数えず、引き出しもしません。使いたい素材・完成品は、開始前にカバンかリテイナーへ移してください。";
 
     /// <summary>必須プラグイン（InternalName, 表示名, 用途）。</summary>
     public static readonly (string Internal, string Display, string Why)[] RequiredPlugins =
@@ -53,24 +54,51 @@ public static class Preflight
     public static List<PreflightItem> Run(TaskContext ctx, JobQuestPlan? plan, Ipc.ArtisanHqEstimate.Job? hq = null)
     {
         var list = new List<PreflightItem>();
+        // HQ の見込みは参考値なので、計算できなくても始めるのは止めない（以前は Error にして開始できなくなった）。
+        // 注意として出し、確認窓で利用者に決めてもらう
         if (hq?.Error is { } calculationError)
-            list.Add(new PreflightItem(Severity.Error, $"HQ 計算の条件を確かめられません：{calculationError}"));
+            list.Add(new PreflightItem(Severity.Warn, $"HQ の参考値を計算できませんでした（{calculationError}）。見込みを出さずに進めます"));
 
         // 1) プラグイン
         var installed = Svc.PluginInterface.InstalledPlugins.ToList();
         // 戦闘・釣りの素材が今の計画に無ければ、RSR・AutoHook が無くても止めない（使わない物で止めない）。
         // ほかの手段が失敗して戦闘・釣りに回ったときは、その作業の開始時に理由を出して止まる
         bool Uses(Route r) => plan == null || plan.Shortfalls.Any(x => x.Route == r || x.Fallbacks.Contains(r));
+
+        // この点検はリテイナーから引き出す前の手持ちで立てた計画で行う。戦闘・釣りの不足は、リテイナーの在庫で埋まるかもしれない。
+        // 以前はリテイナーに持っている魚・戦闘素材のために、釣りの同意や RSR を求めて開始できなかった。
+        // リテイナーを使うときは、その分を注意にとどめ、引き出した後の素材集めの始めでもう一度確かめて止める（JobQuestFlow.StartAcquire・GatherTask）
+        var afterRetainers = ctx.Config.UseRetainerStock;
+        var routeSeverity = afterRetainers ? Severity.Warn : Severity.Error;
+        // 控えの手段（ほかの手段で集めきれなかったときに回る手段）は、その手段に回った周回の始めで確かめて止まる
+        var retainerNote = afterRetainers
+            ? "（リテイナーの在庫で足りれば使いません。引き出した後も要るとき・ほかの手段で集めきれずに回ったときは、その素材集めの周回の始めで止まります）"
+            : string.Empty;
+
+        // 残りのジョブクエの経路に Questionable の釣りの手順があれば、AutoHook は計画に関係なく要る。
+        // Questionable は AutoHook が無いと釣りの手順で止まり、以前は理由の出ない失敗になっていた
+        var questFishing = plan == null ? [] : QuestsWithFishing(plan.RemainingQuests, QuestionablePaths.Steps);
         foreach (var (internalName, display, why) in RequiredPlugins)
         {
             var p = installed.FirstOrDefault(x => x.InternalName == internalName);
             if (p != null && p.IsLoaded)
                 continue;
 
+            if (internalName == "AutoHook" && questFishing.Count > 0)
+            {
+                list.Add(new PreflightItem(Severity.Error,
+                    $"{display} が読み込まれていません（{string.Join("、", questFishing.Take(3))}{(questFishing.Count > 3 ? $" ほか {questFishing.Count - 3} 本" : string.Empty)} の、"
+                    + "Questionable の釣りの手順で要ります）"));
+                continue;
+            }
+
             var optional = (internalName == "RotationSolver" && !Uses(Route.Combat)) || (internalName == "AutoHook" && !Uses(Route.Fish));
+            var routeOnly = internalName is "RotationSolver" or "AutoHook";
             list.Add(optional
                 ? new PreflightItem(Severity.Warn, $"{display} が読み込まれていません（{why}に使います。今の計画では使いませんが、ほかの手段で集めきれず{why}に回ったときに止まります）")
-                : new PreflightItem(Severity.Error, $"{display} が読み込まれていません（{why}に使います）"));
+                : routeOnly
+                    ? new PreflightItem(routeSeverity, $"{display} が読み込まれていません（{why}で集める素材があります）{retainerNote}")
+                    : new PreflightItem(Severity.Error, $"{display} が読み込まれていません（{why}に使います）"));
         }
 
         // GBR の NPC 購入は Allagan Tools か Allagan Item Search が要る
@@ -96,8 +124,16 @@ public static class Preflight
         if (Jobs.StartProblem(ctx.Config.SelectedCrafters, Jobs.Level) is { } levelProblem)
             list.Add(new PreflightItem(Severity.Error, levelProblem));
 
-        // 3) レベル
+        // 選んだ職のジョブクエ（Lv70 まで）に要るメインクエストが未完了なら始めない
+        var msqProblem = MainQuestGate.StartProblem(ctx.Data, ctx.Config.SelectedCrafters);
+        if (msqProblem != null)
+            list.Add(new PreflightItem(Severity.Error, msqProblem));
+
+        // 3) レベル。見るのは今の計画で使う職だけ（以前は使わない職の Lv60 未満でも注意を出していた）。
+        // 使う職＝残りのクエストの職・製作に使う職・採集で集める素材があれば採掘と園芸・釣りで集める素材があれば漁師
+        var usedJobs = UsedJobs(plan);
         var low = Jobs.Crafters.Concat(Jobs.Gatherers)
+            .Where(usedJobs.Contains)
             .Select(j => (Job: j, Level: Jobs.Level(j)))
             .Where(x => x.Level < 60)
             .ToList();
@@ -118,6 +154,13 @@ public static class Preflight
                 used = plan.RemainingQuests.Select(q => q.ClassJobId).Concat(plan.Craft.Crafts.Select(c => c.ClassJobId)).ToHashSet();
                 if (plan.Craft.LockedBySecretBook.Count > 0 && ctx.Data.Planner?.Pick(ctx.Config.ScripCollectableItemId) is { } collectRecipe)
                     used.Add(Jobs.CraftTypeToClassJob(collectRecipe.CraftType.RowId));
+            }
+
+            // 選んだ採集職のギアセット（無いと受注の時点で Questionable が止まる。素材集めや製作の後になりうるので、始める前に止める）
+            foreach (var job in Jobs.Gatherers.Where(used.Contains))
+            {
+                if (GearCheck.FindGearset(job) < 0)
+                    list.Add(new PreflightItem(Severity.Error, $"{Jobs.Name(job)} のギアセットがありません（ジョブクエの受注でその職に着替えられません）。ギアセットを登録してから開始してください"));
             }
 
             foreach (var job in Jobs.Crafters.Where(used.Contains))
@@ -146,9 +189,10 @@ public static class Preflight
             }
         }
 
-        foreach (var job in Jobs.Gatherers)
+        // 採集・釣りで集める素材があるときだけ、その職のギアセットを見る（選んだ採集職は上で開始不可にしている）
+        foreach (var job in Jobs.Gatherers.Where(usedJobs.Contains))
         {
-            if (GearCheck.FindGearset(job) < 0)
+            if (GearCheck.FindGearset(job) < 0 && !(plan?.RemainingQuests.Any(q => q.ClassJobId == job) ?? false))
                 list.Add(new PreflightItem(Severity.Warn, $"{Jobs.Name(job)} のギアセットがありません（GBR が採集・釣りで止まります）"));
         }
 
@@ -172,12 +216,12 @@ public static class Preflight
             // 釣りは GBR に一任する。GBR が釣れない設定なら、別の手段に黙って切り替えず始める前に止める
             var fishItems = string.Join("、", plan!.Shortfalls.Where(x => x.Route == Route.Fish).Select(x => $"{x.Name}×{x.Shortfall}"));
             if (ctx.Gbr.ReadAutoGatherBool("FishDataCollection") != true)
-                list.Add(new PreflightItem(Severity.Error,
+                list.Add(new PreflightItem(routeSeverity,
                     $"釣りで集める素材があります（{fishItems}）が、GBR の「Opt-in to fishing data collection」が OFF のため GBR は釣りをしません。"
                     + "これは釣果を GBR の外部サーバーへ送ることへの同意なので、こちらからは変えません。"
-                    + "GBR の設定画面の検索欄に「fishing data」と入れると項目が出ます。ON にしてからもう一度始めてください"));
+                    + "GBR の設定画面の検索欄に「fishing data」と入れると項目が出ます。ON にしてからもう一度始めてください" + retainerNote));
             if (ctx.Gbr.ReadAutoGatherBool("UseAutoHook") == false)
-                list.Add(new PreflightItem(Severity.Error, $"釣りで集める素材があります（{fishItems}）が、GBR の UseAutoHook が OFF のため釣りが始まりません"));
+                list.Add(new PreflightItem(routeSeverity, $"釣りで集める素材があります（{fishItems}）が、GBR の UseAutoHook が OFF のため釣りが始まりません{retainerNote}"));
         }
 
         // 5.5) 任意のマテリア（既定は剛柔のマテリア）が、付ける納品物に付けられるか
@@ -214,9 +258,12 @@ public static class Preflight
             // 前提のクエストが自動で進められない（メインクエスト等が未完了）ジョブクエ。
             // 止めずに「どのクエストが未達なので動作保証しない」と注意を出す（確認窓で続けるか決める）。
             // 続けた場合、そのクエストは計画に入れない（素材も集めない）。進められる分だけ進める
+            // メインクエストが未達で開始できない（上の Error）ときは、「続けた場合は飛ばす」とは案内しない
+            var cannotStart = msqProblem != null;
             foreach (var line in plan.BlockedSummary())
-                list.Add(new PreflightItem(Severity.Warn,
-                    $"前提のクエストが未完了のため、次のジョブクエは進められません（動作保証外。続けた場合、これらは飛ばし、素材も集めません）：{line}"));
+                list.Add(new PreflightItem(Severity.Warn, cannotStart
+                    ? $"前提のクエストが未完了のため、次のジョブクエは進められません：{line}"
+                    : $"前提のクエストが未完了のため、次のジョブクエは進められません（動作保証外。続けた場合、これらは飛ばし、素材も集めません）：{line}"));
         }
 
         // RSR がこちらを使う前から動いている（利用者が使っている）とき。
@@ -235,7 +282,20 @@ public static class Preflight
         {
             list.AddRange(RsrSettings(ctx));
             if (Ipc.RsrStateReader.ReadTargetFreelyOverride() != false)
-                list.Add(new PreflightItem(Severity.Error, "RSR の外部ターゲット指定が有効、または読めません。指定外を狙わないと確認できるまで戦闘は始められません"));
+            {
+                list.Add(new PreflightItem(routeSeverity, "RSR の外部ターゲット指定が有効、または読めません。指定外を狙わないと確認できるまで戦闘は始められません" + retainerNote));
+
+                // 注意に下げたときは開始できるので、攻撃されたときの反撃の注意もここで出す（以前は下の else の側にしか無く、出なかった）
+                if (routeSeverity == Severity.Warn && CombatJobPicker.Pick() != null)
+                    list.Add(new PreflightItem(Severity.Warn, "RSR の外部ターゲット指定が有効、または読めません。攻撃されたときの反撃ができず、そこで止まります"));
+            }
+        }
+        else if (installed.Any(x => x.InternalName == Ipc.RsrStateReader.InternalName && x.IsLoaded) && CombatJobPicker.Pick() != null
+                 && Ipc.RsrStateReader.ReadTargetFreelyOverride() != false)
+        {
+            // 戦闘で集める素材が無くても、攻撃されたら反撃する。そのときに外部ターゲット指定が有効だと、
+            // 反撃を続けられずに実行全体が止まる。止めはしないが、始める前に知らせる
+            list.Add(new PreflightItem(Severity.Warn, "RSR の外部ターゲット指定が有効、または読めません。攻撃されたときの反撃ができず、そこで止まります"));
         }
 
         // 5.85) vnavmesh の「詰まったら止める」「止めた後に探し直す」が両方 ON（設定ファイルを読むだけ）。
@@ -290,6 +350,9 @@ public static class Preflight
 
         if (list.All(x => x.Severity == Severity.Ok))
             list.Add(new PreflightItem(Severity.Ok, "問題は見つかりませんでした"));
+
+        // チョコボかばん（使わない・引き出さない。どこかに注意を出す）。Ok なので上の判定は変えない
+        list.Add(new PreflightItem(Severity.Ok, "チョコボかばん：中身は数えず、引き出しません（入っている素材は無いものとして集め直します）"));
 
         return list;
     }
@@ -382,15 +445,33 @@ public static class Preflight
     /// 準備は主スレッド、計算はフレームごとに進める。条件変更・例外は結果を破棄して停止する。
     /// </summary>
     public static Ipc.ArtisanHqEstimate.Job BeginHq(JobQuestPlan? plan)
-        => new(plan == null ? [] : plan.Craft.Crafts
+        => new(plan == null ? [] : HqTargets(plan));
+
+    /// <summary>
+    /// HQ の見込みの対象：HQ 指定の製作のうち手持ちの HQ で足りていないものと、残りのクエストの受注後の製作のうち
+    /// HQ が要り、まだ持っていないもの（Lv61〜70 の32品。以前は対象に入っておらず、Lv70 ちょうどの装備で HQ になりにくくても知らせなかった）。
+    /// </summary>
+    public static List<(uint RecipeId, uint ItemId, uint ClassJobId)> HqTargets(JobQuestPlan plan)
+    {
+        var list = plan.Craft.Crafts
             .Where(c => c.WantHq && (c.HqTarget <= 0 || Inventory.CountNow(c.ItemId, hqOnly: true) < c.HqTarget))
-            .Select(c => (c.RecipeId, c.ItemId, c.ClassJobId)));
+            .Select(c => (c.RecipeId, c.ItemId, c.ClassJobId)).ToList();
+        var recipes = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Recipe>();
+        foreach (var qc in plan.RemainingQuests.SelectMany(q => q.QuestCrafts))
+        {
+            if (!qc.Hq || Inventory.CountNow(qc.ItemId, hqOnly: true) >= qc.Count || list.Any(t => t.RecipeId == qc.RecipeId))
+                continue;
+            if (recipes.TryGetRow(qc.RecipeId, out var recipe))
+                list.Add((qc.RecipeId, qc.ItemId, Jobs.CraftTypeToClassJob(recipe.CraftType.RowId)));
+        }
+
+        return list;
+    }
 
     private static IEnumerable<PreflightItem> HqOutlook(TaskContext ctx, JobQuestPlan plan, Ipc.ArtisanHqEstimate.Job? hq)
     {
         // 手持ちの HQ で足りている品は、実際の製作でも HQ を求めない（CraftOneTask.HqNeeded＝0）ので外す
-        var targets = plan.Craft.Crafts.Where(c => c.WantHq && (c.HqTarget <= 0 || Inventory.CountNow(c.ItemId, hqOnly: true) < c.HqTarget))
-            .Select(c => (c.RecipeId, c.ItemId, c.ClassJobId)).ToList();
+        var targets = HqTargets(plan);
         if (targets.Count == 0)
             yield break;
 
@@ -407,8 +488,16 @@ public static class Preflight
         var results = hq.Results;
         yield return new PreflightItem(Severity.Ok, "HQ は参考値です。実際のソルバー・食事・HQ素材と異なる場合、上振れも下振れもあります。成功率の下限ではありません");
 
-        foreach (var r in results.Where(r => r.Percent == null))
+        var failed = results.Where(r => r.Percent == null).ToList();
+        foreach (var r in failed)
             ctx.Log.Write("事前点検", $"HQ の見込みを計算できませんでした：{CraftPlanner.ItemName(r.ItemId)}（{r.Note}）");
+
+        // 計算できなかった品は、確認窓にも注意として出す（以前は記録にしか出ず、見込みが無いことが伝わらなかった。開始は止めない）
+        if (failed.Count > 0)
+            yield return new PreflightItem(Severity.Warn,
+                "HQ の参考値を計算できなかった品があります（見込みなしで進めます）："
+                + string.Join("、", failed.Take(5).Select(r => $"{CraftPlanner.ItemName(r.ItemId)}（{r.Note}）"))
+                + (failed.Count > 5 ? $" ほか {failed.Count - 5} 件" : string.Empty));
         foreach (var r in results.Where(r => r.Percent != null))
             ctx.Log.Write("事前点検", $"HQ の見込み：{CraftPlanner.ItemName(r.ItemId)} {r.Percent:0.#}%（{r.Stats}・{r.Solver}・{r.Runs}回）");
 
@@ -433,6 +522,31 @@ public static class Preflight
     ///  ・TargetFreely・IgnoreNonFateInFate が ON：戦闘の間だけ OFF にして戻すことを知らせる
     ///  ・自動 OFF の設定：記録に残すだけ（外れたらこちらで送り直す）
     /// </summary>
+    /// <summary>
+    /// 今の計画で使う職（残りのクエストの職・製作に使う職・採集で集める素材があれば採掘と園芸・釣りで集める素材があれば漁師）。
+    /// 計画が無ければ全部。
+    /// </summary>
+    public static HashSet<uint> UsedJobs(JobQuestPlan? plan)
+    {
+        if (plan == null)
+            return Jobs.Crafters.Concat(Jobs.Gatherers).ToHashSet();
+        var used = plan.RemainingQuests.Select(q => q.ClassJobId).Concat(plan.Craft.Crafts.Select(c => c.ClassJobId)).ToHashSet();
+        bool Uses(Route r) => plan.Shortfalls.Any(x => x.Route == r || x.Fallbacks.Contains(r));
+        if (Uses(Route.Gather))
+        {
+            used.Add(Jobs.Gatherers[0]);
+            used.Add(Jobs.Gatherers[1]);
+        }
+
+        if (Uses(Route.Fish))
+            used.Add(Jobs.Gatherers[2]);
+        return used;
+    }
+
+    /// <summary>経路に Questionable の釣りの手順があるクエスト（AutoHook が要る）。</summary>
+    public static List<JobQuest> QuestsWithFishing(IEnumerable<JobQuest> quests, Func<ushort, IReadOnlyList<QuestionableStep>?> steps)
+        => quests.Where(q => steps(q.ShortId)?.Any(s => s.Type == "Fish") == true).ToList();
+
     private static IEnumerable<PreflightItem> RsrSettings(TaskContext ctx)
     {
         if (Ipc.RsrStateReader.ReadBool("PoslockCasting") == true)

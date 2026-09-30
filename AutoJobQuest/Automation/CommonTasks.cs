@@ -320,14 +320,19 @@ public sealed class MoveToTask : AutoTask
 
 /// <summary>
 /// 指定エリアへテレポートする（Lifestream）。そのエリアに解放済みのエーテライトが無ければ失敗。
-/// 既にそのエリアにいれば何もしない。
+/// 既にそのエリアにいれば何もしない。ただし、行き先のエーテライトを指定したとき（同じエリアの中のテレポ）は、
+/// 頼んだ後にエリア移動の読み込みを見て、それが終わって動ける状態になったら着いたとする（同じエリアでもテレポは読み込みを挟む）。
 /// </summary>
 public sealed class TeleportTask : AutoTask
 {
     private readonly uint territory;
     private readonly Vector3? near;
+    private readonly uint? within;
     private bool requested;
     private int attempts;
+
+    // 同じエリアの中のテレポで、頼んだ後にエリア移動の読み込みを見たか
+    private bool sawBetweenAreas;
 
     // 頼んだ後にテレポ（Action 5）の詠唱を見たか（詠唱が途切れたら上限を待たずに頼み直す）
     private bool sawCast;
@@ -340,17 +345,21 @@ public sealed class TeleportTask : AutoTask
 
     /// <param name="territory">行き先のエリア。</param>
     /// <param name="near">エリア内で近づきたい位置（複数のエーテライトがあるとき、一番近いものを選ぶ）。</param>
-    public TeleportTask(uint territory, Vector3? near = null)
+    /// <param name="within">同じエリアの中で飛ぶ先のエーテライト（エーテライト表の行）。指定しなければ、そのエリアに入った時点で着いたとする。</param>
+    public TeleportTask(uint territory, Vector3? near = null, uint? within = null)
     {
         this.territory = territory;
         this.near = near;
+        this.within = within;
     }
 
     public override string Name => $"テレポ: {TerritoryName(this.territory)}";
 
     protected override TaskResult Tick(TaskContext ctx)
     {
-        if (Me.Territory == this.territory && GameUi.PlayerFree())
+        if (this.within == null
+                ? Me.Territory == this.territory && GameUi.PlayerFree()
+                : this.requested && this.sawBetweenAreas && !GameUi.BetweenAreas && Me.Territory == this.territory && GameUi.PlayerFree())
             return TaskResult.Done;
 
         // 上限は実際に作業できた時間で測る（反撃・会話の窓の処理と、他者の画面を待った時間は数えない）
@@ -367,6 +376,7 @@ public sealed class TeleportTask : AutoTask
             // 詠唱→エリア移動が始まるのを待つ。詠唱を見た後に途切れたらすぐ、詠唱が一度も始まらなければ上限でやり直す（TeleportWatch）
             var casting = CastingTeleport();
             this.sawCast |= casting;
+            this.sawBetweenAreas |= GameUi.BetweenAreas;
             switch (TeleportWatch.Decide(casting, GameUi.BetweenAreas, this.sawCast, GameUi.PlayerFree(), GameUi.ActionStatus(TeleportActionId), this.PhaseElapsed))
             {
                 case TeleportWatch.Verdict.InProgress:
@@ -409,11 +419,12 @@ public sealed class TeleportTask : AutoTask
         if (this.attempts++ >= 3)
             return this.Fail($"{TerritoryName(this.territory)} へテレポできませんでした（3 回頼んでも詠唱が始まらないか、途切れました{(this.lastRefusal != 0 ? $"。最後に見た理由{MarketBoardWatcher.MessageText(this.lastRefusal)}" : string.Empty)}）");
 
-        var aetheryte = FindAetheryte(this.territory, this.near);
+        var aetheryte = this.within ?? FindAetheryte(this.territory, this.near);
         if (aetheryte == null)
             return this.Fail($"{TerritoryName(this.territory)} に解放済みのエーテライトがありません");
 
         this.sawCast = false;
+        this.sawBetweenAreas = false;
         if (!ctx.Lifestream.TryTeleport(aetheryte.Value, 0, out var accepted) || !accepted)
         {
             // 同じ点検をしてから頼んでいるので、ここに来るのは点検と Lifestream の間で状態が変わったときだけ。次のフレームで読み直す
@@ -432,12 +443,15 @@ public sealed class TeleportTask : AutoTask
         => Svc.Objects.LocalPlayer is { } me && me.IsCasting && me.CastActionId == TeleportActionId
            && me.CastActionType == (byte)FFXIVClientStructs.FFXIV.Client.Game.ActionType.Action;
 
-    /// <summary>そのエリアの解放済みエーテライト（近い位置が分かれば一番近いもの）。</summary>
+    /// <summary>
+    /// そのエリアの解放済みエーテライト（近い位置が分かれば一番近いもの）。
+    /// 位置は地図の印から求める（エーテライト表の Level の行は本体では1つも無い。以前はどれも同じ距離になり、
+    /// 行番号の一番小さいエーテライトを選んでいた）。
+    /// </summary>
     public static uint? FindAetheryte(uint territory, Vector3? near)
     {
         var unlocked = Svc.Aetherytes.Select(a => a.AetheryteId).ToHashSet();
         var sheet = Svc.Data.GetExcelSheet<Aetheryte>();
-        var levels = Svc.Data.GetExcelSheet<Level>();
 
         var candidates = sheet
             .Where(a => a.IsAetheryte && a.Territory.RowId == territory && unlocked.Contains(a.RowId))
@@ -448,13 +462,7 @@ public sealed class TeleportTask : AutoTask
             return candidates[0].RowId;
 
         return candidates
-            .OrderBy(a =>
-            {
-                var lv = a.Level.FirstOrDefault(l => l.RowId != 0);
-                return lv.RowId != 0 && levels.TryGetRow(lv.RowId, out var row)
-                    ? Vector2.Distance(new Vector2(row.X, row.Z), new Vector2(near.Value.X, near.Value.Z))
-                    : float.MaxValue;
-            })
+            .OrderBy(a => Data.AetherytePlaces.FlatDistance(a.RowId, near.Value) ?? float.MaxValue)
             .First().RowId;
     }
 

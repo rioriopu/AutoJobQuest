@@ -210,7 +210,12 @@ public static class PlanBuilder
     /// <param name="data">ゲームデータの表（作り終わっていること）。</param>
     /// <param name="selected">木工→調理の順の選択。</param>
     /// <param name="excludedRoutes">前の周回で失敗した手段（品目 → 手段）。次は別の手段にする。</param>
-    public static unsafe JobQuestPlan Build(GameDataCache data, bool[] selected, IReadOnlyDictionary<uint, HashSet<Route>>? excludedRoutes = null)
+    /// <param name="onlyQuests">
+    /// 今の区切りのジョブクエ（鞄があふれないよう、職ごと・前から何本かずつに区切って進める。JobQuestFlow の NextBatch）。
+    /// null なら選んだ職の残り全部。進められないクエスト（Blocked）は区切りに関係なく全部を出す。
+    /// </param>
+    public static unsafe JobQuestPlan Build(GameDataCache data, bool[] selected, IReadOnlyDictionary<uint, HashSet<Route>>? excludedRoutes = null,
+        IReadOnlySet<uint>? onlyQuests = null)
     {
         var plan = new JobQuestPlan();
         if (!data.IsReady)
@@ -229,7 +234,7 @@ public static class PlanBuilder
         //   進められないクエストの素材まで集めると、ギルと時間が無駄になるため）
         var (runnable, blocked) = SplitQuests(data.Quests!.Quests, jobs, PrereqContext.FromGame(data));
         plan.Blocked.AddRange(blocked);
-        plan.RemainingQuests.AddRange(runnable);
+        plan.RemainingQuests.AddRange(onlyQuests == null ? runnable : runnable.Where(q => onlyQuests.Contains(q.RowId)));
 
         var inv = Inventory.Snapshot();
 
@@ -247,10 +252,35 @@ public static class PlanBuilder
                 plan.PartialNeeds[q.RowId] = needs.Needed;
             }
 
-            plan.RetainerTargets.AddRange(needs.Needed);
-            // 取引可能な魚・鉱石などは先に用意できる。専用品は受注後のQuestionableの採集手順で得る。
-            plan.Targets.AddRange(needs.Needed.Where(n => !Jobs.IsGatherer(q.ClassJobId)
-                || !Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRow(n.ItemId).IsUntradable));
+            // 受注した後にしか手に入らない納品物（Lv61〜70 の取引できない品：クエストがくれる材料・その材料から作る品・受注後に採る品）は
+            // 用意しない（受注後に Questionable が作る・採る）。取引できる魚・鉱石などは先に用意できる。
+            // 品質不問で2個以上を渡す製作品は HQ で用意する（NQ と HQ の山が分かれると納品窓で渡せない）
+            // 採集職の納品物で、こちら（GBR）で集めきれなかった品（採集・釣りの手段を外した品）は、受注後に Questionable が自分で採るので、
+            // 先に集める対象から外す（以前は集めにくい品が1つあると、周回の上限で実行全体が止まった）
+            var questGathers = Jobs.IsGatherer(q.ClassJobId) ? QuestionablePaths.GatheredItems(q.ShortId) : new HashSet<uint>();
+            bool LeftToQuestionable(uint item) => questGathers.Contains(item) && excludedRoutes != null
+                && excludedRoutes.TryGetValue(item, out var bad) && (bad.Contains(Route.Gather) || bad.Contains(Route.Fish));
+            var prepare = needs.Needed.Where(n => !q.AfterAcceptItems.Contains(n.ItemId) && !LeftToQuestionable(n.ItemId))
+                .Select(n => PlanAsHq(data.Planner!, n)).ToList();
+            plan.RetainerTargets.AddRange(prepare);
+            plan.Targets.AddRange(prepare);
+
+            // 受注後に作る品のクリスタル（クエストはくれない）。まだ渡す前で、作った品も足りていなければ、
+            // 作る回数＋作り直しの予備の分を用意する（HQ にならなかったときの作り直し：QuestCraftTask）
+            if (stage == Automation.QuestItemStage.Stage.All)
+                foreach (var qc in q.QuestCrafts)
+                {
+                    var held = qc.Hq ? inv.CountHq(qc.ItemId) : inv.CountAll(qc.ItemId);
+                    if (held >= qc.Count)
+                        continue;
+                    var crafts = (int)Math.Ceiling((qc.Count - held) * (double)qc.Crafts / Math.Max(1, qc.Count)) + QuestCraftSpare;
+                    foreach (var (item, amount) in qc.Prepared)
+                    {
+                        var req = new QuestItemReq(item, amount * crafts, false, $"受注後に作る {CraftPlanner.ItemName(qc.ItemId)} の材料（予備 {QuestCraftSpare} 回分を含む）");
+                        plan.Targets.Add(req);
+                        plan.RetainerTargets.Add(req);
+                    }
+                }
 
             // Questionable の「Craft」手順のうち、納品物ではない品（中間素材）の手順は、手元に無いと Artisan の既製リストが動いて
             // 追加製作・材料の買い足しになる。その数も手元に残るよう作る（まだ手順の前のクエストだけ）
@@ -324,6 +354,27 @@ public static class PlanBuilder
         }
 
         return plan;
+    }
+
+    /// <summary>
+    /// 受注後に作る品（Lv61〜70 の製作職）の、作り直しの予備の回数（そのクリスタルを先に用意する）。
+    /// 設定の MaxRetryRounds（HQ にならなかったときに作り直す回数の上限）から Configuration が入れる。
+    /// </summary>
+    public static int QuestCraftSpare { get; set; } = 3;
+
+    /// <summary>
+    /// 品質不問で2個以上を渡す、重ねられて HQ のある製作品は、HQ で用意する。
+    /// 計画は品質不問の納品を NQ と HQ の合計で数えるが、納品窓は「1つの欄に1つの山から N 個」しか受け付けない。
+    /// 手持ちやリテイナーの NQ に製作でできた HQ が混ざると、どちらの山も N 個に届かず渡せない（Lv60 までで9件：木工 Lv10 のアッシュ材×12 など）。
+    /// HQ で N 個そろえておけば、納品窓は NQ の山が足りなければ HQ の山を使える。
+    /// </summary>
+    public static QuestItemReq PlanAsHq(CraftPlanner planner, QuestItemReq n)
+    {
+        if (n.Hq || n.Count < 2 || !planner.IsCraftable(n.ItemId))
+            return n;
+        if (!Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Item>().TryGetRow(n.ItemId, out var item) || item.StackSize <= 1 || !item.CanBeHq)
+            return n;
+        return n with { Hq = true, Evidence = n.Evidence + "（品質不問だが、NQ と HQ の山が分かれると納品窓で渡せないので HQ で用意する）" };
     }
 
     /// <summary>

@@ -170,6 +170,11 @@ public static class QuestTakeOver
             return null;
 
         var seqCrafts = crafts.Where(c => c.Sequence == sequence).ToList();
+
+        // 製作の無い段（購入だけ：釣り餌など）は引き取らない（以前は漁師 Lv63・65 で「作る品を全部持っている」が空で真になり、
+        // 餌を買わずに進めて後の釣りで詰まった。Lv1〜60 の漁師6本・採掘1本も同じ形。購入の手順は「持っていれば飛ばす」付きなので二重には買わない）
+        if (seqCrafts.Count == 0)
+            return null;
         var premade = seqCrafts.Any(c => c.ItemId == null);
         var buys = buyOrCraft.Any(s => s.Type == "PurchaseItem");
         var allHeld = seqCrafts.Where(c => c.ItemId != null).All(c => held(c.ItemId!.Value, Math.Max(1, c.ItemCount), c.Hq));
@@ -185,6 +190,82 @@ public static class QuestTakeOver
         if (rest.Count == 0 || rest.Any(s => !OwnTypes.Contains(s.Type)))
             return null;
         return WithoutDone(rest, doneRecipient);
+    }
+
+    /// <summary>
+    /// 受注後の品（Lv61〜70 の製作職）の製作手順を引き取るか。引き取るならその品、引き取らないなら null。
+    /// 必要数を（HQ が要るなら HQ で）持っていれば引き取らない。Questionable の製作手順は「持っていれば飛ばす」付きなので、
+    /// こちらが作り終えて戻した後は Questionable が飛ばして先へ進む。
+    /// 以前は持ち物を見ずに引き取ったので、戻した直後の数フレーム（Questionable が飛ばすまで）に製作手順をまた引き取り、
+    /// 戻す→引き取るを繰り返して30分の上限で止まっていた（Lv61〜70 の製作32本すべて）。
+    /// </summary>
+    /// <param name="type">Questionable のいまの手順の種類。</param>
+    /// <param name="stepItem">その手順の品（経路データ。無ければ null）。</param>
+    /// <param name="crafts">そのクエストの受注後に作る品。</param>
+    /// <param name="held">持っている数（品, HQ で数えるか）。</param>
+    public static QuestCraft? QuestCraftToTake(string type, uint? stepItem, IReadOnlyList<QuestCraft> crafts, Func<uint, bool, int> held)
+    {
+        if (type != "Craft" || crafts.Count == 0)
+            return null;
+        var qc = crafts.FirstOrDefault(c => stepItem == null || c.ItemId == stepItem);
+        if (qc == null)
+            return null;
+        return held(qc.ItemId, qc.Hq) >= qc.Count ? null : qc;
+    }
+
+    /// <summary>
+    /// 手で行う手順（Instruction）の後に、同じ段でこちらが行える手順（話しかける等）だけが残り、その段で渡す品がそろったら、
+    /// 残りの手順を返す（こちらで行う）。そろっていない・ほかの種類が残るなら null。
+    /// 漁師 Lv68「減少を食い止めろ」の段5は、刺突漁で大方士を獲った後にワワラゴへ渡して初めて段が進む。
+    /// Questionable の Instruction は段が変わるまで待ち続け、先へ進めるのは Questionable の画面の Skip だけなので、
+    /// 以前は獲り終えても進まず、60分の上限で止まっていた。
+    /// </summary>
+    /// <param name="steps">そのクエストの全手順（経路データ）。</param>
+    /// <param name="sequence">Questionable がいま進めている段。</param>
+    /// <param name="stepIndex">Questionable がいま進めている手順の番号。</param>
+    /// <param name="type">その手順の種類。</param>
+    /// <param name="itemsReady">この段で渡す品が、必要数そろっているか。</param>
+    public static List<QuestionableStep>? AfterInstruction(IReadOnlyList<QuestionableStep> steps, int sequence, int stepIndex, string type, bool itemsReady)
+    {
+        if (type != "Instruction" || !itemsReady)
+            return null;
+        var rest = steps.Where(s => s.Sequence == sequence && s.Index > stepIndex).OrderBy(s => s.Index).ToList();
+        if (rest.Count == 0 || rest.Any(s => !OwnTypes.Contains(s.Type)) || !rest.Any(s => s.Type is "Interact" or "CompleteQuest"))
+            return null;
+        return rest;
+    }
+
+    /// <summary>
+    /// 受注後の品の製作の段にいるのに、その品が（HQ が要るなら HQ で）足りないなら、その品（引き取って作る）。そうでなければ null。
+    /// Questionable の製作の手順の「持っていれば飛ばす」は品質を見ない（NQ と HQ の合計で数える）。そのため NQ だけを持って製作の段に来ると、
+    /// 製作の手順を飛ばして受け取る相手へ行き、相手は HQ が無いので応じず、30分の上限で止まっていた（こちらの引き取りは手順の種類が製作のときだけだった）。
+    /// そこで、その段のどの手順にいても、HQ が足りなければ引き取る。
+    /// </summary>
+    /// <param name="sequence">Questionable がいま進めている段。</param>
+    /// <param name="steps">そのクエストの全手順（経路データ）。</param>
+    /// <param name="crafts">そのクエストの受注後に作る品。</param>
+    /// <param name="held">持っている数（品, HQ で数えるか）。</param>
+    public static QuestCraft? QuestCraftInSequence(int sequence, IReadOnlyList<QuestionableStep> steps, IReadOnlyList<QuestCraft> crafts, Func<uint, bool, int> held)
+    {
+        foreach (var qc in crafts)
+        {
+            var inThisSequence = steps.Any(s => s.Sequence == sequence && s.Type == "Craft" && (s.ItemId == null || s.ItemId == qc.ItemId));
+            if (inThisSequence && held(qc.ItemId, qc.Hq) < qc.Count)
+                return qc;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 手で行う手順の段で渡す品（受注後にしか手に入らない品のうち、その段が品を使う段の範囲にあるもの）。
+    /// 漁師 Lv68 なら大方士×3（クエストの本文から読んだ数）。
+    /// </summary>
+    public static List<QuestItemReq> InstructionItems(JobQuest quest, int sequence)
+    {
+        if (sequence < quest.FirstItemSeq || (quest.LastItemSeq != 255 && sequence > quest.LastItemSeq))
+            return [];
+        return quest.Items.Where(i => quest.AfterAcceptItems.Contains(i.ItemId)).ToList();
     }
 
     /// <summary>
@@ -213,6 +294,23 @@ public static class QuestTakeOver
         return WithoutDone(rest, doneRecipient);
     }
 
+    /// <summary>ギアセット・装備を変える手順の種類（Questionable の新しいクラス向けの準備）。</summary>
+    public static readonly string[] GearsetSetupTypes = ["EquipItem", "CreateGearset", "EquipRecommended", "UpdateGearset"];
+
+    /// <summary>
+    /// 受注前の段（段0）に、新しいクラス向けの準備（道具の装備・ギアセットの作成・推奨装備での上書き）があるなら、その段の受注の手順。無ければ null。
+    /// Lv1 の「My First ～」（製作8職・採集3職）がこの形（経路で確認：飛ばす条件は NG+ だけ）。
+    /// Lv70 の職では要らず、利用者のギアセットを1つ増やして書き換える。漁師と製作8職は Lv1 の道具が無いと例外で止まる。
+    /// そこで段0 はこちらで受注だけ行う（受注の相手に話しかける）。
+    /// </summary>
+    public static QuestionableStep? GearsetSetupAccept(IReadOnlyList<QuestionableStep> steps)
+    {
+        var seq0 = steps.Where(s => s.Sequence == 0).ToList();
+        if (!seq0.Any(s => GearsetSetupTypes.Contains(s.Type)))
+            return null;
+        return seq0.FirstOrDefault(s => s.Type == "AcceptQuest" && s.DataId != null && s.Position != null);
+    }
+
     private static List<QuestionableStep> WithoutDone(List<QuestionableStep> rest, Func<uint, bool>? doneRecipient)
         => doneRecipient == null ? rest : rest.Where(s => !(s.Type == "Interact" && s.DataId is { } id && doneRecipient(id))).ToList();
 }
@@ -235,6 +333,21 @@ public sealed class GoToTask : AutoTask
     private AutoTask? sub;
     private bool aethernetRequested;
     private int aethernetTries;
+
+    // 同じエリアの中のテレポを試したか（1回だけ）
+    private bool shortcutTried;
+
+    // 中継点のそばで、そのオブジェクトを探し始めた時刻（テレポ直後はまだ載っていないことがある）
+    private DateTime? nodeSearchSince;
+
+    /// <summary>中継点のそばで、そのオブジェクトが載るのを待つ上限。</summary>
+    private static readonly TimeSpan NodeSearchLimit = TimeSpan.FromSeconds(10);
+
+    /// <summary>同じエリアの中でテレポを考える距離（今の位置から行き先まで、水平でこれ以上あるとき）。</summary>
+    public const float ShortcutMinDistance = 400f;
+
+    /// <summary>同じエリアの中でテレポするのは、エーテライトから行き先までが今より これだけ以上近いとき。</summary>
+    public const float ShortcutGain = 300f;
 
     public GoToTask(uint territory, Vector3 position, float range, string label)
     {
@@ -278,6 +391,17 @@ public sealed class GoToTask : AutoTask
             var flat = Vector2.Distance(new Vector2(Me.Position.X, Me.Position.Z), new Vector2(this.position.X, this.position.Z));
             if (flat <= this.range && MathF.Abs(Me.Position.Y - this.position.Y) < 8f)
                 return TaskResult.Done;
+
+            // 同じエリアでも、行き先に近い解放済みのエーテライトがあればテレポする（1回だけ。漁師 Lv68 のワワラゴは同じエリアの約1300m 先で、
+            // 歩くと4分の上限に当たりえた。Questionable も経路の AetheryteShortcut でナマイへ飛ぶ）
+            if (!this.shortcutTried && SameTerritoryShortcut(this.territory, Me.Position, this.position, IsNodeUnlocked) is { } shortcut)
+            {
+                this.shortcutTried = true;
+                ctx.Log.Write("移動", $"{this.label} は同じエリアの遠く（水平 {flat:0}m）なので、近くのエーテライト（{AetherytePlaces.Name(shortcut)}）へテレポします");
+                this.sub = new TeleportTask(this.territory, this.position, shortcut);
+                return TaskResult.Running;
+            }
+
             this.sub = new MoveToTask(this.position, this.range, this.label);
             return TaskResult.Running;
         }
@@ -296,7 +420,13 @@ public sealed class GoToTask : AutoTask
 
         var target = NearestNode(this.territory, this.position, IsNodeUnlocked);
         if (target == null)
-            return this.Fail($"{TeleportTask.TerritoryName(this.territory)} へ行くエーテライト・エーテルネットの中継点が見つかりません");
+        {
+            // 行き先のエリアに解放済みの中継点が1つも無い（以前は理由が「見つかりません」だけで、未交感だと伝わらなかった）
+            var any = NearestNode(this.territory, this.position);
+            return this.Fail(any is { } n
+                ? $"{TeleportTask.TerritoryName(this.territory)} のエーテライト・エーテルネットの中継点（最寄りは「{AetherytePlaces.Name(n)}」）が未交感です。交感してから再開してください"
+                : $"{TeleportTask.TerritoryName(this.territory)} へ行くエーテライト・エーテルネットの中継点が見つかりません");
+        }
 
         var sheet = Svc.Data.GetExcelSheet<Aetheryte>();
         var t = sheet.GetRow(target.Value);
@@ -307,7 +437,9 @@ public sealed class GoToTask : AutoTask
         }
 
         // 行き先の組に、いまのエリアの中継点・エーテライトが入っているか
-        var here = sheet.Where(a => a.Territory.RowId == Me.Territory && a.AethernetGroup == t.AethernetGroup && t.AethernetGroup != 0 && IsNodeUnlocked(a.RowId)).ToList();
+        // 見えない行（都市の門：野外側の着地点で、中継点のオブジェクトは無い）は外す（以前は野外の門へ歩いてから止まっていた。
+        // 外すと、野外からは組の本体のエーテライトへテレポしてから中継点へ歩く）
+        var here = NodesHere(Me.Territory, t.AethernetGroup, IsNodeUnlocked);
         if (here.Count == 0)
         {
             var main = sheet.FirstOrDefault(a => a.IsAetheryte && a.AethernetGroup == t.AethernetGroup && IsNodeUnlocked(a.RowId));
@@ -317,12 +449,55 @@ public sealed class GoToTask : AutoTask
             return TaskResult.Running;
         }
 
-        // 近くのエーテライト／中継点まで歩いてから都市内転送
-        var near = Svc.Objects.Where(o => o.ObjectKind == ObjectKind.Aetheryte)
-            .OrderBy(o => Vector3.Distance(o.Position, Me.Position)).FirstOrDefault();
+        // 近くの「解放済みの」エーテライト／中継点まで歩いてから都市内転送（以前は一番近い中継点を、解放済みかを見ずに選んでいた。
+        // 未交感の中継点だと Lifestream が交感だけして転送せず、利用者の交感の状態も勝手に変えた）。
+        // 位置は地図の印から求める（エーテライト表の Level の行はほとんど無く、以前は位置が引けずに必ず止まっていた）。
+        // 地図の印からは高さが分からないので、距離は水平で見る。近くのエーテライトのオブジェクトと、求めた位置が10m以内かで照らす
+        // （Lifestream の TryGetTinyAetheryteFromIGameObject と同じ見方）
+        var nodes = here.Select(a => (Row: a.RowId, Place: AetherytePlaces.Of(a.RowId))).Where(x => x.Place != null)
+            .Select(x => (x.Row, Flat: x.Place!.Value.Flat, x.Place.Value.Height)).ToList();
+        if (nodes.Count == 0)
+            return this.Fail($"{TeleportTask.TerritoryName(Me.Territory)} の解放済みの中継点（{string.Join("、", here.Select(a => AetherytePlaces.Name(a.RowId)))}）の位置を、"
+                             + "ゲームデータから求められません。近くの中継点まで手で移動してから再開してください");
+        var me2 = new Vector2(Me.Position.X, Me.Position.Z);
+        var node = nodes.OrderBy(x => Vector2.Distance(x.Flat, me2)).First();
+        var near = Svc.Objects.Where(o => o.ObjectKind == ObjectKind.Aetheryte && Vector2.Distance(new Vector2(o.Position.X, o.Position.Z), node.Flat) < 10f)
+            .OrderBy(o => Vector2.Distance(new Vector2(o.Position.X, o.Position.Z), node.Flat)).FirstOrDefault();
         if (near == null)
-            return this.Fail("近くにエーテライト・エーテルネットの中継点が見つかりません");
-        if (Vector3.Distance(near.Position, Me.Position) > 7f)
+        {
+            // まだ読み込まれていない（遠い）なら、その位置へ歩く。近づけば読み込まれる。
+            // 高さが分からなければ、vnavmesh で床に合わせる（以前は今の高さのまま向かい、高低差が 8m 以上だと着いたと判定されずに止まった。
+            // CombatTask の地図の座標と同じやり方）
+            if (Vector2.Distance(node.Flat, me2) > 7f)
+            {
+                this.nodeSearchSince = null;
+                var guess = new Vector3(node.Flat.X, node.Height ?? Me.Position.Y, node.Flat.Y);
+                var dest = node.Height != null
+                    ? guess
+                    : ctx.Navmesh.NearestPoint(guess, 10f, 300f) ?? ctx.Navmesh.PointOnFloor(new Vector3(guess.X, Me.Position.Y + 100f, guess.Z), false, 10f);
+                if (dest == null)
+                    return this.Fail($"エーテルネットの中継点（{AetherytePlaces.Name(node.Row)}）の足元の位置が分かりません（vnavmesh の経路の地図に床が見つかりません）");
+                this.sub = new MoveToTask(dest.Value, 5f, $"エーテルネットの中継点（{AetherytePlaces.Name(node.Row)}）");
+                return TaskResult.Running;
+            }
+
+            // テレポで着いた直後は、そのオブジェクトがまだ載っていないことがある。上限まで探し続ける
+            this.nodeSearchSince ??= DateTime.UtcNow;
+            if (DateTime.UtcNow - this.nodeSearchSince.Value < NodeSearchLimit)
+            {
+                this.Status = $"エーテルネットの中継点（{AetherytePlaces.Name(node.Row)}）を探しています";
+                return TaskResult.Running;
+            }
+
+            return this.Fail($"エーテルネットの中継点（{AetherytePlaces.Name(node.Row)}）の近くに来ましたが、{NodeSearchLimit.TotalSeconds:0} 秒探してもそのオブジェクトが見つかりません");
+        }
+
+        this.nodeSearchSince = null;
+
+        // 近いかは MoveToTask の「着いた」と同じ見方（水平 5m 以内かつ高さの差 8m 未満）にそろえる（以前は3次元の 7m で見ていたので、
+        // 段の上の中継点では MoveToTask がすぐ着いたと返し、こちらは遠いとみて作り直し続けた。Lifestream が都市内転送を受け付けるのは水平 11m・3次元 15m 未満）
+        var nearFlat = Vector2.Distance(new Vector2(near.Position.X, near.Position.Z), me2);
+        if (nearFlat > 5f || MathF.Abs(near.Position.Y - Me.Position.Y) >= 8f)
         {
             this.sub = new MoveToTask(near.Position, 5f, "エーテルネットの中継点");
             return TaskResult.Running;
@@ -337,26 +512,60 @@ public sealed class GoToTask : AutoTask
         return TaskResult.Running;
     }
 
+    /// <summary>
+    /// そのエリアにある、同じ組の、見えている・解放済みのエーテライトと中継点（都市内転送の出発点の候補）。組が 0 なら空。
+    /// 見えない行（都市の門）は外す。
+    /// </summary>
+    public static List<Aetheryte> NodesHere(uint territory, byte group, Func<uint, bool> unlocked)
+        => group == 0
+            ? []
+            : Svc.Data.GetExcelSheet<Aetheryte>().Where(a => a.Territory.RowId == territory && !a.Invisible && a.AethernetGroup == group && unlocked(a.RowId)).ToList();
+
+    /// <summary>
+    /// 同じエリアの中で、行き先に近い解放済みのエーテライトへテレポするほうがよいなら、そのエーテライト（エーテライト表の行）。よくなければ null。
+    /// 今の位置から行き先まで水平で <see cref="ShortcutMinDistance"/> 以上あり、エーテライトから行き先までが今より <see cref="ShortcutGain"/> 以上近いときだけ。
+    /// </summary>
+    public static uint? SameTerritoryShortcut(uint territory, Vector3 me, Vector3 destination, Func<uint, bool> unlocked)
+    {
+        var dest2 = new Vector2(destination.X, destination.Z);
+        var fromMe = Vector2.Distance(new Vector2(me.X, me.Z), dest2);
+        if (fromMe < ShortcutMinDistance)
+            return null;
+        uint? best = null;
+        var bestDistance = float.MaxValue;
+        foreach (var a in Svc.Data.GetExcelSheet<Aetheryte>())
+        {
+            if (!a.IsAetheryte || a.Invisible || a.Territory.RowId != territory || !unlocked(a.RowId))
+                continue;
+            if (AetherytePlaces.FlatDistance(a.RowId, destination) is not { } d || d >= bestDistance)
+                continue;
+            best = a.RowId;
+            bestDistance = d;
+        }
+
+        return best != null && bestDistance + ShortcutGain <= fromMe ? best : null;
+    }
+
     private static unsafe bool IsNodeUnlocked(uint id)
     {
         var state = FFXIVClientStructs.FFXIV.Client.Game.UI.UIState.Instance();
         return state != null && state->IsAetheryteUnlocked(id);
     }
 
-    /// <summary>そのエリアで、位置に一番近いエーテライト／中継点（エーテライト表の行）。無ければ null。</summary>
+    /// <summary>
+    /// そのエリアで、位置に一番近いエーテライト／中継点（エーテライト表の行）。無ければ null。
+    /// 距離は水平で見る（位置は地図の印から求め、高さが分からないため。以前は Level の行が無いので、どの行も同じ距離になり、
+    /// 行番号の一番小さい行を選んでいた）。位置が求められない行は後回しにする。
+    /// </summary>
     public static uint? NearestNode(uint territory, Vector3 position, Func<uint, bool>? unlocked = null)
     {
-        var levels = Svc.Data.GetExcelSheet<Level>();
         uint? best = null;
         var bestDist = float.MaxValue;
         foreach (var a in Svc.Data.GetExcelSheet<Aetheryte>())
         {
             if (a.Territory.RowId != territory || a.Invisible || (unlocked != null && !unlocked(a.RowId)))
                 continue;
-            var lv = a.Level.FirstOrDefault(l => l.RowId != 0);
-            var d = lv.RowId != 0 && levels.TryGetRow(lv.RowId, out var row)
-                ? Vector3.Distance(new Vector3(row.X, row.Y, row.Z), position)
-                : float.MaxValue / 2;
+            var d = AetherytePlaces.FlatDistance(a.RowId, position) ?? float.MaxValue / 2;
             if (d < bestDist)
             {
                 bestDist = d;
@@ -542,7 +751,9 @@ public sealed unsafe class NpcStepTask : AutoTask
             return this.Fail($"{NpcName(this.step.DataId)} に話しかけられません。距離・壁・高低差を確認してください");
         (this.seqBefore, this.varsBefore) = QuestState(this.questRowId);
         this.interactedAt = DateTime.UtcNow;
-        if (GameUi.Interact(npc, checkLineOfSight: true))
+
+        // 着いた後は視線判定なし（Questionable と同じ。経路の終点から壁やカウンターで遮られても話しかけられるように）
+        if (GameUi.Interact(npc))
         {
             this.firstInteractAt = this.interactedAt;
             this.selectedMenu = null;
@@ -643,8 +854,9 @@ public sealed unsafe class QuestionableStarter
         var qm = QuestManager.Instance();
         var accepted = qm != null && qm->IsQuestAccepted(this.questRowId);
 
-        // 1) 受注前なら、受けられる職に着替える
-        if (!accepted && !this.jobChecked)
+        // 1) 受けられる職に着替える。受注済みでも合わせる（クラス・ジョブのクエストは受注した職でしか進まない。
+        //    以前は受注前だけ着替えたので、止めて再開すると素材集め・製作で職が変わったまま頼み、Questionable の採集の手順が例外で止まった）
+        if (!this.jobChecked)
         {
             this.jobChecked = true;
             var job = Unlocks.PickJobFor(this.questRowId);
@@ -673,7 +885,72 @@ public sealed unsafe class QuestionableStarter
             }
         }
 
-        // 2) Questionable が前の動作を終えるのを待つ
+        // 2)〜3) Questionable が前の動作を終える・動ける・ジャーナルの空き・受注できるか
+        var ready = this.ReadyToAccept(ctx, accepted, out fail, out status);
+        if (ready != TaskResult.Done)
+            return ready;
+
+        // 3.5) 受注中のほかのクエストをジャーナルで非表示にする（設定で切れる。控えを保存してから、1本ずつ間を空けて送る）
+        if (ctx.Config.HideOtherQuestsDuringRun && this.JournalStep(ctx, out var journalStatus))
+        {
+            status = journalStatus;
+            return TaskResult.Running;
+        }
+
+        // 4) 優先リストをこのクエストだけにする
+        if (!this.Priority.Active && this.Priority.Take(ctx.Questionable, this.questRowId, ctx.Log) is { } priorityFail)
+        {
+            fail = priorityFail;
+            return TaskResult.Failed;
+        }
+
+        // 5) TextAdvance の外部制御（QuestTask のとき）。他者（止まる途中の Questionable 等）が持っていれば、手放すのを待つ（10秒まで）
+        if (this.takeTextAdvance && !ctx.TextAdvance.OwnsControl)
+        {
+            if (this.WaitTextAdvance(ctx, out status))
+                return TaskResult.Running;
+
+            if (!ctx.TextAdvance.TakeControlForTurnIn() && !this.taWarned)
+            {
+                this.taWarned = true;
+                ctx.Log.Warn("クエスト", ctx.TextAdvance.IsInExternalControl() == true
+                    ? "TextAdvance はほかのプラグインが外部制御しています（納品窓に TextAdvance が品を入れ、こちらの入力と取り合う可能性）"
+                    : "TextAdvance の外部制御を取れませんでした（納品窓の入力が取り合いになる可能性）");
+            }
+        }
+
+        // 再依頼でも必ず直前に照合する（定期監視の間隔に依存しない）。
+        if (this.Priority.Keep(ctx.Questionable, ctx.Log) is { } changedPriority)
+        {
+            fail = changedPriority;
+            return TaskResult.Failed;
+        }
+        if (this.takeTextAdvance && !ctx.TextAdvance.VerifyTurnInControlNow())
+        {
+            fail = $"TextAdvance の操作権を確保できません（{ctx.TextAdvance.LossReason ?? "理由を読めません"}）。納品入力の競合を避けるため止めました";
+            return TaskResult.Failed;
+        }
+
+        // 6) 頼む
+        if (!ctx.Questionable.StartSingleQuest(this.questRowId))
+        {
+            fail = $"Questionable が「{this.label}」を始められませんでした（経路データが無い等）";
+            return TaskResult.Failed;
+        }
+
+        this.Requested = true;
+        this.wander = 0;
+        return TaskResult.Done;
+    }
+
+    /// <summary>
+    /// Questionable が前の動作を終えるのを待ち、動ける状態を待ち、受注前ならジャーナルの空きと受注できるかを確かめる。
+    /// 済めば Done、待つなら Running、止めるなら Failed（<paramref name="fail"/> に理由）。
+    /// </summary>
+    private TaskResult ReadyToAccept(TaskContext ctx, bool accepted, out string? fail, out string status)
+    {
+        fail = null;
+        status = string.Empty;
         var running = ctx.Questionable.IsRunning();
         if (running == true)
             this.busySince ??= DateTime.UtcNow;
@@ -696,17 +973,14 @@ public sealed unsafe class QuestionableStarter
         }
 
         // 上限でも受注済みのクエストは進められる。
-        unsafe
+        var journal = QuestManager.Instance();
+        if (!accepted && journal != null && journal->NumAcceptedQuests >= journal->NormalQuests.Length)
         {
-            var journal = QuestManager.Instance();
-            if (!accepted && journal != null && journal->NumAcceptedQuests >= journal->NormalQuests.Length)
-            {
-                fail = $"「{this.label}」を新しく受注する空きがありません。ジャーナルの空きを作って再開してください";
-                return TaskResult.Failed;
-            }
+            fail = $"「{this.label}」を新しく受注する空きがありません。ジャーナルの空きを作って再開してください";
+            return TaskResult.Failed;
         }
 
-        // 3) 受注前なら、受注できるか
+        // 受注前なら、受注できるか
         if (!accepted && ctx.Questionable.IsReadyToAcceptQuest(this.questRowId) != true)
         {
             var reason = ctx.Questionable.IsQuestLockedReason(this.questRowId) is { } lr && lr.Reason.Length > 0 ? lr.Reason : "理由を読めません";
@@ -714,63 +988,40 @@ public sealed unsafe class QuestionableStarter
             return TaskResult.Failed;
         }
 
-        // 3.5) 受注中のほかのクエストをジャーナルで非表示にする（設定で切れる。控えを保存してから、1本ずつ間を空けて送る）
-        if (ctx.Config.HideOtherQuestsDuringRun && this.JournalStep(ctx, out var journalStatus))
-        {
-            status = journalStatus;
-            return TaskResult.Running;
-        }
+        return TaskResult.Done;
+    }
 
-        // 4) 優先リストをこのクエストだけにする
-        if (!this.Priority.Active && this.Priority.Take(ctx.Questionable, this.questRowId, ctx.Log) is { } priorityFail)
-        {
-            fail = priorityFail;
-            return TaskResult.Failed;
-        }
+    /// <summary>TextAdvance の外部制御がほかの者にあれば、手放すのを待つ（10秒まで）。待つなら true。</summary>
+    private bool WaitTextAdvance(TaskContext ctx, out string status)
+    {
+        status = string.Empty;
+        if (ctx.TextAdvance.CanOwn() != false)
+            return false;
+        this.taWaitSince ??= DateTime.UtcNow;
+        if (DateTime.UtcNow - this.taWaitSince.Value >= TimeSpan.FromSeconds(10))
+            return false;
+        status = "TextAdvance の外部制御が空くのを待っています";
+        return true;
+    }
 
-        // 5) TextAdvance の外部制御（QuestTask のとき）。他者（止まる途中の Questionable 等）が持っていれば、手放すのを待つ（10秒まで）
+    /// <summary>
+    /// 受注をこちらで行う前の確かめ（Lv1 の「My First ～」）。Questionable に頼むときと同じ確かめ
+    /// （Questionable が止まっている・動ける・ジャーナルの空き・受注できるか・TextAdvance の外部制御が空くのを10秒まで待つ）を通し、
+    /// 同じ文言で止める。以前はこれを通らずに話しかけたので、ジャーナルが上限でも「段が進みません」という誤った理由で止まった。
+    /// 済めば Done（TextAdvance の外部制御も取る）、待つなら Running、止めるなら Failed。
+    /// </summary>
+    public TaskResult ReadyForOwnAccept(TaskContext ctx, out string? fail, out string status)
+    {
+        var ready = this.ReadyToAccept(ctx, accepted: false, out fail, out status);
+        if (ready != TaskResult.Done)
+            return ready;
         if (this.takeTextAdvance && !ctx.TextAdvance.OwnsControl)
         {
-            if (ctx.TextAdvance.CanOwn() == false)
-            {
-                this.taWaitSince ??= DateTime.UtcNow;
-                if (DateTime.UtcNow - this.taWaitSince.Value < TimeSpan.FromSeconds(10))
-                {
-                    status = "TextAdvance の外部制御が空くのを待っています";
-                    return TaskResult.Running;
-                }
-            }
-
-            if (!ctx.TextAdvance.TakeControlForTurnIn() && !this.taWarned)
-            {
-                this.taWarned = true;
-                ctx.Log.Warn("クエスト", ctx.TextAdvance.IsInExternalControl() == true
-                    ? "TextAdvance はほかのプラグインが外部制御しています（納品窓に TextAdvance が品を入れ、こちらの入力と取り合う可能性）"
-                    : "TextAdvance の外部制御を取れませんでした（納品窓の入力が取り合いになる可能性）");
-            }
+            if (this.WaitTextAdvance(ctx, out status))
+                return TaskResult.Running;
+            ctx.TextAdvance.TakeControlForTurnIn();
         }
 
-        // 再依頼でも必ず直前に照合する（定期監視の間隔に依存しない）。
-        if (this.Priority.Keep(ctx.Questionable, ctx.Log) is { } changedPriority)
-        {
-            fail = changedPriority;
-            return TaskResult.Failed;
-        }
-        if (this.takeTextAdvance && !ctx.TextAdvance.EnsureTurnInControl())
-        {
-            fail = "TextAdvance の操作権を確保できません。納品入力の競合を避けるため止めました";
-            return TaskResult.Failed;
-        }
-
-        // 6) 頼む
-        if (!ctx.Questionable.StartSingleQuest(this.questRowId))
-        {
-            fail = $"Questionable が「{this.label}」を始められませんでした（経路データが無い等）";
-            return TaskResult.Failed;
-        }
-
-        this.Requested = true;
-        this.wander = 0;
         return TaskResult.Done;
     }
 
@@ -854,7 +1105,12 @@ public sealed unsafe class QuestionableStarter
             if (this.Priority.Keep(ctx.Questionable, ctx.Log) is { } keepFail)
                 return keepFail;
             if (this.takeTextAdvance && ctx.TextAdvance.OwnsControl && !ctx.TextAdvance.KeepControl())
-                ctx.Log.Warn("クエスト", "TextAdvance の外部制御がほかの依頼者に移りました（納品窓の入力が取り合いになる可能性）");
+            {
+                // 利用者が TextAdvance の画面で取り消した（または読み直した）なら、取り直さずに止める
+                if (ctx.TextAdvance.CancelledExternally)
+                    return ctx.TextAdvance.LossReason;
+                ctx.Log.Warn("クエスト", $"TextAdvance の外部制御を失いました（{ctx.TextAdvance.LossReason ?? "理由を読めません"}。納品窓の入力が取り合いになる可能性）");
+            }
         }
 
         return null;
