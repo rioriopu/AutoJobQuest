@@ -282,6 +282,42 @@ public static unsafe class GameUi
     }
 
     /// <summary>
+    /// 受注の窓（JournalAccept）の「受注しない」を押す（TextAdvance が「受ける」を押すのと同じやり方で、DeclineButton を押す）。
+    /// 押せなければ窓を閉じる（KnockOnIssuerTask と同じ Close(true)）。
+    /// </summary>
+    public static void DeclineQuestOffer(AtkUnitBase* addon)
+    {
+        if (TestBackend is { } test)
+        {
+            test.Close((nint)addon);
+            return;
+        }
+
+        if (addon == null)
+            return;
+        if (!ClickComponentButton(addon, ((AddonJournalAccept*)addon)->DeclineButton, "受注しない"))
+            addon->Close(true);
+    }
+
+    /// <summary>受注の窓（JournalAccept）のクエスト名。読めなければ null（検証の仕組みでも null）。</summary>
+    public static string? QuestOfferTitle(AtkUnitBase* addon)
+    {
+        if (TestBackend != null || addon == null)
+            return null;
+        var title = ((AddonJournalAccept*)addon)->QuestTitleText;
+        if (title == null)
+            return null;
+        try
+        {
+            return Dalamud.Game.Text.SeStringHandling.SeString.Parse(title->NodeText.AsSpan().ToArray()).TextValue;
+        }
+        catch
+        {
+            return title->NodeText.ToString();
+        }
+    }
+
+    /// <summary>
     /// ボタンを押す（ECommons の ClickAddonButton と同じ：ボタンのノードに登録済みの先頭イベントを流す）。
     /// ボタンが無い・押せない状態なら false（押せないボタンを強制的に押すことはしない）。
     /// </summary>

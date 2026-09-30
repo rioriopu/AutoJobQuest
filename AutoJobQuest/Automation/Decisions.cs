@@ -1294,6 +1294,82 @@ public static class QuestPurchaseConfirm
 }
 
 /// <summary>
+/// クエストの完了の直後の後片付けの判断（NpcLeftovers の説明）。
+/// 完了の後、NPC が続けて出す窓を閉じ、動ける状態がしばらく続いたら（NPC の会話が終わったとみなして）終える。
+/// </summary>
+public static class AfterQuestWindDown
+{
+    public enum Verdict
+    {
+        /// <summary>NPC の窓が開いている。閉じる。</summary>
+        Close,
+
+        /// <summary>窓は無いが、まだ動けない（会話の途中など）。待つ。</summary>
+        WaitFree,
+
+        /// <summary>動けるが、NPC の会話が続かないかを見ている。</summary>
+        Settling,
+
+        /// <summary>終わった。</summary>
+        Done,
+
+        /// <summary>上限を過ぎた。後は次の作業の前の見張り（LeftoverWindowWatch）に任せて終える。</summary>
+        GiveUp,
+    }
+
+    /// <summary>後片付けの上限。</summary>
+    public static readonly TimeSpan Limit = TimeSpan.FromSeconds(20);
+
+    public static Verdict Decide(NpcLeftovers.Kind open, bool playerFree, TimeSpan freeFor, TimeSpan elapsed, TimeSpan settle)
+    {
+        if (elapsed > Limit)
+            return Verdict.GiveUp;
+        if (open != NpcLeftovers.Kind.None)
+            return Verdict.Close;
+        if (!playerFree)
+            return Verdict.WaitFree;
+        return freeFor < settle ? Verdict.Settling : Verdict.Done;
+    }
+}
+
+/// <summary>
+/// 次のクエストを Questionable に頼む前、動ける状態を待つ間の見張り（クエスト完了後に止まったように見えることがあった。
+/// 実際は Questionable が止まったのではなく、開いたままの NPC の選択肢で「動ける状態」にならず、こちらが次のクエストを頼めずに待ち続けていた）。
+/// 開いたままの NPC の窓（受注の窓・選択肢）があり、Questionable が止まっていて、こちらの会話でもなければ、少し様子を見てから閉じる
+/// （閉じれば動ける状態になり、次のクエストを頼む）。会話の窓は流れ全体の ForeignTalk が扱う。
+/// 閉じられる窓が無いまま上限まで動けなければ、黙って待ち続けずに理由を出して止める。
+/// </summary>
+public static class LeftoverWindowWatch
+{
+    public enum Verdict
+    {
+        /// <summary>待つ。</summary>
+        Wait,
+
+        /// <summary>開いたままの NPC の窓を閉じる。</summary>
+        Close,
+
+        /// <summary>上限まで動けない。止める。</summary>
+        GiveUp,
+    }
+
+    /// <summary>閉じる前に様子を見る時間（ほかの操作が閉じるか・利用者が選んでいる途中か）。検証の仕組みでは短くする。</summary>
+    public static TimeSpan Grace { get; set; } = TimeSpan.FromSeconds(3);
+
+    /// <summary>動けないまま待つ上限。検証の仕組みでは短くする。</summary>
+    public static TimeSpan Limit { get; set; } = TimeSpan.FromMinutes(3);
+
+    public static Verdict Decide(NpcLeftovers.Kind open, bool questionableRunning, bool ownConversation, TimeSpan notFreeFor)
+    {
+        if (notFreeFor > Limit)
+            return Verdict.GiveUp;
+        if (open is NpcLeftovers.Kind.None or NpcLeftovers.Kind.Talk || questionableRunning || ownConversation)
+            return Verdict.Wait;
+        return notFreeFor < Grace ? Verdict.Wait : Verdict.Close;
+    }
+}
+
+/// <summary>
 /// Questionable の釣りの手順の前に、手順の指定の餌をこちらで付けておくかの判断（不具合の例：漁師 Lv15「キキルン族の思い出の味」で、
 /// 買ったラットの尾でなくピルバグのまま釣り続け、目当ての魚が釣れなかった）。
 /// Questionable は釣りの手順で、AutoHook を有効にし、プリセット（餌の強制切り替え）を渡し、/ahstart を同じフレームで送る（Fish.cs の Start）。

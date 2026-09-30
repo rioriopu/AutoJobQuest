@@ -818,6 +818,10 @@ public sealed unsafe class QuestionableStarter
     private bool jobChecked;
     private EquipJobTask? equip;
     private DateTime? busySince;
+    // 動ける状態を待ち始めた時刻・開いたままの NPC の窓を最後に閉じた時刻・同じ窓を2度書かない控え（LeftoverWindowWatch）
+    private DateTime? notFreeSince;
+    private DateTime leftoverActAt = DateTime.MinValue;
+    private string lastLeftoverNote = string.Empty;
     private int wander;
     private DateTime lastKeep = DateTime.MinValue;
     private DateTime? taWaitSince;
@@ -967,9 +971,40 @@ public sealed unsafe class QuestionableStarter
 
         if (!GameUi.PlayerFree())
         {
-            status = "動ける状態になるのを待っています";
+            // 開いたままの NPC の窓（受注の窓・選択肢）で動けないなら、様子を見てから閉じる（LeftoverWindowWatch）
+            var now = DateTime.UtcNow;
+            this.notFreeSince ??= now;
+            var open = NpcLeftovers.Find(out var addon, out var detail);
+            switch (LeftoverWindowWatch.Decide(open, running == true, ctx.InOwnConversation, now - this.notFreeSince.Value))
+            {
+                case LeftoverWindowWatch.Verdict.Close:
+                    if (now - this.leftoverActAt >= TimeSpan.FromMilliseconds(300))
+                    {
+                        this.leftoverActAt = now;
+                        if (detail != this.lastLeftoverNote)
+                        {
+                            this.lastLeftoverNote = detail;
+                            ctx.Log.Warn("クエスト", $"「{this.label}」を Questionable に頼む前に、開いたままの NPC の窓を閉じます：{detail}"
+                                                    + "（Questionable は止まっていて、こちらの会話でもありません。受注の窓は受けずに断り、選択肢は何も選びません）");
+                        }
+
+                        NpcLeftovers.Close(open, addon);
+                    }
+
+                    status = $"開いたままの NPC の窓を閉じています（{detail}）";
+                    return TaskResult.Running;
+                case LeftoverWindowWatch.Verdict.GiveUp:
+                    fail = $"「{this.label}」を Questionable に頼む前に、{LeftoverWindowWatch.Limit.TotalMinutes:0} 分たっても動ける状態になりません"
+                           + $"（{(open == NpcLeftovers.Kind.None ? "閉じられる NPC の窓はありません" : detail)}。そのときの状態は記録の［状態］の行にあります）。"
+                           + "動ける状態にしてから、もう一度始めてください（続きから進みます）";
+                    return TaskResult.Failed;
+            }
+
+            status = open == NpcLeftovers.Kind.None ? "動ける状態になるのを待っています" : $"動ける状態になるのを待っています（{detail}）";
             return TaskResult.Running;
         }
+
+        this.notFreeSince = null;
 
         // 上限でも受注済みのクエストは進められる。
         if (!accepted && GameMemory.JournalFull)

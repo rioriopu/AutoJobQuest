@@ -35,6 +35,10 @@ public sealed class TextAdvanceIpc : IpcGate
     private bool releasePending;
     private bool requestAllowed;
 
+    // 受注の窓を TextAdvance に受けさせない（クエストの完了の後片付けの間だけ：AllowQuestAccept）。解除・喪失で戻す
+    private bool questAcceptOff;
+    private bool appliedAcceptOff;
+
     /// <summary>こちらが外部制御を取っているか（ジョブクエを進める間・手動の報告の間）。</summary>
     public bool OwnsControl => this.ownControl;
 
@@ -135,6 +139,8 @@ public sealed class TextAdvanceIpc : IpcGate
     {
         this.ownControl = false;
         this.requestAllowed = false;
+        this.questAcceptOff = false;
+        this.appliedAcceptOff = false;
         this.lostExternally = true;
         this.LossReason = reason;
         Core.DebugLog.Current?.Line("IPC", reason);
@@ -149,6 +155,8 @@ public sealed class TextAdvanceIpc : IpcGate
     {
         this.ownControl = false;
         this.requestAllowed = false;
+        this.questAcceptOff = false;
+        this.appliedAcceptOff = false;
         this.lostExternally = true;
         this.LossReason = "TextAdvance の外部制御が外され、ほかのプラグイン（Questionable など）が取り直しました。取り直さずに止めます";
         Core.DebugLog.Current?.Line("IPC", this.LossReason);
@@ -167,6 +175,23 @@ public sealed class TextAdvanceIpc : IpcGate
         }
 
         return this.IsInExternalControl() is { } held ? !held : null;
+    }
+
+    /// <summary>
+    /// 受注の窓（JournalAccept）を TextAdvance に受けさせる・受けさせないを切り替える（こちらが外部制御を持っているときだけ）。
+    /// TextAdvance は、受注を任されていると、どのクエストの受注の窓でも「受ける」を押す（TextAdvance の ExecQuestAccept）。
+    /// クエストの完了の直後は、NPC が続けて別のクエストを差し出すことがあるので、後片付けの間だけ切る（不具合の例：
+    /// 漁師 Lv15 の完了の直後にシシプが差し出したサイドクエスト「夢をも釣る船」を、手放した直後の TextAdvance が受けた）。
+    /// 解除（ReleaseControl）で元に戻る。
+    /// </summary>
+    public bool AllowQuestAccept(bool allow)
+    {
+        if (!this.ownControl)
+            return false;
+        this.questAcceptOff = !allow;
+        if (this.appliedAcceptOff == this.questAcceptOff)
+            return true;
+        return this.Apply(this.requestAllowed);
     }
 
     /// <summary>
@@ -274,7 +299,7 @@ public sealed class TextAdvanceIpc : IpcGate
 
         var cfg = new ExternalTerritoryConfig
         {
-            EnableQuestAccept = true,
+            EnableQuestAccept = !this.questAcceptOff,
             EnableQuestComplete = true,
             EnableRewardPick = true,
             EnableRequestHandin = allowRequest,
@@ -286,8 +311,9 @@ public sealed class TextAdvanceIpc : IpcGate
         };
 
         // 記録は、取る・設定を変えるときだけ書く（以前は毎フレーム1行ずつ書き、止まったときの「直前の記録」が埋まった）
-        if (!this.ownControl || this.requestAllowed != allowRequest)
-            this.Trace($"EnableExternalControl（納品窓の入力={(allowRequest ? "TextAdvance に任せる" : "こちらで行う")}）");
+        if (!this.ownControl || this.requestAllowed != allowRequest || this.appliedAcceptOff != this.questAcceptOff)
+            this.Trace($"EnableExternalControl（納品窓の入力={(allowRequest ? "TextAdvance に任せる" : "こちらで行う")}"
+                       + $"{(this.questAcceptOff ? "・受注の窓は受けない" : string.Empty)}）");
         this.releasePending = true;
         var received = this.TryInvoke("EnableExternalControl",
                      () => this.Func<string, ExternalTerritoryConfig, bool>("TextAdvance.EnableExternalControl")
@@ -298,6 +324,7 @@ public sealed class TextAdvanceIpc : IpcGate
         {
             this.ownControl = true;
             this.requestAllowed = allowRequest;
+            this.appliedAcceptOff = this.questAcceptOff;
             this.LossReason = null;
             return ApplyOutcome.Owned;
         }
@@ -311,6 +338,7 @@ public sealed class TextAdvanceIpc : IpcGate
         // 取り消しの印は、実行の終わり（後始末）で消す（次の実行ではまた取れる）
         this.lostExternally = false;
         this.unreadableSince = null;
+        this.questAcceptOff = false; // 受注の切り替えは解除のたびに戻す（次に取るときは受注も任せる）
         if (!this.ownControl && !this.releasePending)
             return;
 
@@ -324,6 +352,8 @@ public sealed class TextAdvanceIpc : IpcGate
             this.ownControl = false;
             this.releasePending = false;
             this.requestAllowed = false;
+            this.questAcceptOff = false;
+            this.appliedAcceptOff = false;
         }
     }
 

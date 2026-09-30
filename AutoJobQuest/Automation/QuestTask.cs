@@ -215,6 +215,14 @@ public sealed unsafe class QuestTask : AutoTask
     {
         if (this.IsComplete)
         {
+            // 完了の直後の後片付け：NPC が続けて出す窓（別のクエストの受注の窓・普段のメニュー・会話）を閉じてから終える（WindDownAfterComplete）
+            if (!this.windDownDone)
+            {
+                if (this.WindDownAfterComplete(ctx) == TaskResult.Running)
+                    return TaskResult.Running;
+                this.windDownDone = true;
+            }
+
             // 推奨装備に着替えていたら、完了の後にその職のギアセットに着直す（途中で着直すと、Questionable が段の頭からやり直して、また着替えるため）
             if (this.gearChangedByQuestionable)
             {
@@ -606,6 +614,71 @@ public sealed unsafe class QuestTask : AutoTask
             ctx.Log.Debug("クエスト", $"購入の確認に OK を押しません（{verdict}）：{body.Replace("\n", " ")}"
                                      + $"（読んだ品 {parsed?.Item ?? "なし"}×{parsed?.Count}・{parsed?.Price} ギル／手順の品 {string.Join("、", expected.Select(e => $"{e.Item1}×{e.ItemCount}"))}）");
         }
+    }
+
+    // 完了の後片付け：済んだか・始めた時刻・動ける状態になった時刻・最後に閉じた時刻・閉じた窓
+    private bool windDownDone;
+    private DateTime? windDownSince;
+    private DateTime? windDownFreeSince;
+    private DateTime windDownActAt = DateTime.MinValue;
+    private readonly List<string> windDownClosed = [];
+
+    /// <summary>
+    /// 完了の後、動ける状態がこれだけ続いたら NPC の会話が終わったとみなす（ゲームは完了の約0.05秒後に同じ NPC の会話を続けることがある：
+    /// 実機の記録で 0.053 秒・0.054 秒）。検証の仕組みでは短くする。
+    /// </summary>
+    public static TimeSpan WindDownSettle { get; set; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// クエストの完了の直後の後片付け（NpcLeftovers・AfterQuestWindDown の説明）。
+    /// 始めに TextAdvance を借りたまま受注だけ切る（手放す前に、NPC が差し出した別のクエストを TextAdvance が受けないように）。
+    /// NPC が出した窓は閉じる（受注の窓は受けない・選択肢は選ばない・会話は送る）。動ける状態が続いたら終える。
+    /// 上限を過ぎたら記録に残して終え、次の作業の前の見張り（LeftoverWindowWatch）に任せる。
+    /// </summary>
+    private TaskResult WindDownAfterComplete(TaskContext ctx)
+    {
+        var now = DateTime.UtcNow;
+        if (this.windDownSince == null)
+        {
+            this.windDownSince = now;
+            ctx.TextAdvance.AllowQuestAccept(false);
+        }
+
+        var open = NpcLeftovers.Find(out var addon, out var detail);
+        var free = GameUi.PlayerFree();
+        if (free)
+            this.windDownFreeSince ??= now;
+        else
+            this.windDownFreeSince = null;
+
+        var freeFor = this.windDownFreeSince is { } f ? now - f : TimeSpan.Zero;
+        switch (AfterQuestWindDown.Decide(open, free, freeFor, now - this.windDownSince.Value, WindDownSettle))
+        {
+            case AfterQuestWindDown.Verdict.Close:
+                if (now - this.windDownActAt >= TimeSpan.FromMilliseconds(300))
+                {
+                    this.windDownActAt = now;
+                    if (open != NpcLeftovers.Kind.Talk && !this.windDownClosed.Contains(detail))
+                        this.windDownClosed.Add(detail);
+                    NpcLeftovers.Close(open, addon);
+                }
+
+                this.Status = $"完了の後に NPC が出した窓を閉じています（{detail}）";
+                return TaskResult.Running;
+            case AfterQuestWindDown.Verdict.WaitFree:
+            case AfterQuestWindDown.Verdict.Settling:
+                this.Status = "完了の後、NPC の会話が終わるのを見ています";
+                return TaskResult.Running;
+            case AfterQuestWindDown.Verdict.GiveUp:
+                ctx.Log.Warn("クエスト", $"完了の後 {AfterQuestWindDown.Limit.TotalSeconds:0} 秒たっても NPC の会話が終わりません"
+                                        + $"（{(open == NpcLeftovers.Kind.None ? "開いている NPC の窓はありません" : detail)}）。次の作業の前の見張りに任せます");
+                break;
+        }
+
+        if (this.windDownClosed.Count > 0)
+            ctx.Log.Write("クエスト", $"完了の後に NPC が出した窓を閉じました：{string.Join("／", this.windDownClosed)}"
+                                   + "（受注の窓は受けずに断り、選択肢は何も選んでいません。別のクエストを受けないため）");
+        return TaskResult.Done;
     }
 
     // 釣りの手順の餌：付けようとしている餌・付いたのを見たか・送った回数・最後に送った時刻・同じことを2度書かない控え
