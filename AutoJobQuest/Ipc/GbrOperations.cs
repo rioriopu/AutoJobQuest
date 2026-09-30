@@ -166,6 +166,17 @@ public sealed class GbrOperations
         }
     }
 
+    /// <summary>
+    /// まだ戻していない一時変更が残っているか（戻して、保存ファイルへの書き込みを確かめているだけのものは含まない）。
+    /// 実行の結果の分類に使う（以前は保存の確かめ待ちも数えたので、GBR を使った実行は成功しても
+    /// 必ず「後始末確認待ち」になった。GBR の保存は少し遅れてファイルに書かれ、確かめは止まっている間に10秒おきに続く）。
+    /// </summary>
+    public bool HasUnrestored => Unrestored(this.config);
+
+    /// <summary><see cref="HasUnrestored"/> の本体（ゲームを起動せずに試せるように分けた）。</summary>
+    public static bool Unrestored(Configuration c)
+        => c.GbrOwnListActive || c.GbrDisabledListRefs.Count > 0 || c.GbrConfigOriginals.Count > 0 || c.GbrVendorListPending;
+
     /// <summary>元に戻すべき一時変更が残っているか（戻したが保存を確かめていないものも含む）。</summary>
     public bool HasLeftovers
         => this.config.GbrOwnListActive || this.config.GbrDisabledListRefs.Count > 0 || this.config.GbrConfigOriginals.Count > 0
@@ -607,7 +618,10 @@ public sealed class GbrOperations
     /// NPC 購入の専用リストを用意する。ギルの店で買えるものだけを入れる。
     /// 戻り値のリスト ID を <see cref="StartVendor"/> に渡す。
     /// </summary>
-    public Guid? PrepareVendorList(IReadOnlyList<(uint ItemId, uint TargetOwned)> entries, out List<uint> notGil)
+    /// <param name="entries">品目と「持っていたい総数」。</param>
+    /// <param name="notGil">ギルの店で自動購入できなかった品目。</param>
+    /// <param name="preferredNpc">品目ごとに買う NPC（ENpc）。その NPC で登録できなければ、GBR が選ぶ店で買う（記録に残す）。</param>
+    public Guid? PrepareVendorList(IReadOnlyList<(uint ItemId, uint TargetOwned)> entries, out List<uint> notGil, IReadOnlyDictionary<uint, uint>? preferredNpc = null)
     {
         notGil = [];
         var h = this.reflection.Get();
@@ -657,6 +671,18 @@ public sealed class GbrOperations
                     continue;
                 }
 
+                // 買う NPC の指定があれば、その NPC で登録する（例：万能ルアーはリムサ・ロミンサのよろず屋）
+                if (preferredNpc != null && preferredNpc.TryGetValue(itemId, out var npcId))
+                {
+                    if (this.TryAddWithNpc(h, vblm, listId, itemId, target, npcId, out var why))
+                    {
+                        Note($"{Data.CraftPlanner.ItemName(itemId)} は NPC {npcId} で買うよう登録しました");
+                        continue;
+                    }
+
+                    Note($"{Data.CraftPlanner.ItemName(itemId)} を NPC {npcId} で登録できなかったので、GBR が選ぶ店で買います（{why}）");
+                }
+
                 // openWindow:false（既定の true だと GBR の窓が開く）
                 var ok = (bool)trySet.Invoke(vblm, [listId, itemId, target, false, false, false])!;
                 if (!ok)
@@ -686,6 +712,71 @@ public sealed class GbrOperations
             this.SetError($"GBR の購入リストを用意できませんでした: {Unwrap(ex)}");
             return null;
         }
+    }
+
+    /// <summary>
+    /// 品目を、指定の NPC（ENpc）から買うように購入リストへ入れる（GBR の TryAddTarget(Guid, VendorShopEntry, VendorNpc, uint, bool, bool, bool)）。
+    /// ギルの店の一覧（VendorShopResolver.GilShopEntries）から、その品目を置き、その NPC が売っていて、自動購入に対応し、除外されていない組を探す。
+    /// </summary>
+    private bool TryAddWithNpc(GbrHandle h, object vblm, Guid listId, uint itemId, uint target, uint npcId, out string why)
+    {
+        why = string.Empty;
+        var resolver = h.GbrAsm.GetType("GatherBuddy.Vulcan.Vendors.VendorShopResolver", throwOnError: false);
+        var vpm = h.GbrAsm.GetType("GatherBuddy.Vulcan.Vendors.VendorPurchaseManager", throwOnError: false);
+        var excl = h.GbrAsm.GetType("GatherBuddy.Vulcan.Vendors.VendorDevExclusions", throwOnError: false);
+        if (resolver == null || vpm == null || excl == null)
+        {
+            why = "GBR の店の型が見つかりません";
+            return false;
+        }
+
+        if (resolver.GetProperty("IsInitialized", GbrHandle.PubStatic)?.GetValue(null) is not true)
+        {
+            why = "GBR の店のデータがまだ読み込み中です";
+            return false;
+        }
+
+        var isSupported = vpm.GetMethod("IsPurchaseSupported", GbrHandle.PubStatic);
+        var isExcluded = excl.GetMethod("IsExcluded", GbrHandle.PubStatic);
+        var entries = resolver.GetProperty("GilShopEntries", GbrHandle.PubStatic)?.GetValue(null) as IEnumerable;
+        if (isSupported == null || isExcluded == null || entries == null)
+        {
+            why = "GBR の店の一覧を読めません";
+            return false;
+        }
+
+        foreach (var e in entries)
+        {
+            var et = e.GetType();
+            if ((uint)et.GetProperty("ItemId")!.GetValue(e)! != itemId)
+                continue;
+            foreach (var n in (IEnumerable)et.GetProperty("Npcs")!.GetValue(e)!)
+            {
+                if ((uint)n.GetType().GetProperty("NpcId")!.GetValue(n)! != npcId)
+                    continue;
+                if (!(bool)isSupported.Invoke(null, [e, n])! || (bool)isExcluded.Invoke(null, [n])!)
+                {
+                    why = "GBR がその NPC からの自動購入に対応していません";
+                    return false;
+                }
+
+                var add = vblm.GetType().GetMethod("TryAddTarget", GbrHandle.PubInst, null,
+                    [typeof(Guid), et, n.GetType(), typeof(uint), typeof(bool), typeof(bool), typeof(bool)], null);
+                if (add == null)
+                {
+                    why = "GBR の TryAddTarget が見つかりません（GBR の版が変わった可能性）";
+                    return false;
+                }
+
+                if ((bool)add.Invoke(vblm, [listId, e, n, target, false, false, false])!)
+                    return true;
+                why = "GBR が登録を断りました";
+                return false;
+            }
+        }
+
+        why = "その NPC がその品を売っていません（GBR の店の一覧）";
+        return false;
     }
 
     /// <summary>購入を始める。戻り値は GBR の StartResult の名前（失敗時は null）。</summary>

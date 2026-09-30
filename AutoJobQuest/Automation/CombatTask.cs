@@ -69,6 +69,9 @@ public sealed class CombatTask : AutoTask
     private readonly Engagement engage = new();
     private readonly ICombatWorld world = GameCombatWorld.Instance;
     private bool pausedByUi;
+
+    // ナビメッシュの読み込みを頼んだ（1回だけ。移動の作業と同じ）
+    private bool navReloadRequested;
     private DateTime uiOpenSince = DateTime.MinValue;
 
     // 諦めた敵にしか狙われていないのに戦闘状態が続いている時刻（続けば止める）
@@ -254,6 +257,11 @@ public sealed class CombatTask : AutoTask
                 return this.Fail(this.engage.Problem);
         }
 
+        // 範囲攻撃を Off にできない・勝手に狙う設定を切れないときは止める（指定モンスター以外は攻撃しないため。
+        // 以前は警告だけで戦い続け、巻き込んだ敵を「攻撃してきた敵」として次々に倒しに行きえた）
+        if (ctx.Rotation.TargetingProblem is { } problem)
+            return this.Fail($"RSR が指定のモンスター以外を攻撃しうる状態なので、戦闘を止めます：{problem}");
+
         this.Status = status;
         return TaskResult.Running;
     }
@@ -323,9 +331,10 @@ public sealed class CombatTask : AutoTask
 
             this.moving.Cleanup(ctx);
             this.moving = null;
-            this.spotArrivedAt = DateTime.UtcNow;
-            if (r == TaskResult.Failed)
-                this.spotIndex = (this.spotIndex + 1) % this.spots.Count;
+
+            // 着けなかった出現点は「着いた」にしない（以前は着いた印も付けたので、次のフレームで
+            // もう1つ進み、出現点を1つ飛ばしていた。出現点が2つだと、遠い方へ一度も行かずに着けない方を繰り返した）
+            (this.spotIndex, this.spotArrivedAt) = SpotAfterMove(this.spotIndex, this.spots.Count, r == TaskResult.Failed, DateTime.UtcNow);
             return TaskResult.Running;
         }
 
@@ -345,6 +354,22 @@ public sealed class CombatTask : AutoTask
         if (this.spotArrivedAt != DateTime.MinValue)
             this.spotIndex = (this.spotIndex + 1) % this.spots.Count;
 
+        // 地図（ナビメッシュ）の準備ができるまで待つ（以前は準備前だと床が見つからず、出現点を全部
+        // 「床が無い」として毎フレーム飛ばし続けた。読み込みを頼むのは移動の作業の中だけで、そこまで届かなかった）
+        if (!ctx.Navmesh.IsReady())
+        {
+            var progress = ctx.Navmesh.BuildProgress();
+            if (progress is not (>= 0 and < 1) && !this.navReloadRequested)
+            {
+                this.navReloadRequested = true;
+                ctx.Navmesh.Reload();
+                ctx.Log.Debug("戦闘", "ナビメッシュの準備ができていないので、読み込みを頼みました");
+            }
+
+            this.Status = progress is >= 0 and < 1 ? $"ナビメッシュ構築中 {progress * 100:0}%" : "ナビメッシュの準備を待っています";
+            return TaskResult.Running;
+        }
+
         var spot = this.spots[this.spotIndex];
         var world = MapCoords.ToWorld(this.territory, spot.X, spot.Y);
         var onFloor = ctx.Navmesh.NearestPoint(new Vector3(world.X, Me.Position.Y, world.Z), 10f, 300f)
@@ -361,6 +386,13 @@ public sealed class CombatTask : AutoTask
         this.spotArrivedAt = DateTime.MinValue;
         return TaskResult.Running;
     }
+
+    /// <summary>
+    /// 出現点への移動が終わった後の、次に見る出現点と「着いた時刻」。着けたら同じ出現点で湧きを見る（進めるのは湧きを見た後）。
+    /// 着けなければ次の出現点へ1つだけ進め、着いた印は付けない（ゲームを起動せずに試せるように分けた）。
+    /// </summary>
+    public static (int Index, DateTime ArrivedAt) SpotAfterMove(int index, int count, bool failed, DateTime now)
+        => failed ? ((index + 1) % count, DateTime.MinValue) : (index, now);
 
     private void CancelMove(TaskContext ctx)
     {

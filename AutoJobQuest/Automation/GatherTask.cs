@@ -66,6 +66,12 @@ public sealed class GatherTask : AutoTask
     /// </summary>
     public Planning.Route Route { get; }
 
+    /// <summary>刺突漁の GBR を動かす作業か（エサを使わない。刺突漁の設定は SpearfishTask が合わせる）。</summary>
+    public bool Spearfish { get; init; }
+
+    // 竿の釣り（エサを使う）
+    private bool RodFishing => this.Route == Planning.Route.Fish && !this.Spearfish;
+
     public GatherTask(IEnumerable<GatherNeed> needs, uint? preferredTerritory, string label, TimeSpan limit, Planning.Route route = Planning.Route.Gather)
     {
         this.needs = needs.ToList();
@@ -81,7 +87,8 @@ public sealed class GatherTask : AutoTask
     /// この作業が GBR に合わせる設定（刺突漁の設定は含まない：釣果送信の同意は、竿の釣りでは変えない。
     /// 刺突漁は <see cref="SpearfishTask.RequiredSettings"/> が先に合わせる）。
     /// </summary>
-    public static List<GbrRequiredSettings.Setting> RequiredSettings(Planning.Route route) => GbrRequiredSettings.For(route, spearfish: false);
+    public static List<GbrRequiredSettings.Setting> RequiredSettings(Planning.Route route, bool spearfish = false)
+        => spearfish ? [.. GbrRequiredSettings.Always, .. GbrRequiredSettings.Fishing] : GbrRequiredSettings.For(route, spearfish: false);
 
     /// <summary>
     /// GBR と同じ数え方の所持数（GBR の GatherableExtensions.GetInventoryCount と同じ）：
@@ -115,6 +122,15 @@ public sealed class GatherTask : AutoTask
             var missing = RequiredCapabilities.Fishing(ctx.Gbr.ReadAutoGatherBool(GbrRequiredSettings.FishDataCollection), ctx.AutoHook.IsLoaded);
             if (missing.Count > 0)
                 return this.Fail($"釣りを始められません（{string.Join(" / ", this.needs.Select(n => CraftPlanner.ItemName(n.ItemId)))}）：{string.Join(" / ", missing)}");
+        }
+
+        // 竿の釣りは万能ルアーで行う。直前の購入で買えず0個なら、釣らずに別の手段へ回す
+        // （0個のまま GBR を動かすと、投げられないまま上限の90分まで待つ）
+        if (this.RodFishing && !VersatileLure.CanFish(Inventory.CountNow(VersatileLure.ItemId)))
+        {
+            this.Unfinished.AddRange(this.needs.Select(n => n.ItemId));
+            ctx.Log.Warn("採集", $"万能ルアーが0個で、買えなかったので釣りません（{string.Join("、", this.needs.Select(n => CraftPlanner.ItemName(n.ItemId)))}は別の手段にします）");
+            return TaskResult.Done;
         }
 
         // 動いている・読めないときは始めない（利用者の操作を横取りしない。fail-closed）
@@ -165,7 +181,7 @@ public sealed class GatherTask : AutoTask
         // GBR が集められる設定になっていなければ、この作業の間だけ合わせる（終わったら後始末で戻す。
         // 以前は vnavmesh の移動・採集窓の操作が OFF だと始める前に止め、UseAutoHook が OFF だと釣りを止めていた）。
         // 刺突漁の設定（徒歩の強制・釣果送信の同意）は SpearfishTask が先に合わせている
-        var required = RequiredSettings(this.Route);
+        var required = RequiredSettings(this.Route, this.Spearfish);
         var changed = GbrRequiredSettings.Apply(required, ctx.Gbr.ReadAutoGatherBool, ctx.Gbr.OverrideBool, out var failedSetting);
         foreach (var c in changed)
             ctx.Log.Write("採集", $"GBR の設定を、この作業の間だけ変えました：{GbrRequiredSettings.Describe(c)}。終わったら戻します");
@@ -216,12 +232,20 @@ public sealed class GatherTask : AutoTask
             {
                 this.enabledByMe = ctx.GatherBuddy.IsAutoGatherEnabled() != false;
                 this.Unfinished.AddRange(remaining.Select(r => r.Key));
-                ctx.Log.Warn("採集", $"GBR の自動採集が ON になりません（{ctx.GatherBuddy.StatusText()}）。知覚不足・ギアセット無し・エサ無しなどが考えられます。別の入手手段にします");
+                ctx.Log.Warn("採集", $"GBR の自動採集が ON になりません（{ctx.GatherBuddy.StatusText()}）。知覚不足・ギアセット無しなどが考えられます。別の入手手段にします");
                 return TaskResult.Done;
             }
 
             this.NextPhase("GBR が採集中");
             return TaskResult.Running;
+        }
+
+        // 竿の釣りの途中で万能ルアーが全部なくなったら、GBR を止める（投げられないまま待たない）。集めきれなかった品は
+        // 釣りの手段から外さずに次の周回へ回し、周回の始めに5個買い直す（全部なくなったときだけ買う）
+        if (this.RodFishing && !VersatileLure.CanFish(Inventory.CountNow(VersatileLure.ItemId)))
+        {
+            ctx.Log.Warn("採集", $"{this.label}: 万能ルアーが全部なくなったので、釣りを止めます（次の周回で {VersatileLure.BuyCount} 個買い直してから続けます）");
+            return TaskResult.Done;
         }
 
         if (on == false)
@@ -270,7 +294,8 @@ public sealed class GatherTask : AutoTask
 /// 持っていたい総数（計画と同じ数え方＝Inventory.Snapshot）。買う数は作業を始めるときに「総数 − その時点の所持数」で決める
 /// （計画時の不足数を開始時の所持数に足すと、その間に手に入った分まで余計に買ってギルを使う）。
 /// </param>
-public sealed record VendorNeed(uint ItemId, int TargetOwned);
+/// <param name="PreferredNpcId">買う NPC（ENpc）。null なら GBR が選ぶ。指定の NPC で買えなければ GBR が選ぶ店で買う。</param>
+public sealed record VendorNeed(uint ItemId, int TargetOwned, uint? PreferredNpcId = null);
 
 /// <summary>
 /// GBR の購入機能で NPC から買う（NPC で買える素材・魚は買う。ギルの店だけ）。
@@ -291,6 +316,7 @@ public sealed class VendorTask : AutoTask
     private Guid? listId;
     private bool started;
     private int retries;
+    private DateTime nextStartAt = DateTime.MinValue;
 
     // 止めるよう頼んだ（GBR の Stop は中止待ちを立てるだけなので、IsBusy が false になるまで待つ：VendorBuyListManager.cs:468-481）
     private bool stopRequested;
@@ -350,7 +376,9 @@ public sealed class VendorTask : AutoTask
         // （GBR のソースで確認：読むのは自動採集と収集品の処理だけ）。変えると、購入の後に戻すまで控えが残るだけになる。
         // 採集の作業（GatherTask）は自分で変える
 
-        this.listId = ctx.Gbr.PrepareVendorList(this.targets.Select(t => (t.Key, (uint)t.Value)).ToList(), out var notGil);
+        var preferred = this.needs.Where(n => n.PreferredNpcId != null && this.targets.ContainsKey(n.ItemId))
+            .ToDictionary(n => n.ItemId, n => n.PreferredNpcId!.Value);
+        this.listId = ctx.Gbr.PrepareVendorList(this.targets.Select(t => (t.Key, (uint)t.Value)).ToList(), out var notGil, preferred);
         if (this.listId == null)
             return this.Fail(ctx.Gbr.LastError ?? "GBR の購入リストを用意できませんでした");
 
@@ -372,6 +400,11 @@ public sealed class VendorTask : AutoTask
     {
         if (!this.started)
         {
+            // 開始を頼むのは1秒に1回まで（以前は毎フレーム頼み、失敗の頼み直し3回が一瞬で尽きて止まった）
+            if (DateTime.UtcNow < this.nextStartAt)
+                return TaskResult.Running;
+            this.nextStartAt = DateTime.UtcNow + TimeSpan.FromSeconds(1);
+
             var r = ctx.Gbr.StartVendor(this.listId!.Value);
             switch (r)
             {

@@ -51,6 +51,9 @@ public sealed class DefenseWatch
     private DateTime startedAt;
     private DateTime onlyGivenUpSince = DateTime.MinValue;
 
+    // ショップ等の画面が開いていたので、近づく移動を止めていた（閉じたら HP が減らない時間の数え直しをする）
+    private bool pausedByWindow;
+
     // 狙っている敵（ID・名前 ID・BaseId で引き直す）
     private ulong targetId;
     private uint targetNameId;
@@ -153,6 +156,22 @@ public sealed class DefenseWatch
             this.targetNameId = attacker.NameId;
             this.targetBaseId = attacker.BaseId;
             this.engage.Start(this.world, attacker);
+        }
+
+        // ショップ等の画面が開いている間は、敵へ近づく移動をしない（以前は反撃だけ画面を見ていなかった）。
+        // RSR は Henched のまま届く範囲で攻撃を続ける。待った時間は「HP が減らない時間」に数えない
+        if (this.world.WindowOpen)
+        {
+            this.engage.StopApproach(nav);
+            this.pausedByWindow = true;
+            status = "攻撃されています（ショップ等の画面が開いているので、近づかずに反撃しています）";
+            return Result.Defending;
+        }
+
+        if (this.pausedByWindow)
+        {
+            this.pausedByWindow = false;
+            this.engage.Resume(this.world);
         }
 
         switch (this.engage.Tick(this.world, rsr, nav, attacker, out status))

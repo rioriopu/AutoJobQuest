@@ -49,6 +49,14 @@ public static class GbrRequiredSettings
         new("UseAutoHook", true, "UseAutoHook", "OFF だと GBR が AutoHook を動かさないので、釣らない・突かない。GBR の画面に無く、設定ファイルだけにある項目"),
     ];
 
+    /// <summary>竿の釣りのとき（刺突漁には効かない設定）。</summary>
+    public static readonly IReadOnlyList<Setting> RodFishing =
+    [
+        // AutoGather.AutoHook.cs:53, 84-108（ON だと AutoHook のグローバルプリセットで釣り、魚のエサを万能ルアーに差し替えない：
+        // エサは全て万能ルアーにする。刺突漁では見ない＝!IsSpearFish）
+        new("UseAutoHookGlobalPreset", false, "Use AutoHook Global Preset", "ON だと GBR が AutoHook のグローバルプリセットで釣り、エサを万能ルアーに差し替えない"),
+    ];
+
     /// <summary>刺突漁（潜水）のとき。</summary>
     public static readonly IReadOnlyList<Setting> Spearfishing =
     [
@@ -60,7 +68,7 @@ public static class GbrRequiredSettings
             "OFF だと GBR は魚が目標にあるだけで止まる。ON の間は、釣った魚のデータが GBR の外部サーバーへ送られる"),
     ];
 
-    /// <summary>その作業で要る設定。刺突漁は、釣りの設定と刺突漁の設定の両方を含む。</summary>
+    /// <summary>その作業で要る設定。竿の釣りは釣りの設定と竿の釣りの設定、刺突漁は釣りの設定と刺突漁の設定を含む。</summary>
     /// <param name="route">集め方（GBR の自動採集を使うもの）。</param>
     /// <param name="spearfish">刺突漁か。</param>
     public static List<Setting> For(Route route, bool spearfish)
@@ -68,6 +76,8 @@ public static class GbrRequiredSettings
         var list = Always.ToList();
         if (route == Route.Fish || spearfish)
             list.AddRange(Fishing);
+        if (route == Route.Fish && !spearfish)
+            list.AddRange(RodFishing);
         if (spearfish)
             list.AddRange(Spearfishing);
         return list;

@@ -107,8 +107,12 @@ public sealed class Services : IDisposable
 
             if (this.Ctx.Rotation.RestorePending)
                 pending.Add("RSR のモード・範囲攻撃の設定");
-            if (this.Ctx.Gbr.HasLeftovers)
+            // GBR は、まだ戻していないものだけを数える（戻して保存ファイルへの書き込みを確かめているだけのものは、止まっている間に確かめ続ける）
+            this.Ctx.Gbr.VerifyConfigSaved();
+            if (this.Ctx.Gbr.HasUnrestored)
                 pending.Add("GBR の設定・自動採集リスト");
+            else if (this.Ctx.Gbr.HasLeftovers)
+                this.Log.Write("GBR", "GBR の設定とリストは戻しました（保存ファイルに書かれたかは、止まっている間に確かめます）");
             if (this.Config.ArtisanTempConsumableRecipes.Count > 0)
                 pending.Add($"Artisan の食事・薬の一時指定（{this.Config.ArtisanTempConsumableRecipes.Count} レシピ）");
             return new RunFacts(this.Config.PendingPurchase != null, pending);

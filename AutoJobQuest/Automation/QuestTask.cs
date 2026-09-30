@@ -90,6 +90,10 @@ public sealed unsafe class QuestTask : AutoTask
     private bool spearfishTried;
     private DateTime? spearfishSince;
     private TimeSpan spearfishTotal;
+
+    // 受注後の品をこちらで作っている時間（HQ の作り直しは回数の上限で止めるので、クエストの時間の上限には数えない）
+    private DateTime? questCraftSince;
+    private TimeSpan questCraftTotal;
     private int instructionSeq;
     private int instructionStep;
 
@@ -241,8 +245,9 @@ public sealed unsafe class QuestTask : AutoTask
         // 手で行う手順を待った時間は数えない
         var waited = this.manualWaitTotal + (this.manualWaitSince is { } ws ? DateTime.UtcNow - ws : TimeSpan.Zero);
         var spearWaited = this.spearfishTotal + (this.spearfishSince is { } ss ? DateTime.UtcNow - ss : TimeSpan.Zero);
+        var craftWaited = this.questCraftTotal + (this.questCraftSince is { } cs ? DateTime.UtcNow - cs : TimeSpan.Zero);
         var limit = TimeSpan.FromMinutes(this.paths?.Any(s => s.Type is "Gather" or "Fish") == true ? 90 : 30);
-        if (this.Elapsed - waited - spearWaited > limit)
+        if (this.Elapsed - waited - spearWaited - craftWaited > limit)
             return this.Fail($"{limit.TotalMinutes:0}分たってもクエストが完了しません");
         if (waited > ManualWaitLimit)
             return this.Fail($"手で行う手順を {ManualWaitLimit.TotalMinutes:0} 分待っても進みませんでした。手順を終えてから再開してください");
@@ -405,6 +410,7 @@ public sealed unsafe class QuestTask : AutoTask
                 {
                     ctx.Questionable.Stop(Plugin.InternalNameConst);
                     this.questCraft = new QuestCraftTask(this.quest, qc, this.paths);
+                    this.questCraftSince = DateTime.UtcNow;
                     ctx.Log.Write("クエスト", $"Questionable が {CraftPlanner.ItemName(qc.ItemId)} の製作の段（段 {stepData.Sequence}・手順 {stepData.InteractionType}）に入ったので止め、"
                                          + $"こちらで{(qc.Hq ? " HQ になるまで" : string.Empty)}作ります"
                                          + "（Questionable の製作は品質を見ないため。製作は Artisan に任せます）");
@@ -657,6 +663,9 @@ public sealed unsafe class QuestTask : AutoTask
         var failed = r == TaskResult.Failed ? this.questCraft.FailReason : null;
         this.questCraft.Cleanup(ctx);
         this.questCraft = null;
+        if (this.questCraftSince is { } craftSince)
+            this.questCraftTotal += DateTime.UtcNow - craftSince;
+        this.questCraftSince = null;
         if (failed != null)
             return this.Fail(failed);
 

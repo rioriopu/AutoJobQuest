@@ -234,6 +234,9 @@ public sealed unsafe class MarketBoardWatcher : IDisposable
     /// <summary>出品一覧の通知を受け取れているか（false なら、ページの番号での照合はできない）。</summary>
     public bool OfferingsAvailable => this.offeringsSubscribed;
 
+    /// <summary>取引履歴の通知を受け取れているか（false なら、相場から外れた高値かは確かめられない）。</summary>
+    public bool HistoryAvailable => this.historySubscribed;
+
     /// <summary>その品の最近の取引の単価（最大20件。届いていなければ空）。</summary>
     public List<uint> HistoryUnitPrices(uint itemId)
     {
@@ -577,6 +580,15 @@ public sealed unsafe class MarketBoardTask : AutoTask
 
     /// <summary>買えなかった品目の ID（呼び出し側が別の手段を選ぶのに使う）。</summary>
     public List<uint> UnfinishedItems { get; } = [];
+
+    /// <summary>買えなかった理由（品目 → 理由。入手手段が尽きて止めるときに、本当の理由を画面とチャットに出すのに使う）。</summary>
+    public Dictionary<uint, string> UnfinishedReasons { get; } = [];
+
+    /// <summary>出品を選ぶ前に、取引履歴（相場）が届くのを待つ上限。</summary>
+    public static readonly TimeSpan HistoryWait = TimeSpan.FromSeconds(5);
+
+    /// <summary>自分で開いたマーケットボードの画面を閉じ直す上限（過ぎたら止める）。</summary>
+    public static readonly TimeSpan CloseLimit = TimeSpan.FromMinutes(1);
 
     public MarketBoardTask(IEnumerable<MarketNeed> needs, MarketBoardWatcher watcher)
     {
@@ -963,6 +975,15 @@ public sealed unsafe class MarketBoardTask : AutoTask
             return TaskResult.Running;
         }
 
+        // 取引履歴（相場）が届くのを少し待つ（以前は出品一覧がそろった時点で決め、履歴がまだなら
+        // 相場から外れた高値の確認を黙って飛ばしていた。履歴の無い品もあるので、上限を過ぎたら履歴なしで進む）
+        if (ctx.Config.ConfirmUnitPriceRatio > 0 && this.watcher.HistoryAvailable
+            && this.watcher.HistoryUnitPrices(this.searching).Count == 0 && this.PhaseElapsed < HistoryWait)
+        {
+            this.Status = "取引履歴（相場）が届くのを待っています";
+            return TaskResult.Running;
+        }
+
         var listings = this.ReadListings();
 
         // 読み取った出品を全部記録する（どの出品を選んだかを後から確かめられるように）
@@ -1025,7 +1046,7 @@ public sealed unsafe class MarketBoardTask : AutoTask
         var history = this.watcher.HistoryUnitPrices(this.buyingItem);
         var market = PurchaseGuard.MedianUnitPrice(history);
         if (market == null && ctx.Config.ConfirmUnitPriceRatio > 0)
-            ctx.Log.Debug("マーケット", $"{CraftPlanner.ItemName(this.buyingItem)} の取引履歴が届いていないので、相場から外れた高値かは確かめられません");
+            ctx.Log.Warn("マーケット", $"{CraftPlanner.ItemName(this.buyingItem)} の取引履歴が {HistoryWait.TotalSeconds:0} 秒待っても届かないので、相場から外れた高値かは確かめられません（1回の額の確認は働きます）");
         var excess = Math.Max(0, pick.Quantity - need) * (long)pick.UnitPrice;
         var reasons = PurchaseGuard.ConfirmReasons(pick.Total, pick.UnitPrice, ctx.Config.ConfirmPurchaseAboveGil, approved,
             market, ctx.Config.ConfirmUnitPriceRatio, SpentThisRun, RunApprovedUpTo, excess, ctx.Config.ConfirmExcessAboveGil);
@@ -1315,6 +1336,8 @@ public sealed unsafe class MarketBoardTask : AutoTask
 
         this.Unfinished.Add(this.current.Label);
         this.UnfinishedItems.AddRange(this.current.Candidates);
+        foreach (var id in this.current.Candidates)
+            this.UnfinishedReasons[id] = why;
         this.buyingItem = 0;
         this.Go(Phase.Next, string.Empty);
         return TaskResult.Running;
@@ -1327,12 +1350,12 @@ public sealed unsafe class MarketBoardTask : AutoTask
         if (!this.openedByMe || !CloseOwnWindows(ref this.closeAt))
             return TaskResult.Done;
 
-        if (this.TimedOut(TimeSpan.FromSeconds(10)))
-        {
-            ctx.Log.Warn("マーケット", "マーケットボードの画面が閉じません（開いたまま次へ進みます）");
-            return TaskResult.Done;
-        }
+        // 自分で開いた画面なので、閉じ直しを続ける（以前は 10 秒で「開いたまま次へ」進んだが、次の作業は
+        // この画面を「開いている間は動かない画面」として5分待ち、「画面が開いたまま」という別の理由で止まっていた）
+        if (this.TimedOut(CloseLimit))
+            return this.Fail($"マーケットボードの画面が {CloseLimit.TotalSeconds:0} 秒たっても閉じません（画面を閉じてから、もう一度開始してください）");
 
+        this.Status = "マーケットボードの画面を閉じています";
         return TaskResult.Running;
     }
 

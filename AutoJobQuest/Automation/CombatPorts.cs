@@ -44,6 +44,9 @@ public interface ICombatWorld
     /// <summary>自分が詠唱中か（詠唱中に歩き出すと詠唱が切れるので、近づく移動を頼まない）。</summary>
     bool Casting { get; }
 
+    /// <summary>ショップ等の画面（確認窓・選択肢・納品窓も含む）が開いているか（開いている間は移動しない）。</summary>
+    bool WindowOpen { get; }
+
     Vector3 MyPosition { get; }
 
     /// <summary>いまのジョブが戦闘ジョブか。</summary>
@@ -195,6 +198,8 @@ public sealed class GameCombatWorld : ICombatWorld
     public bool Mounted => GameUi.Mounted;
 
     public bool Casting => Svc.Objects.LocalPlayer is { } me && me.IsCasting;
+
+    public bool WindowOpen => GameUi.IsShopOrMarketOpen();
 
     public Vector3 MyPosition => Me.Position;
 

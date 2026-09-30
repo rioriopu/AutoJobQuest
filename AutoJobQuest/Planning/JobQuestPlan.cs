@@ -313,7 +313,8 @@ public static class PlanBuilder
             bool LeftToQuestionable(uint item) => questGathers.Contains(item) && excludedRoutes != null
                 && excludedRoutes.TryGetValue(item, out var bad) && (bad.Contains(Route.Gather) || bad.Contains(Route.Fish));
             var prepare = needs.Needed.Where(n => !q.AfterAcceptItems.Contains(n.ItemId) && !LeftToQuestionable(n.ItemId))
-                .Select(n => PlanAsHq(data.Planner!, n)).ToList();
+                .Select(n => PlanAsHq(data.Planner!, n))
+                .Select(n => PlanSingleQuality(data.Planner!, n, inv)).ToList();
             plan.RetainerTargets.AddRange(prepare);
             plan.Targets.AddRange(prepare);
 
@@ -430,6 +431,29 @@ public static class PlanBuilder
         if (!Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Item>().TryGetRow(n.ItemId, out var item) || item.StackSize <= 1 || !item.CanBeHq)
             return n;
         return n with { Hq = true, Evidence = n.Evidence + "（品質不問だが、NQ と HQ の山が分かれると納品窓で渡せないので HQ で用意する）" };
+    }
+
+    /// <summary>
+    /// 品質不問で2個以上を渡す、重ねられて HQ のある「作れない品」（採集品・魚）は、1つの品質で N 個そろうように数える
+    /// （釣り・採集で HQ が混ざると、NQ と HQ の山がどちらも N 個に届かず、納品窓で渡せない。
+    /// 計画は NQ と HQ の合計で数えるので「足りている」と判断し、再開しても同じ所で止まり続けた。作れる品は <see cref="PlanAsHq"/> で HQ にそろえる）。
+    /// どちらかの品質で N 個あればそのまま。無ければ、手持ちの HQ の数を上乗せして、集め足す品（GBR の採集・NPC の品は NQ）で NQ の山が N 個になるようにする。
+    /// </summary>
+    public static QuestItemReq PlanSingleQuality(CraftPlanner planner, QuestItemReq n, IInventoryView inv)
+    {
+        if (n.Hq || n.Count < 2 || planner.IsCraftable(n.ItemId))
+            return n;
+        if (!Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Item>().TryGetRow(n.ItemId, out var item) || item.StackSize <= 1 || !item.CanBeHq)
+            return n;
+        var nq = inv.CountNq(n.ItemId);
+        var hq = inv.CountHq(n.ItemId);
+        if (hq == 0 || Math.Max(nq, hq) >= n.Count)
+            return n;
+        return n with
+        {
+            Count = n.Count + hq,
+            Evidence = n.Evidence + $"（品質不問だが NQ {nq}・HQ {hq} に分かれ、どちらの山も {n.Count} 個に届かず納品窓で渡せないので、NQ で {n.Count} 個そろうよう HQ の {hq} 個を上乗せする）",
+        };
     }
 
     /// <summary>

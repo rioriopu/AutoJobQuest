@@ -65,8 +65,15 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
     // 製作の列の打ち切り（材料が予定より少ないレシピに来たら、古い計画のまま進めず、残りを捨てて立て直す）
     private string? craftCut;
 
+    // 製作の列の途中で、HQ 指定の品が HQ にならない回数が上限に届いた（段の終わりにこの理由で止める）
+    private string? hqStop;
+
     // マーケットで買えなかった回数（品目ごと。2回で手段から外す）
     private readonly Dictionary<uint, int> marketFailures = [];
+
+    // 品目ごとの最後の失敗の理由（入手手段が尽きて止めるときに出す。以前は「入手手段が残っていない」だけで、
+    // ギルが足りない等の本当の理由は記録の注意の行にしか無かった）
+    private readonly Dictionary<uint, string> lastFailure = [];
 
     // 入手に失敗した手段（品目 → 手段）
     private readonly Dictionary<uint, HashSet<Route>> excluded = [];
@@ -84,6 +91,9 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
     private BlockedQuest? knockTarget;
     private List<BlockedQuest> knockOthers = [];
     private KnockOnIssuerTask? knockTask;
+
+    // 話しかけて止める段の後始末を済ませた（止めたときに全体の後始末から2回呼ばないように）
+    private bool knockCleaned;
     private readonly Dictionary<uint, int> marketSwitchUsed = [];
     private List<(uint Item, int Need)> pendingSwitch = [];
 
@@ -401,6 +411,11 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
             marketLines.Add((CraftPlanner.ItemName(r.ItemId), r.Shortfall, why));
         }
 
+        // 装着するマテリアも並べる（計画の不足には入らず、周回の先頭で別に買う。以前は一覧から漏れ、
+        // たいてい一番高い品なのに開始の確認に出なかった。マテリアは本来の手段がマーケットなので、了承の数には入れない）
+        foreach (var m in MateriaMarketNeeds(ctx.Config, plan))
+            marketLines.Add((m.Label, m.Need, "装着に使うマテリア。出品が無ければその場で止めます"));
+
         this.startApproved = approve;
         var marketPlan = Preflight.MarketPlanText(marketLines);
 
@@ -485,6 +500,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         this.craftCut = null;
         this.craftTasks.Clear();
         this.marketFailures.Clear();
+        this.lastFailure.Clear();
         // マーケットへの切り替えの了承は区切りごと（前の区切りで了承した品でも、この区切りの数で聞き直す）
         this.marketSwitchApproved.Clear();
         this.marketSwitchUsed.Clear();
@@ -563,6 +579,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         if (r == TaskResult.Running)
             return TaskResult.Running;
         this.knockTask.Cleanup(ctx);
+        this.knockCleaned = true;
 
         var text = KnockOnIssuerTask.StopText(this.knockTarget, this.knockTask.Result, this.knockTask.Detail ?? this.knockTask.FailReason, this.knockOthers);
         ctx.Log.Warn("クエスト", text);
@@ -837,7 +854,8 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
 
         var unknown = raw.Where(r => r.Routes.Count == 0).ToList();
         if (unknown.Count > 0)
-            return this.Fail($"入手手段が残っていない素材があります：{string.Join("、", unknown.Select(r => $"{CraftPlanner.ItemName(r.Item)}×{r.Need}"))}");
+            return this.Fail($"入手手段が残っていない素材があります：{string.Join("、", unknown.Select(r => $"{CraftPlanner.ItemName(r.Item)}×{r.Need}"
+                                                                                               + (this.lastFailure.TryGetValue(r.Item, out var why) ? $"（最後の失敗 {why}）" : string.Empty)))}");
 
         this.roundTasks.Clear();
         var steps = new List<Func<TaskContext, AutoTask?>>();
@@ -936,6 +954,11 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
                     $"釣りで集める素材（{string.Join("、", fish.Select(f => $"{CraftPlanner.ItemName(f.Item)}×{f.Need}"))}）がありますが、釣りを始められません：{string.Join(" / ", missing)}");
             }
 
+            // 釣りのエサは万能ルアー。釣りの直前に数え、全部なくなっていればリムサ・ロミンサのよろず屋で5個買う
+            // （段は実行する瞬間に作るので、その時点の所持数で決まる。1〜4個なら買い足さない）
+            steps.Add(_ => VersatileLure.PurchaseBefore(Inventory.CountNow(VersatileLure.ItemId)) is { } lure
+                ? this.Track(new VendorTask([lure]))
+                : null);
             steps.Add(_ => this.Track(new GatherTask(
                 fish.Select(f => new GatherNeed(f.Item, inv.CountAll(f.Item) + f.Need)), null, "釣り", TimeSpan.FromMinutes(90), Route.Fish)));
         }
@@ -1039,6 +1062,8 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
                     // マーケットは一時的な理由（混雑・その時点で出品が無い）でも失敗するので、2回失敗するまでは外さない
                     foreach (var id in m.UnfinishedItems)
                     {
+                        if (m.UnfinishedReasons.TryGetValue(id, out var why))
+                            this.lastFailure[id] = $"マーケット：{why}";
                         var n = this.marketFailures[id] = this.marketFailures.GetValueOrDefault(id) + 1;
                         if (n >= 2)
                             this.Exclude(id, Route.MarketBoard);
@@ -1224,6 +1249,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
 
         var steps = new List<Func<TaskContext, AutoTask?>> { _ => new GoToInnTask() };
         this.craftCut = null;
+        this.hqStop = null;
         foreach (var c in plan.Craft.Crafts)
             steps.Add(cc => this.NextCraft(cc, c));
 
@@ -1245,6 +1271,16 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
     {
         if (this.craftCut != null)
             return null;
+
+        // 次のレシピへ進む前に、終わった製作の HQ を数える。HQ 指定の品が上限まで HQ にならなければ、ここで列を打ち切る
+        // （以前は列を全部作り終えてから数えたので、止まるまでに後ろのレシピの材料も使っていた）
+        if (this.TallyHqFailures(ctx) is { } stop)
+        {
+            this.hqStop = stop;
+            this.craftCut = "HQ 指定の品が HQ になりませんでした";
+            ctx.Log.Warn("製作", "HQ 指定の品が HQ にならなかったので、ここで製作の列を打ち切ります（残りのレシピは作りません）");
+            return null;
+        }
 
         // 納品用の取り置き（HQ 指定の中間素材を、親の製作の後に作る分）は、いまの手持ちで回数を数え直す。
         // 計画は「親が HQ を先に使う」（Artisan のふつうの動き）で見積もっている。もし親が NQ を先に使って HQ が残っていれば、
@@ -1455,8 +1491,11 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
 
             case Stage.Craft:
                 // 同じ段で立て直す（足りない品があれば作り直し、残りが無ければ次へ）。その前に、HQ の失敗を品目ごとに数える
-                if (this.TallyHqFailures(ctx) is { } hqStop)
+                if ((this.hqStop ?? this.TallyHqFailures(ctx)) is { } hqStop)
+                {
+                    this.hqStop = null;
                     return this.Fail(hqStop);
+                }
                 break;
 
             // Craft・Quests は同じ段で立て直す（足りない品があれば作り直し、残りが無ければ次へ）
@@ -1478,6 +1517,15 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         var c = this.child;
         this.child = null;
         Safe(ctx, "作業の後始末", () => c?.Cleanup(ctx));
+
+        // 最後の「受注の NPC に話しかけて止める」段は子ではなく knockTask で動くので、別に片付ける（
+        // 以前はこの段の途中で止めても、自分が頼んだ移動と選択肢の窓が残った）
+        var k = this.knockTask;
+        if (k != null && !this.knockCleaned)
+        {
+            this.knockCleaned = true;
+            Safe(ctx, "話しかけの後始末", () => k.Cleanup(ctx));
+        }
 
         // 念のため、他プラグインへ頼んでいたことを全部戻す
         Safe(ctx, "RSR の優先ターゲットを外す", ctx.Rotation.ClearOwnPriorities);

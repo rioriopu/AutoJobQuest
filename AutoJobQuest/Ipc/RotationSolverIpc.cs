@@ -94,7 +94,20 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
     private readonly HashSet<string> boolWarnings = [];
     private string? safetyProblem;
 
-    public void BeginRun() => this.boolWarnings.Clear();
+    public void BeginRun()
+    {
+        this.boolWarnings.Clear();
+        this.boolProblem = null;
+    }
+
+    // 真偽の設定を false にできなかったときの理由（問題なければ null）
+    private string? boolProblem;
+
+    /// <summary>
+    /// 指定外の敵を攻撃しうる RSR の設定の問題（範囲攻撃を Off にできない・勝手に狙う設定を false にできない）。問題なければ null。
+    /// 指定のモンスターを倒しに行く戦闘では、これが出たら止める（指定モンスター以外は攻撃しないため）。
+    /// </summary>
+    public string? TargetingProblem => this.AoeProblem ?? this.boolProblem;
 
     /// <summary>利用者が明示的に現在値を保持する。自動復元の控えだけを破棄し、RSRの設定は変更しない。</summary>
     public void KeepCurrentBoolSettings()
@@ -133,6 +146,7 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
                             : $"RSR の設定 {name} を false にしても戻ります（利用者か RSR が変えた可能性）";
                         Core.DebugLog.Current?.Line("IPC", $"⚠ {msg}");
                         Svc.Chat.Print($"[AutoJobQuest] {msg}");
+                        this.boolProblem = msg;
                     }
 
                     break;
@@ -175,6 +189,7 @@ public sealed class RotationSolverIpc : IpcGate, Automation.IRotationControl
         this.boolTaken.Clear();
         this.boolResends.Clear();
         this.lastBoolCheck = DateTime.MinValue;
+        this.boolProblem = null;
     }
 
     private void SaveBool(string name, bool? original)

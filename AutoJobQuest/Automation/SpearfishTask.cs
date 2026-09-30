@@ -352,6 +352,7 @@ public sealed class SpearfishTask : AutoTask
             $"刺突漁（{CraftPlanner.ItemName(this.wanted)}）", GatherLimit, Route.Fish)
         {
             StopWhen = () => this.Held >= this.count,
+            Spearfish = true,
         };
         this.step = SpearStep.Gather;
         this.NextPhase("GBR と AutoHook で刺突漁をしています");

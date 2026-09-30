@@ -270,6 +270,17 @@ public static class Preflight
                     $"釣りで集める素材があります（{fishItems}）が、GBR の「Opt-in to fishing data collection」が OFF のため GBR は釣りをしません。"
                     + "これは釣果を GBR の外部サーバーへ送ることへの同意なので、こちらからは変えません。"
                     + "GBR の設定画面の検索欄に「fishing data」と入れると項目が出ます。ON にしてからもう一度始めてください" + retainerNote));
+            // 釣りのエサは万能ルアー。0個なら釣りの前にリムサ・ロミンサのよろず屋で5個買う（GBR の NPC 購入）
+            var lure = Inventory.CountNow(Automation.VersatileLure.ItemId);
+            var canBuyLure = installed.Any(x => x.IsLoaded && x.InternalName is "InventoryTools" or "AllaganItemSearch");
+            list.Add(lure > 0
+                ? new PreflightItem(Severity.Ok, $"釣りのエサは万能ルアーを使います（いま {lure} 個。全部なくなったら、リムサ・ロミンサ：下甲板層のよろず屋で {Automation.VersatileLure.BuyCount} 個買い直します）。"
+                                                 + "魚の決まったエサを持っていると、GBR はそちらを使います")
+                : canBuyLure
+                    ? new PreflightItem(Severity.Ok, $"釣りのエサは万能ルアーを使います。いま0個なので、釣りの前にリムサ・ロミンサ：下甲板層のよろず屋で {Automation.VersatileLure.BuyCount} 個買います")
+                    : new PreflightItem(Severity.Warn, $"釣りで集める素材があります（{fishItems}）が、万能ルアーが0個で、Allagan Tools が無いため GBR の NPC 購入で買えません。"
+                                                       + "釣りの素材は別の手段になります（万能ルアーを用意してから始めると釣ります）"));
+
             foreach (var s in Automation.GbrRequiredSettings.Fishing.Where(s => ctx.Gbr.ReadAutoGatherBool(s.Name) == !s.Value))
                 list.Add(new PreflightItem(Severity.Ok, $"釣りで集める素材があります（{fishItems}）。GBR の「{s.Label}」が {Automation.GbrRequiredSettings.OnOff(!s.Value)} です（{s.Why}）。"
                                                         + $"釣りの間だけ {Automation.GbrRequiredSettings.OnOff(s.Value)} にし、終わったら戻します"));
