@@ -504,6 +504,17 @@ public static unsafe class GameUi
     /// <summary>その行動（Action シート）が今使えるか（ActionManager.GetActionStatus。0＝使える、それ以外＝使えない理由の LogMessage の行番号）。</summary>
     public static uint ActionStatus(uint id) => ActionManager.Instance()->GetActionStatus(ActionType.Action, id);
 
+    /// <summary>自分の向き（ラジアン）。読めなければ 0。</summary>
+    public static float PlayerRotation => Svc.Objects.LocalPlayer?.Rotation ?? 0f;
+
+    /// <summary>自分の向きを変える（GBR の自動採集が釣りの前に向きを合わせるのと同じ：GameObject.SetRotation）。</summary>
+    public static void SetPlayerRotation(float rad)
+    {
+        if (Svc.Objects.LocalPlayer is { } me)
+            ((FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)me.Address)->SetRotation(rad);
+        Core.DebugLog.Current?.Line("操作", $"向きを {rad:0.00} ラジアンに変えました");
+    }
+
     /// <summary>行動の後の硬直中か（ActionManager.AnimationLock が 0 より大きい。ECommons の Player.IsAnimationLocked と同じ）。</summary>
     public static bool AnimationLocked => ActionManager.Instance()->AnimationLock > 0;
 
