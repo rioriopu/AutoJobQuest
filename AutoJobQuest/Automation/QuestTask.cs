@@ -791,20 +791,29 @@ public sealed unsafe class QuestTask : AutoTask
     // Questionable の YesNoChoiceHandler と同じ行）
     private const uint HqTradeConfirmAddon = 102434;
 
-    // 会話の窓に答える（HandleQuestDialogs）：最初に見た窓・答えた窓・記録した窓
-    private nint dialogSeen;
-    private nint dialogAnswered;
+    // マテリアを付けた品を渡す確認の文面（ゲームデータ Addon#102433「マテリアが装着されたアイテムをトレードしようとしています。
+    // 装着されているマテリアは戻ってきませんが、本当によろしいですか？」）。MeldTask でマテリアを付けた納品物を渡すときに出る。
+    // Questionable はこの確認を扱わない（YesNoChoiceHandler の一覧に無い）
+    private const uint MateriaTradeConfirmAddon = 102433;
+
+    // 会話の窓に答える（HandleQuestDialogs）：最初に見た窓・答えた窓（どちらも「窓の場所:本文」。同じ場所に続けて別の窓が開いても取り違えない）
+    private string? dialogSeen;
+    private string? dialogAnswered;
 
     /// <summary>
-    /// Questionable が止まっている間（こちらが代わりに手順を行う間）に出た窓に、Questionable と同じ答え方で答える（不具合の例：
-    /// 錬金術師 Lv1 の報告をこちらで行い、HQ の蒸留水を渡す確認のまま止まった）。Questionable はこれらの窓を Questionable が動いている間だけ扱い
-    /// （YesNoChoiceHandler・DialogueChoiceHandler の ShouldHandleUiInteractions）、YesAlready はクエストの間こちらが止めているので、
-    /// こちらで答えないと誰も答えない。
+    /// クエストの間に出た次の窓に、Questionable と同じ答え方で答える。Questionable が動いているかどうかに関係なく、窓が見えた最初のフレームは見送り、
+    /// 次のフレームでも開いたままなら答える（Questionable は窓が開いたとき〔PostSetup〕に答えるので、答えていれば次のフレームには閉じている）。
     ///  ・HQ 品を渡す確認（Addon#102434）：OK（コールバック 0。「ハイクオリティ品を渡す」にチェックを入れるまで OK ボタンは押せないので、
-    ///    Questionable と同じくコールバックで答える）
+    ///    Questionable と同じくコールバックで答える）。どの職のどの納品も、納品窓はこの作業（HandleRequest）だけが扱うので、ここで全部を押さえる
+    ///  ・マテリアを付けた品を渡す確認（Addon#102433）：OK（同じくコールバック 0）。MeldTask でマテリアを付けた納品物を渡すときに出る。
+    ///    Questionable はこの確認を扱わないので、こちらが答えないと必ず止まる
     ///  ・今の段の手順の会話の選択肢（経路の DialogueChoices）：「はい／いいえ」は本文が問いに合えば指定どおり。一覧（SelectString・SelectIconString・
     ///    映像中の CutSceneSelectString）は、問いが合い、答えに合う項目があればその番号（Questionable の DialogueChoiceHandler と同じ読み方）。
-    /// 窓が見えた最初のフレームは見送り、次のフレームでも開いていて Questionable が止まっていれば答える（Questionable が動いていれば任せる）。
+    /// 不具合の例：
+    ///  ①錬金術師 Lv1 の報告をこちらで行い（Questionable を止めていた）、HQ の蒸留水を渡す確認のまま止まった。Questionable はこれらの窓を
+    ///    自分が動いている間だけ扱い（ShouldHandleUiInteractions）、YesAlready はクエストの間こちらが止めているので、誰も答えなかった
+    ///  ②①を直した後、Lv5（578）では Questionable が動いている間に同じ確認のまま止まった。Questionable は窓を受け取った（YesNoChoiceHandler: TravelYesNo）が
+    ///    HQ の確認と判定しなかった（日本語の本文の途中の改行に照合が合わないと見られる）。①の直しは「Questionable が動いていれば任せる」だったので押さなかった
     /// </summary>
     private void HandleQuestDialogs(TaskContext ctx)
     {
@@ -839,29 +848,36 @@ public sealed unsafe class QuestTask : AutoTask
         var ptr = yesno != null ? (nint)yesno : (nint)menu;
         if (ptr == 0)
         {
-            this.dialogSeen = 0;
-            this.dialogAnswered = 0;
+            this.dialogSeen = null;
+            this.dialogAnswered = null;
             return;
         }
 
-        if (ptr == this.dialogAnswered)
+        var key = yesno != null ? $"{ptr}:{yesnoBody}" : $"{ptr}:{menuPrompt}:{string.Join("|", menuEntries ?? [])}";
+        if (key == this.dialogAnswered)
             return;
-        if (ptr != this.dialogSeen)
+        if (key != this.dialogSeen)
         {
-            this.dialogSeen = ptr;
+            this.dialogSeen = key;
             return;
         }
 
-        if (ctx.Questionable.IsRunning() == true)
-            return;
-
-        if (yesno != null)
+        // 渡す確認（マテリア・HQ）は、ほかのプレイヤーとの取引（Trade）でも出る。取引の窓が開いていれば、クエストの納品ではないので答えない
+        if (yesno != null && !GameUi.IsVisible("Trade"))
         {
+            if (QuestDialogue.Matches(yesnoBody, QuestDialogue.ResolveAddon(MateriaTradeConfirmAddon)))
+            {
+                GameUi.Fire(yesno, true, 0);
+                this.dialogAnswered = key;
+                ctx.Log.Write("クエスト", "マテリアを付けた品を渡す確認に OK と答えました（クエストの納品物。Questionable はこの確認を扱わない）");
+                return;
+            }
+
             if (QuestDialogue.Matches(yesnoBody, QuestDialogue.ResolveAddon(HqTradeConfirmAddon)))
             {
                 GameUi.Fire(yesno, true, 0);
-                this.dialogAnswered = ptr;
-                ctx.Log.Write("クエスト", "HQ 品を渡す確認に OK と答えました（Questionable が止まっている間の納品。Questionable と同じ答え方）");
+                this.dialogAnswered = key;
+                ctx.Log.Write("クエスト", $"HQ 品を渡す確認に OK と答えました（Questionable が{(ctx.Questionable.IsRunning() == true ? "動いているのに答えなかったため" : "止まっている間の納品のため")}。Questionable と同じ答え方）");
                 return;
             }
         }
@@ -881,8 +897,8 @@ public sealed unsafe class QuestTask : AutoTask
                 if (!QuestDialogue.Matches(yesnoBody, QuestDialogue.Resolve(this.quest.ShortId, c.Prompt!)))
                     continue;
                 GameUi.Fire(yesno, true, c.Yes ? 0 : 1);
-                this.dialogAnswered = ptr;
-                ctx.Log.Write("クエスト", $"手順の会話の選択肢に「{(c.Yes ? "はい" : "いいえ")}」と答えました：{yesnoBody?.Replace("\n", " ")}（Questionable が止まっている間。経路の指定どおり）");
+                this.dialogAnswered = key;
+                ctx.Log.Write("クエスト", $"手順の会話の選択肢に「{(c.Yes ? "はい" : "いいえ")}」と答えました：{yesnoBody?.Replace("\n", " ")}（Questionable が答えなかったため。経路の指定どおり）");
                 return;
             }
 
@@ -900,8 +916,8 @@ public sealed unsafe class QuestTask : AutoTask
             if (index < 0)
                 continue;
             GameUi.Fire(menu, true, index);
-            this.dialogAnswered = ptr;
-            ctx.Log.Write("クエスト", $"手順の会話の選択肢で「{menuEntries[index]}」を選びました：{menuPrompt?.Replace("\n", " ")}（Questionable が止まっている間。経路の指定どおり）");
+            this.dialogAnswered = key;
+            ctx.Log.Write("クエスト", $"手順の会話の選択肢で「{menuEntries[index]}」を選びました：{menuPrompt?.Replace("\n", " ")}（Questionable が答えなかったため。経路の指定どおり）");
             return;
         }
     }
