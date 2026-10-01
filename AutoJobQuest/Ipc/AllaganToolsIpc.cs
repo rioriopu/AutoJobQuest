@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Linq;
 using FFXIVClientStructs.FFXIV.Client.Game;
 
@@ -27,6 +28,16 @@ public sealed class AllaganToolsIpc : IpcGate
         (int)InventoryType.RetainerPage1, (int)InventoryType.RetainerPage2, (int)InventoryType.RetainerPage3, (int)InventoryType.RetainerPage4,
         (int)InventoryType.RetainerPage5, (int)InventoryType.RetainerPage6, (int)InventoryType.RetainerPage7,
     ];
+
+    /// <summary>
+    /// 今のキャラクターが持つキャラクター（リテイナーなど）の番号（AllaganTools.GetCharactersOwnedByActive(false)：ECommons の AllaganToolsIPC で確認）。
+    /// リテイナー以外（フリーカンパニーなど）が混じっても、リテイナーの持ち物の種類で数えるので 0 になる。読めなければ null。
+    /// </summary>
+    public HashSet<ulong>? OwnedByActive()
+        => this.TryInvoke("GetCharactersOwnedByActive",
+            () => this.Func<bool, HashSet<ulong>>("AllaganTools.GetCharactersOwnedByActive").InvokeFunc(false), out var set)
+            ? set
+            : null;
 
     /// <summary>読み込み済みで使えるか。</summary>
     public bool IsInitialized()
