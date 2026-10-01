@@ -32,6 +32,10 @@ public sealed class MoveToTask : AutoTask
     private bool reloadRequested;
     private DateTime mountTriedAt = DateTime.MinValue;
 
+    // マウントを頼んでから乗り終わるのを待つ期限（不具合の例：頼んだ0.08秒後に歩き出し、マウントの詠唱が移動で途切れて徒歩のままだった。
+    // 詠唱の旗〔Casting・Mounting〕は頼んだ次のフレームにはまだ立っていない）
+    private DateTime? mountWaitUntil;
+
     // ショップ等の画面が開いたので、自分の移動を止めて待っている（閉じたら経路を引き直す）
     private bool pausedByUi;
 
@@ -156,13 +160,28 @@ public sealed class MoveToTask : AutoTask
                 && DateTime.UtcNow - this.mountTriedAt > TimeSpan.FromSeconds(5))
             {
                 this.mountTriedAt = DateTime.UtcNow;
-                GameUi.UseGeneralAction(9); // マウント・ルーレット（GeneralAction 9：実測済み）
+                if (GameUi.UseGeneralAction(9)) // マウント・ルーレット（GeneralAction 9：実測済み）
+                    this.mountWaitUntil = DateTime.UtcNow + TimeSpan.FromSeconds(3);
                 this.Status = "マウントに乗っています";
                 return TaskResult.Running;
             }
 
             if (Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.Mounting] || Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.Casting])
                 return TaskResult.Running;
+
+            // マウントを頼んだら、乗り終わるまで歩き出さない（歩くと詠唱が途切れる。3秒たっても乗れなければ歩く）
+            if (this.mountWaitUntil is { } until && !GameUi.Mounted)
+            {
+                if (DateTime.UtcNow < until)
+                {
+                    this.Status = "マウントに乗っています";
+                    return TaskResult.Running;
+                }
+
+                Core.DebugLog.Current?.Line("移動", "マウントを頼みましたが、3秒たっても乗れなかったので歩きます");
+            }
+
+            this.mountWaitUntil = null;
 
             this.fly = GameUi.Mounted && CanFlyHere();
             if (this.path.Request(ctx.Navmesh, Me.Position, this.destination, this.fly))
