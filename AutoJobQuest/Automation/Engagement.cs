@@ -56,6 +56,12 @@ public sealed class Engagement
     /// <summary>RSR へ送れない失敗を、何回続いたら止めるか（数えるのは3秒に1回）。</summary>
     public const int IpcFailureLimit = 3;
 
+    /// <summary>攻撃が届く位置で乗らずに止まっているのに、相手の HP がこれだけ減らなければ、相手のそばまで近寄る（RSR が撃たない理由が視線のほかにあるときの保険）。</summary>
+    public static readonly TimeSpan CloseInAfter = TimeSpan.FromSeconds(10);
+
+    /// <summary>上の保険で近寄る、相手からの水平の距離。</summary>
+    public const float CloseInDistance = 8f;
+
     private readonly StallWatch stall = new();
 
     // 近づく移動（取り消せる探索）。使えないときは SimpleMove で代える
@@ -125,6 +131,11 @@ public sealed class Engagement
     private DateTime approachClosestAt = DateTime.MinValue;
     private bool jumpTried;
 
+    // 届く位置で止まり始めた時刻・HP が減らないので近寄ることにしたか（CloseInAfter）・RSR の視線が遮られたことを記録した相手
+    private DateTime inReachSince = DateTime.MinValue;
+    private bool closeIn;
+    private ulong sightLoggedFor;
+
     /// <summary>狙い始める（狙い直す）。</summary>
     public void Start(ICombatWorld world, IFoe foe)
     {
@@ -138,6 +149,8 @@ public sealed class Engagement
         this.approachClosestAt = world.Now;
         this.landCandidates = null;
         this.jumpTried = false;
+        this.inReachSince = DateTime.MinValue;
+        this.closeIn = false;
     }
 
     /// <summary>次の降りる場所の候補へ移る（今の候補へ向かった記録を消す）。</summary>
@@ -375,6 +388,35 @@ public sealed class Engagement
         // 飛んだまま敵の上空に浮き、高さの差で3次元の距離が 56m あったので降りず、地上の経路で近づこうとして高度が下がらないまま止まっていた）。
         // 降りる操作（一般アクション 23）は、飛んでいれば着地、地上なら降りる
         var flat = Vector2.Distance(new Vector2(world.MyPosition.X, world.MyPosition.Z), new Vector2(t.Position.X, t.Position.Z));
+
+        // ゲームが「届く」と言っても、RSR の視線の判定で遮られている相手は RSR が撃たない（RsrSightBlocked）。「届かない」として、見える所まで近づく
+        if (inReach && world.RsrSightBlocked(t) is { } sightBlock)
+        {
+            inReach = false;
+            if (this.sightLoggedFor != t.Id)
+            {
+                this.sightLoggedFor = t.Id;
+                Core.DebugLog.Current?.Line("戦闘", $"{t.Name}（{dist:0.0}m）はゲームの判定では攻撃が届きますが、RSR の視線の判定（足もと+2m のレイキャスト）が "
+                    + $"({sightBlock.Point.X:0.0}, {sightBlock.Point.Y:0.0}, {sightBlock.Point.Z:0.0})（材質 0x{sightBlock.Material:X}）で遮られて RSR が撃たないので、見える所まで近づきます");
+            }
+        }
+
+        // 届く位置で乗らずに止まって 10 秒、相手の HP が減らなければ（RSR が撃たない理由がほかにある）、相手から水平 8m まで近寄る（保険）。
+        // 近寄るのは、届く位置で止まってから数える（遠くから近づいてきた時間は数えない。キャスターが毎回そばまで歩かないように）
+        if (!inReach || world.Mounted)
+            this.inReachSince = DateTime.MinValue;
+        else if (this.inReachSince == DateTime.MinValue)
+            this.inReachSince = now;
+        if (!this.closeIn && this.inReachSince != DateTime.MinValue && flat > CloseInDistance
+            && now - this.inReachSince > CloseInAfter && this.stall.SinceProgress(now) > CloseInAfter)
+        {
+            this.closeIn = true;
+            Core.DebugLog.Current?.Line("戦闘", $"{t.Name}（{dist:0.0}m）は攻撃が届く位置ですが、HP が {CloseInAfter.TotalSeconds:0} 秒減らない（RSR が撃たない）ので、"
+                + $"水平 {CloseInDistance:0}m まで近寄ります");
+        }
+
+        if (this.closeIn && flat > CloseInDistance)
+            inReach = false;
 
         // 飛んでいるときは、真下に相手と同じ高さの床があるときだけ降りる（不具合の例：アジス・ラーで、島の縁にいる敵の手前の
         // 空中で「降りる」を2秒おきに送り続け、真下に床が無いので高さ -100 前後から -601 まで降り続けて止まった）。

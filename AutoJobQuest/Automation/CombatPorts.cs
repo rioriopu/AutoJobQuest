@@ -97,6 +97,15 @@ public interface ICombatWorld
     /// 降りられない面かを見る）。当たらない・当たり判定がまだ読み込まれていない（遠い）ときは null。既定は null。
     /// </summary>
     (float TopY, ulong Material)? SkyAbove(Vector3 p) => null;
+
+    /// <summary>
+    /// RSR の視線の判定で、相手が遮られているか。RSR は、ゲームの射程・視線の判定（GetActionInRangeOrLoS）とは別に、自分の足もと+2m から
+    /// 相手の足もと+2m へ当たり判定のレイキャストをして、遮られた敵を攻撃の候補に入れない（RSR の TargetUpdater・ObjectHelper.CanSeeFrom。
+    /// Henched でも撃たない）。遮られていれば当たった点と材質、遮られていなければ null。既定は null。
+    /// 不具合の例：黒衣森：北部森林で、1匹倒した後に 28m 先の次の敵を、ゲームの判定で「届く」として止まって待ち、
+    /// RSR が撃たないまま HP が 45 秒減らずに諦めた（次の敵へ1分近くかかった）。
+    /// </summary>
+    (Vector3 Point, ulong Material)? RsrSightBlocked(IFoe foe) => null;
 }
 
 /// <summary>RSR の操作（本番は RotationSolverIpc）。</summary>
@@ -298,6 +307,20 @@ public sealed class GameCombatWorld : ICombatWorld
         if (FFXIVClientStructs.FFXIV.Common.Component.BGCollision.BGCollisionModule.RaycastMaterialFilter(
                 new Vector3(p.X, p.Y + 80f, p.Z), new Vector3(0, -1, 0), out var hit, 120f))
             return (hit.Point.Y, hit.Material);
+        return null;
+    }
+
+    public (Vector3 Point, ulong Material)? RsrSightBlocked(IFoe foe)
+    {
+        // RSR の ObjectHelper.CanSeeFrom と同じ：自分の足もと+2m から相手の足もと+2m へ。ClientStructs の既製の呼び方は、RSR と同じ
+        // 材質の絞り（{0x4000, 0, 0x4000, 0}）と層（1）でレイキャストする（ClientStructs の BGCollisionModule.cs で確認）
+        var from = Me.Position + new Vector3(0, 2f, 0);
+        var offset = foe.Position + new Vector3(0, 2f, 0) - from;
+        var length = offset.Length();
+        if (length < 0.01f)
+            return null;
+        if (FFXIVClientStructs.FFXIV.Common.Component.BGCollision.BGCollisionModule.RaycastMaterialFilter(from, offset / length, out var hit, length))
+            return (hit.Point, hit.Material);
         return null;
     }
 }

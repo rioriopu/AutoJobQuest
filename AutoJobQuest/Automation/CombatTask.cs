@@ -46,9 +46,13 @@ public sealed class CombatTask : AutoTask
     private readonly List<Vector2> spots;
     private readonly TimeSpan limit;
 
-    // 出現点ごとの敵（名前の番号。spots と同じ並び）・見回りの点か・回る順（一筆書き。決めたら変えない）
+    // 出現点ごとの敵（名前の番号。spots と同じ並び）・見回りの点か・高さ（狩り場だけ。データの出現点は地図座標で高さが無い）・回る順（一筆書き。決めたら変えない）
     private readonly List<uint> spotMobs = [];
     private readonly List<bool> spotRoam = [];
+    private readonly List<float?> spotHeights = [];
+
+    // 利用者の決めた狩り場を回る敵（HuntPrefs。データの出現点・見かけた位置・見回りの点は使わず、見かけなくても回るのをやめない）
+    private readonly HashSet<uint> huntSpotMobs = [];
     private List<int> tour = [];
 
     private int spotIndex;
@@ -164,14 +168,37 @@ public sealed class CombatTask : AutoTask
         // そして A へ戻って確かめる、を繰り返す）。同じ敵の地図の出現点と前に見かけた位置を、地図座標で 1.5（約 75m）以内なら1つの群れにまとめる。
         // どの敵の群れかを持たせる（集め終えた敵の群れは回らない）
         this.spots = [];
+
+        // 利用者の決めた狩り場（HuntPrefs。例：北部森林のベーンマイトは決まった場所に固まっているので、そこへ飛んで探す）。
+        // 狩り場のある素材の敵は、データの出現点・前に見かけた位置・見回りの点の代わりに、狩り場だけを回る（狩り場どうしはまとめない）
+        foreach (var need in needs)
+        {
+            var own = HuntPrefs.Spots(need.ItemId, territory);
+            if (own.Count == 0)
+                continue;
+            foreach (var mob in need.Mobs)
+            {
+                this.huntSpotMobs.Add(mob);
+                foreach (var p in own)
+                {
+                    var m = MapCoords.ToMap(territory, p.X, p.Z);
+                    if (m != Vector2.Zero)
+                        this.AddSpot(m, mob, 0.05f, roam: false, height: p.Y);
+                }
+            }
+        }
+
         foreach (var (s, mob) in mapSpots)
-            this.AddSpot(s, mob, ClusterMerge, roam: false);
+        {
+            if (!this.huntSpotMobs.Contains(mob))
+                this.AddSpot(s, mob, ClusterMerge, roam: false);
+        }
 
         // 出現点を足す（不具合の例：フリーズドラゴンは出現点が1か所だけで、2匹倒すと湧き直すまでその場で止まり続けた。
         // 「敵がいなければ次の位置へ回る」を独自に作る。フィールドの敵の湧く場所はゲームのデータに無い）。
         //  ・前に戦ったときに見かけた位置（MobSightings：このプラグインが自分で記録したもの）
         //  ・元の出現点の周りの見回りの点（6方向・地図座標で 1.2＝ワールドで約 60m 先）
-        var mobs = needs.SelectMany(n => n.Mobs).Distinct().ToList();
+        var mobs = needs.SelectMany(n => n.Mobs).Distinct().Where(m => !this.huntSpotMobs.Contains(m)).ToList();
         foreach (var mob in mobs)
         {
             foreach (var seen in MobSightings.Get(territory, [mob]))
@@ -199,7 +226,7 @@ public sealed class CombatTask : AutoTask
     }
 
     /// <summary>出現点（群れ）を足す（同じ敵の点が地図座標で <paramref name="merge"/> 以内にあれば足さない）。</summary>
-    private void AddSpot(Vector2 p, uint mob, float merge, bool roam)
+    private void AddSpot(Vector2 p, uint mob, float merge, bool roam, float? height = null)
     {
         for (var i = 0; i < this.spots.Count; i++)
             if (this.spotMobs[i] == mob && Vector2.Distance(this.spots[i], p) < merge)
@@ -207,6 +234,7 @@ public sealed class CombatTask : AutoTask
         this.spots.Add(p);
         this.spotMobs.Add(mob);
         this.spotRoam.Add(roam);
+        this.spotHeights.Add(height);
     }
 
     /// <summary>回る順を決める：今いる場所から一番近い点を始めに、そこから一番近い未訪の点、と一筆書きにする（決めたら変えない）。</summary>
@@ -277,7 +305,9 @@ public sealed class CombatTask : AutoTask
         var wantedAtStart = this.WantedMobs();
         this.spotIndex = this.tour.FirstOrDefault(i => wantedAtStart.Contains(this.spotMobs[i]), this.tour[0]);
         var roams = this.spotRoam.Count(r => r);
+        var hunts = this.spotHeights.Count(h => h != null);
         ctx.Log.Write("戦闘", $"{TeleportTask.TerritoryName(this.territory)}：群れ {this.spots.Count - roams} か所"
+                             + (hunts > 0 ? $"（うち利用者の決めた狩り場 {hunts} か所）" : string.Empty)
                              + (roams > 0 ? $"（ほかに見回りの点 {roams} か所）" : string.Empty)
                              + $"を、{string.Join("→", this.tour.Select(i => $"{this.spots[i].X:0.0},{this.spots[i].Y:0.0}"))} の順に回ります");
         ctx.CombatInProgress = true;
@@ -597,8 +627,13 @@ public sealed class CombatTask : AutoTask
                         return TaskResult.Running; // 次のフレームの始めで終わる（落とす敵をどれも見かけない）
                 }
 
+                // 次の点も今いる所のそば（水平 20m 以内：同じ場所に重なる別の敵の点・利用者の狩り場・近い出現点）なら通り抜けない。
+                // 通り抜けると、着く前に次の点へ切り替え、そこでもまた切り替える、を毎フレーム繰り返す（経路の問い合わせも毎回出る）。
+                // そのまま着いて、着いた後の処理（湧きを待つ・次の点へ）に任せる
                 var next = this.NextSpot(wanted);
-                if (next != this.spotIndex && this.SpotFloor(ctx, next) is { } nextFloor && this.moving.ReleaseWithoutStop())
+                if (next != this.spotIndex && this.SpotFloor(ctx, next) is { } nextFloor
+                    && Vector2.Distance(new Vector2(Me.Position.X, Me.Position.Z), new Vector2(nextFloor.X, nextFloor.Z)) > PassThroughDistance
+                    && this.moving.ReleaseWithoutStop())
                 {
                     this.moving.Cleanup(ctx);
                     this.spotIndex = next;
@@ -714,6 +749,10 @@ public sealed class CombatTask : AutoTask
     {
         var spot = this.spots[index];
         var world = MapCoords.ToWorld(this.territory, spot.X, spot.Y);
+
+        // 狩り場は高さも分かっているので、その高さの床を先に探す（洞窟の中・崖の上下で別の床を選ばない）
+        if (this.spotHeights[index] is { } y && ctx.Navmesh.NearestPointReachable(new Vector3(world.X, y, world.Z), 10f, 10f) is { } exact)
+            return exact;
         return ctx.Navmesh.NearestPointReachable(new Vector3(world.X, Me.Position.Y, world.Z), 10f, 300f)
                ?? ctx.Navmesh.PointOnFloor(new Vector3(world.X, Me.Position.Y + 100f, world.Z), false, 10f)
                ?? ctx.Navmesh.PointOnFloor(new Vector3(world.X, 1024f, world.Z), false, 10f);
@@ -761,7 +800,9 @@ public sealed class CombatTask : AutoTask
     private void CountVisit(TaskContext ctx, int index)
     {
         var mob = this.spotMobs[index];
-        if (this.seenMobs.Contains(mob) || this.droppedMobs.Contains(mob))
+
+        // 狩り場の敵は、見かけなくても回るのをやめない（利用者が「ここにいる」と決めた。倒されて湧き直しを待っている間も、ここで待つ）
+        if (this.seenMobs.Contains(mob) || this.droppedMobs.Contains(mob) || this.huntSpotMobs.Contains(mob))
             return;
         var visits = this.unseenVisits[mob] = this.unseenVisits.GetValueOrDefault(mob) + 1;
         var points = Enumerable.Range(0, this.spots.Count).Count(i => this.spotMobs[i] == mob);
@@ -943,7 +984,7 @@ public static class CombatPlanner
     public static bool HasReachableSpawn(SourceIndex sources, uint itemId)
     {
         var unlocked = Svc.Aetherytes.Select(a => a.AetheryteId).ToHashSet();
-        return sources.Get(itemId).DropMobs.Any(m => sources.SpawnsOf(m).Any(s => IsReachable(s.Territory, unlocked) && !MobSkips.IsSkipped(s.Territory, m)));
+        return sources.Get(itemId).DropMobs.Any(m => sources.SpawnsOf(m).Any(s => IsReachable(s.Territory, unlocked) && !HuntPrefs.IsSkipped(itemId, s.Territory, m)));
     }
 
     public static List<(uint Territory, List<CombatNeed> Needs, List<(Vector2 Spot, uint Mob)> Spots)> Plan(
@@ -962,8 +1003,8 @@ public static class CombatPlanner
             {
                 foreach (var spot in sources.SpawnsOf(mob))
                 {
-                    // 利用者が「狙わない」にした敵は外す（デバッグタブのチェック。例：普段いない敵・その素材を落とさない敵）
-                    if (!Reachable(spot.Territory) || MobSkips.IsSkipped(spot.Territory, mob))
+                    // 利用者が「狙わない」にした敵は外す（デバッグタブのチェック。素材ごと。例：普段いない敵・その素材を落とさない敵・行かないエリア）
+                    if (!Reachable(spot.Territory) || HuntPrefs.IsSkipped(item, spot.Territory, mob))
                         continue;
                     if (!byTerr.TryGetValue(spot.Territory, out var l))
                         byTerr[spot.Territory] = l = [];

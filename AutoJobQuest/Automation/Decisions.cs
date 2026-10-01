@@ -983,6 +983,9 @@ public sealed class StallWatch
     /// </summary>
     public void Resume(DateTime now) => this.lastProgress = now;
 
+    /// <summary>最後に HP が減ってから（狙い始めてから）の時間。</summary>
+    public TimeSpan SinceProgress(DateTime now) => now - this.lastProgress;
+
     /// <summary>いまの HP を見る。最後に減ってから <see cref="Limit"/> を過ぎていたら true（その敵は諦める）。</summary>
     public bool Observe(uint hp, DateTime now)
     {

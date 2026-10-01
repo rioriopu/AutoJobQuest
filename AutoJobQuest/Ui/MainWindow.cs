@@ -69,6 +69,7 @@ public sealed class MainWindow : Window
     private System.Threading.Tasks.Task<List<DropHuntEntry>>? dropHuntBuild;
     private readonly Dictionary<uint, int> dropHuntCounts = [];
     private string dropHuntFilter = string.Empty;
+    private bool dropHuntShowSkipped;
 
     // キャラクタータブとデバッグタブを出しているか・計画タブを続けて押した回数と最後に押した時刻
     private bool showHiddenTabs;
@@ -1062,6 +1063,10 @@ public sealed class MainWindow : Window
         ImGui.InputTextWithHint("##dropHuntFilter", "品・モンスター・エリアで絞り込む", ref this.dropHuntFilter, 64);
         ImGui.SameLine();
         ImGui.TextColored(Grey, $"{list.Count} 品目（全ジョブクエを在庫 0 から作るときに要る数。NPC から買える品は出していません）");
+        ImGui.SameLine();
+        ImGui.Checkbox("狙わない敵も表示", ref this.dropHuntShowSkipped);
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("チェックを外した敵・エリアは、ふだんは一覧に出しません。ここをオンにすると出るので、戻せます");
 
         var unlocked = Svc.Aetherytes.Select(a => a.AetheryteId).ToHashSet();
         var running = this.services.Runner.IsRunning;
@@ -1091,12 +1096,19 @@ public sealed class MainWindow : Window
                 this.dropHuntCounts[e.ItemId] = Math.Clamp(n, 1, 999);
 
             // エリアごとに、そのエリアで落とす敵のうち「狙う」になっている敵をまとめて倒しに行く（本番の素材集めの戦闘と同じ：近い群れから回る）。
-            // 敵ごとのチェックで「狙わない」にできる（普段いない敵・その素材を落とさない敵。本番の戦闘にも効く）
+            // 敵ごとのチェックで「狙わない」にできる（素材ごと。普段いない敵・その素材を落とさない敵・行かないエリアに使う。本番の戦闘にも効く）。
+            // 「狙わない」の敵と、全部「狙わない」のエリアは、ふだんは出さない（「狙わない敵も表示」で出す）
+            bool Skipped(uint territory, uint nameId) => HuntPrefs.IsSkipped(e.ItemId, territory, nameId);
+            var shown = 0;
             foreach (var area in e.Mobs)
             {
-                var m = area.OnlyTargeted(MobSkips.IsSkipped);
+                var m = area.OnlyTargeted(Skipped);
+                if (m == null && !this.dropHuntShowSkipped)
+                    continue;
+                shown++;
                 var label = $"{m?.Name ?? "（狙う敵がありません）"}（{area.TerritoryName}）##{area.Territory}";
                 var reachable = CombatPlanner.IsReachable(area.Territory, unlocked);
+                var huntSpots = HuntPrefs.Spots(e.ItemId, area.Territory);
                 using (ImRaii.Disabled(running || !reachable || m == null))
                 {
                     if (ImGui.Button(label) && m != null)
@@ -1108,19 +1120,48 @@ public sealed class MainWindow : Window
                         ? "このエリアの入口のエーテライトが未解放です（または野外のエリアではありません）"
                         : running ? "動いている間は始められません"
                         : m == null ? "このエリアの敵が全部「狙わない」になっています"
+                        : huntSpots.Count > 0 ? $"設定の狩り場を回ります：{string.Join(" ／ ", huntSpots.Select(s => $"X {s.X:0.0} Y {s.Y:0.0} Z {s.Z:0.0}"))}"
                         : $"出現点 {m.Spots.Count} か所：{string.Join(" ", m.Spots.Take(6).Select(s => $"{s.Spot.X:0.0},{s.Spot.Y:0.0}"))}");
 
                 // 敵ごとの「狙う」（チェックを外すと、デバッグでも本番の素材集めの戦闘でも狙わない）
                 foreach (var member in area.Members)
                 {
+                    var on = member.Ids.Any(id => !Skipped(area.Territory, id));
+                    if (!on && !this.dropHuntShowSkipped)
+                        continue;
                     ImGui.SameLine();
-                    var on = member.Ids.Any(id => !MobSkips.IsSkipped(area.Territory, id));
                     if (ImGui.Checkbox($"{member.Name}（出現点 {member.Spots}）##{area.Territory}_{member.Ids[0]}", ref on))
-                        MobSkips.Set(area.Territory, member.Ids, !on);
+                        HuntPrefs.SetSkipped(e.ItemId, area.Territory, member.Ids, !on);
                     if (ImGui.IsItemHovered())
-                        ImGui.SetTooltip("チェックを外すと、この敵は狙いません（デバッグでも本番の素材集めの戦闘でも）。普段いない敵・この素材を落とさない敵に使います");
+                        ImGui.SetTooltip("チェックを外すと、この素材を集めるときにこの敵は狙いません（デバッグでも本番の素材集めの戦闘でも）。"
+                                         + "普段いない敵・この素材を落とさない敵・行かないエリアに使います。外した敵は「狙わない敵も表示」で出ます");
+                }
+
+                // 狩り場（敵が固まっている場所へ飛んで探す）。そのエリアにいるときに、今いる場所を足せる。
+                // 狩り場があれば、この素材の敵はデータの出現点の代わりに狩り場だけを回る（デバッグでも本番でも）
+                ImGui.SameLine();
+                using (ImRaii.Disabled(Me.Territory != area.Territory))
+                {
+                    if (ImGui.SmallButton($"今いる場所を狩り場にする##spot{area.Territory}"))
+                        HuntPrefs.AddSpot(e.ItemId, area.Territory, Me.Position);
+                }
+
+                if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                    ImGui.SetTooltip(Me.Territory != area.Territory
+                        ? $"{area.TerritoryName}にいるときに押せます"
+                        : "敵が固まっている場所に立って押すと、この素材の敵は、データの出現点の代わりにここを回って探します（何か所でも足せます）");
+                if (huntSpots.Count > 0)
+                {
+                    ImGui.SameLine();
+                    ImGui.TextColored(Grey, $"狩り場 {huntSpots.Count} か所");
+                    ImGui.SameLine();
+                    if (ImGui.SmallButton($"狩り場を消す##clear{area.Territory}"))
+                        HuntPrefs.ClearSpots(e.ItemId, area.Territory);
                 }
             }
+
+            if (shown == 0)
+                ImGui.TextColored(Grey, "（狙う敵がいません。「狙わない敵も表示」をオンにすると戻せます）");
 
             ImGui.Spacing();
         }
