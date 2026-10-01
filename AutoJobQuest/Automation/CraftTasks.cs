@@ -172,12 +172,16 @@ public sealed class CraftOneTask : AutoTask
     private bool failureStopRequested;
     private DateTime? idleSince;
 
-    // 装備品の素材の選択（GearIngredients）：選ぶ欄（欄の番号・品）・済んだか・最後に操作した時刻・試した回数・レシピを開いた時刻
+    // 装備品の素材の選択（GearIngredients）：選ぶ欄（欄の番号・品）・済んだか・最後に操作した時刻・試した回数・レシピを開いた時刻・欄を見始めた時刻・
+    // 「未選択」の印を見た欄・こちらが候補から選んだ欄
     private List<(int Slot, uint Item)>? gearSlots;
     private bool gearDone;
     private DateTime gearActAt = DateTime.MinValue;
     private int gearTries;
     private DateTime gearNoteAt = DateTime.MinValue;
+    private DateTime? gearStartedAt;
+    private readonly HashSet<int> gearMarkSeen = [];
+    private readonly HashSet<int> gearPicked = [];
 
     // 簡易製作：簡易製作で作るか・職を合わせる下請け（装備品の素材を選ぶ前にも使う）・最後に操作した時刻・レシピを開いた時刻・試した回数・
     // 最後に数が増えた時刻と数
@@ -433,6 +437,9 @@ public sealed class CraftOneTask : AutoTask
             // 装備品の素材は1回ごとに使うので、頼み直す前に欄を見直す（選ばれていれば、そのまま頼む）
             this.gearDone = false;
             this.gearTries = 0;
+            this.gearStartedAt = null;
+            this.gearMarkSeen.Clear();
+            this.gearPicked.Clear();
             ctx.Log.Write("製作", $"{CraftPlanner.ItemName(this.craft.ItemId)} の連続製作が {nowCount - this.beforeAll}/{this.expected} 個で止まったので、"
                                  + $"残り {resume} 回を頼み直します（Artisan の「NQ ができたら止める」等の設定で止まることがある）");
             this.NextPhase("残りの製作を Artisan に頼み直します");
@@ -527,32 +534,103 @@ public sealed class CraftOneTask : AutoTask
             return TaskResult.Running;
         }
 
-        var open = this.gearSlots.FirstOrDefault(g => GameUi.RecipeSlotUnselected(note, g.Slot));
-        if (open.Item == 0)
+        // 選び終えたかは、ゲームのデータ（その欄に割り当てた数が必要数に達したか）で確かめる。画面の「未選択」の印だけで見ると、
+        // 製作手帳が開いた直後は欄がまだ描かれておらず、印が見えないのを「選び終えた」と取り違える（不具合の例：
+        // 開いて 0.017 秒で「選びました」とし、0.48 秒後に Artisan が同じ欄を未選択と見てまた止まった。こちらはボタンを1度も押していなかった）
+        this.gearStartedAt ??= now;
+        if (now - this.gearStartedAt.Value > TimeSpan.FromSeconds(30))
+            return this.Fail($"{CraftPlanner.ItemName(this.craft.ItemId)} の素材の装備品（{string.Join("、", this.gearSlots.Select(g => CraftPlanner.ItemName(g.Item)))}）を30秒たっても選べませんでした。"
+                             + "製作手帳でこのレシピを開き、「未選択」の欄でその品を選んでから「ジョブクエ開始」を押してください（続きから進みます）");
+
+        var states = this.gearSlots.Select(g => (Gear: g, Selected: this.GearSlotSelected(note, g))).ToList();
+        if (states.All(s => s.Selected == true))
         {
             this.gearDone = true;
             ctx.Log.Write("製作", $"装備品の素材を選びました：{string.Join("、", this.gearSlots.Select(g => CraftPlanner.ItemName(g.Item)))}（Artisan に製作を頼みます）");
             return null;
         }
 
-        if (now - this.gearActAt < TimeSpan.FromSeconds(1))
+        var open = states.FirstOrDefault(s => s.Selected == false).Gear;
+        if (open.Item == 0)
+        {
+            // まだ分からない欄がある（製作手帳のデータ・表示がこのレシピに追いついていない）。分かるまで待つ
+            this.Status = "製作手帳の素材の欄を読んでいます";
             return TaskResult.Running;
-        this.gearActAt = now;
-
-        // 候補の小窓が開いていれば品を選ぶ。開いていなければ、欄の「選ぶ」ボタンを押す
-        if (GameUi.IsReady("ContextIconMenu", out var menu))
-        {
-            GameUi.Fire(menu, true, 0, 0, 0, open.Item, null!);
-            ctx.Log.Debug("製作", $"素材の欄 {open.Slot + 1} の候補から {CraftPlanner.ItemName(open.Item)} を選びました");
-        }
-        else
-        {
-            this.gearTries++;
-            GameUi.ClickRecipeSlotSelect(note, open.Slot);
         }
 
         this.Status = $"装備品の素材（{CraftPlanner.ItemName(open.Item)}）を選んでいます";
+        if (now - this.gearActAt < TimeSpan.FromSeconds(1))
+            return TaskResult.Running;
+
+        // 候補の小窓が開いていれば品を選ぶ。開いていなければ、欄の「未選択」の印が描かれてから（押せる状態になってから）「選ぶ」ボタンを押す
+        if (GameUi.IsReady("ContextIconMenu", out var menu))
+        {
+            this.gearActAt = now;
+            this.gearPicked.Add(open.Slot);
+            GameUi.Fire(menu, true, 0, 0, 0, open.Item, null!);
+            ctx.Log.Debug("製作", $"素材の欄 {open.Slot + 1} の候補から {CraftPlanner.ItemName(open.Item)} を選びました");
+        }
+        else if (GameUi.RecipeSlotUnselected(note, open.Slot))
+        {
+            this.gearActAt = now;
+            this.gearTries++;
+            if (!GameUi.ClickRecipeSlotSelect(note, open.Slot))
+                ctx.Log.Debug("製作", $"素材の欄 {open.Slot + 1} の「選ぶ」ボタンを押せませんでした（{this.gearTries} 回目）");
+        }
+
         return TaskResult.Running;
+    }
+
+    /// <summary>
+    /// 装備品の素材の欄が選んであるか。true＝選んである、false＝未選択（押して選ぶ）、null＝まだ分からない（待つ）。
+    /// 時間で決めず、状態で決める：
+    ///  ・製作手帳のデータがまだこのレシピでない → null
+    ///  ・画面に「未選択」の印が出ている → false（印を見たことを控える）
+    ///  ・データでその欄に必要数が割り当て済み（印も出ていない） → true（手で選んでから開始した場合もここ）
+    ///  ・データに出ない場合の備え：印を見た欄で、こちらが候補から選び、その後に印が消えて候補の小窓も閉じた → true
+    ///  ・それ以外（印がまだ描かれていない等） → null
+    /// </summary>
+    private unsafe bool? GearSlotSelected(FFXIVClientStructs.FFXIV.Component.GUI.AtkUnitBase* note, (int Slot, uint Item) g)
+    {
+        var assigned = GearSlotAssigned(this.craft.RecipeId, g.Item);
+        if (assigned == null)
+            return null;
+        if (GameUi.RecipeSlotUnselected(note, g.Slot))
+        {
+            this.gearMarkSeen.Add(g.Slot);
+            return false;
+        }
+
+        if (assigned == true)
+            return true;
+        if (this.gearMarkSeen.Contains(g.Slot) && this.gearPicked.Contains(g.Slot) && !GameUi.IsVisible("ContextIconMenu"))
+            return true;
+        return null;
+    }
+
+    /// <summary>
+    /// 製作手帳で選ばれているレシピ <paramref name="recipeId"/> の素材 <paramref name="item"/> に、必要数が割り当て済みか（ゲームのデータ：
+    /// RecipeNote の RecipeEntry の素材ごとの NQ・HQ の割り当て数。製作手帳の欄の下に出る NQ・HQ の数と同じ）。
+    /// データがまだこのレシピでなければ null。この品が素材の中に見つからなければ false（画面の印で判断する）。
+    /// </summary>
+    private static unsafe bool? GearSlotAssigned(uint recipeId, uint item)
+    {
+        var rn = FFXIVClientStructs.FFXIV.Client.Game.UI.RecipeNote.Instance();
+        if (rn == null || rn->RecipeList == null)
+            return null;
+        var data = rn->RecipeList;
+        if (data->Recipes == null || data->SelectedIndex >= data->RecipeCount)
+            return null;
+        var entry = data->Recipes + data->SelectedIndex;
+        if (entry->RecipeId != recipeId)
+            return null;
+        foreach (ref readonly var ing in entry->Ingredients)
+        {
+            if (ing.ItemId == item && ing.Amount > 0)
+                return ing.NQCount + ing.HQCount >= ing.Amount;
+        }
+
+        return false;
     }
 
     /// <summary>製作手帳で選ばれているレシピ（読めなければ 0）。</summary>
