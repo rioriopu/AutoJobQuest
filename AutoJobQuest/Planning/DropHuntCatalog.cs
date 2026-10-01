@@ -26,10 +26,26 @@ public sealed record DropHuntEntry(uint ItemId, string ItemName, int Needed, str
 /// <summary>
 /// デバッグ：モンスターのドロップで集める素材の一覧（各素材を落とすモンスターを倒しに行くデバッグ）。
 /// 全ジョブクエ（製作8職＋採集3職・Lv1〜70）を在庫 0 から全部作るときの末端の素材のうち、入手手段に戦闘がある品（落とすモンスターの
-/// 出現点が分かっている品）。NPC で買える品も入れる（デバッグで倒しに行けるように）。重いので、画面の外（作業用のスレッド）で作る。
+/// 出現点が分かっている品）。重いので、画面の外（作業用のスレッド）で作る。NPC で買える品は、画面で今のキャラクターが買えるかを見て外す
+/// （<see cref="BuyableFromNpc"/>。店にクエストの条件があり未完了なら、本番でも討伐で集めるので残す）。
 /// </summary>
 public static class DropHuntCatalog
 {
+    /// <summary>
+    /// 今のキャラクターが NPC から買えるか（条件なしの店か、要るクエストをすべて終えた店が1つでもある）。買えるなら討伐は要らないので、
+    /// デバッグの一覧から外す。計画の判定（PlanBuilder.RouteBlockers の NPC 購入）と同じ見方。
+    /// </summary>
+    public static bool BuyableFromNpc(SourceIndex sources, uint itemId, System.Func<uint, bool> isComplete)
+        => sources.Get(itemId).VendorOffers.Any(o => !o.Unknown && o.Quests.All(isComplete));
+
+    /// <summary>NPC の店で買うのに要る、まだ終えていないクエスト（画面の説明用）。</summary>
+    public static string VendorNeeds(SourceIndex sources, uint itemId, System.Func<uint, bool> isComplete)
+    {
+        var offers = sources.Get(itemId).VendorOffers;
+        var quests = offers.SelectMany(o => o.Quests).Where(q => !isComplete(q)).Distinct().Select(q => $"「{Unlocks.QuestName(q)}」").ToList();
+        return quests.Count > 0 ? $"クエスト{string.Join("か", quests)}の完了" : "確かめられない条件（アチーブメント等）";
+    }
+
     public static List<DropHuntEntry> Build(GameDataCache data)
     {
         // 製作の計画の部品は自分専用に作る（作業用のスレッドで使うので、画面の計画と同じ部品を同時に使わない。GameDataCache も毎回新しく作る）

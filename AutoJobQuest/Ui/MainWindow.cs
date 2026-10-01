@@ -1054,11 +1054,14 @@ public sealed class MainWindow : Window
             return;
         }
 
-        var list = this.dropHuntBuild.Result;
+        // NPC から買える品は討伐が要らないので外す。店にクエストの条件があって未完了の品は、本番でも討伐で集めるので残す
+        var sources = this.Ctx.Data.Sources!;
+        bool Done(uint q) => FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(q);
+        var list = this.dropHuntBuild.Result.Where(e => !DropHuntCatalog.BuyableFromNpc(sources, e.ItemId, Done)).ToList();
         ImGui.SetNextItemWidth(260);
         ImGui.InputTextWithHint("##dropHuntFilter", "品・モンスター・エリアで絞り込む", ref this.dropHuntFilter, 64);
         ImGui.SameLine();
-        ImGui.TextColored(Grey, $"{list.Count} 品目（全ジョブクエを在庫 0 から作るときに要る数）");
+        ImGui.TextColored(Grey, $"{list.Count} 品目（全ジョブクエを在庫 0 から作るときに要る数。NPC から買える品は出していません）");
 
         var unlocked = Svc.Aetherytes.Select(a => a.AetheryteId).ToHashSet();
         var running = this.services.Runner.IsRunning;
@@ -1071,7 +1074,12 @@ public sealed class MainWindow : Window
 
             using var id = ImRaii.PushId((int)e.ItemId);
             ImGui.TextUnformatted($"{e.ItemName}　{e.Needed} 個（{e.NeededBy}）");
-            if (e.FirstRoute != Route.Combat)
+            if (e.FirstRoute == Route.Vendor)
+            {
+                ImGui.SameLine();
+                ImGui.TextColored(Grey, $"※NPC の店に{DropHuntCatalog.VendorNeeds(sources, e.ItemId, Done)}が要る（未完了）ので、討伐で集める品");
+            }
+            else if (e.FirstRoute != Route.Combat)
             {
                 ImGui.SameLine();
                 ImGui.TextColored(Grey, $"※本来は{RouteName(e.FirstRoute)}で集める品");
