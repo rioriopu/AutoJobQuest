@@ -724,6 +724,9 @@ public sealed unsafe class NpcStepTask : AutoTask
     private DateTime dismountSentAt = DateTime.MinValue;
     private int retravels;
 
+    // 経路の決まった場所から話しかけて、ゲームに断られた回数（2回で相手の位置まで近づく。相手が歩き回る場合の備え）
+    private int refusals;
+
     public NpcStepTask(QuestionableStep step, uint questRowId)
     {
         this.step = step;
@@ -781,6 +784,11 @@ public sealed unsafe class NpcStepTask : AutoTask
                 return TaskResult.Running;
             }
         }
+
+        // もう話しかけてよい近さなら、移動を作らずにその場で話しかける（不具合の例：錬金術師 Lv1 の報告の手順を、
+        // セヴェリアンから 2.8m の所で始めたのに、経路の決まった場所へ戻ってから机を回り込んで話しかけた）
+        if (!this.arrived && this.travel == null && nearby != null && this.CloseEnough(nearby))
+            this.arrived = true;
 
         if (!this.arrived)
         {
@@ -866,16 +874,26 @@ public sealed unsafe class NpcStepTask : AutoTask
             return TaskResult.Running;
         }
 
-        // 遠ければ近づき直す。判定は移動（GoToTask：水平3m以内・高低差8m未満で着いた扱い）と合わせる（以前は3次元で5mを見ていたので、
+        // 話しかけてよい近さでなければ近づき直す（CloseEnough）。経路の決まった場所にまだ着いていなければその場所へ、着いていれば相手の位置へ。
+        // 決まった場所から2回断られたときも、相手の位置まで近づく（不具合の例：錬金術師 Lv1 で、経路の決まった場所〔机の前〕に着いたのに
+        // 相手から水平4mより遠いので「遠い」とみなし、相手の位置へ机を回り込んでいた。Questionable は決まった場所から話しかける）。
+        // 以前の判定（移動と合わせた水平4m・高低差8m）の経緯：以前は3次元で5mを見ていたので、
         // 相手の上空に浮いていると「遠い」→ 移動は「着いた」で即座に終わる、を毎フレームくり返した〔記録で1万6千回〕）
         var flat = Vector2.Distance(new Vector2(npc.Position.X, npc.Position.Z), new Vector2(Me.Position.X, Me.Position.Z));
-        if (flat > 4f || MathF.Abs(npc.Position.Y - Me.Position.Y) >= 8f)
+        var refused = this.refusals >= 2 && !NearNpc(npc);
+        if (!this.CloseEnough(npc) || refused)
         {
             if (++this.retravels > 5)
                 return this.Fail($"{NpcName(this.step.DataId)} に近づけません（水平 {flat:0.0}m・高低差 {MathF.Abs(npc.Position.Y - Me.Position.Y):0.0}m）。手で近づいてから再開してください");
             this.arrived = false;
             this.dismountSince = null;
-            this.travel = new GoToTask(Me.Territory, npc.Position, 3f, NpcName(this.step.DataId));
+            this.refusals = 0;
+            var toStep = !refused && !this.AtStepPosition();
+            this.travel = toStep
+                ? new GoToTask(this.step.Territory, this.step.Position!.Value, 3f, NpcName(this.step.DataId))
+                : new GoToTask(Me.Territory, npc.Position, 3f, NpcName(this.step.DataId));
+            ctx.Log.Debug("クエスト", $"{NpcName(this.step.DataId)} に近づき直します（{(toStep ? "経路の決まった場所へ" : refused ? "決まった場所から2回断られたので相手の位置へ" : "相手の位置へ")}。"
+                                     + $"相手まで水平 {flat:0.0}m・高低差 {MathF.Abs(npc.Position.Y - Me.Position.Y):0.0}m）");
             return TaskResult.Running;
         }
 
@@ -884,8 +902,15 @@ public sealed unsafe class NpcStepTask : AutoTask
         (this.seqBefore, this.varsBefore) = QuestState(this.questRowId);
         this.interactedAt = DateTime.UtcNow;
 
-        // 着いた後は視線判定なし（Questionable と同じ。経路の終点から壁やカウンターで遮られても話しかけられるように）
-        if (GameUi.Interact(npc))
+        // 着いた後は視線判定なし（Questionable と同じ。経路の終点から壁やカウンターで遮られても話しかけられるように）。
+        // 1回目は相手を選ぶだけ（Interact が false を返す）なので、選び済みの相手に送って false だったときだけ「断られた」と数える
+        var targeted = Svc.Targets.Target?.Address == npc.Address;
+        if (!GameUi.Interact(npc))
+        {
+            if (targeted)
+                this.refusals++;
+        }
+        else
         {
             this.firstInteractAt = this.interactedAt;
             this.selectedMenu = null;
@@ -895,6 +920,27 @@ public sealed unsafe class NpcStepTask : AutoTask
         }
         return TaskResult.Running;
     }
+
+    /// <summary>経路の決まった場所に着いているか（移動〔GoToTask〕と同じ見方：同じエリアで、水平3m以内・高低差8m未満）。</summary>
+    private bool AtStepPosition()
+    {
+        if (this.step.Position is not { } pos || Me.Territory != this.step.Territory)
+            return false;
+        var me = Me.Position;
+        return Vector2.Distance(new Vector2(me.X, me.Z), new Vector2(pos.X, pos.Z)) <= 3f && MathF.Abs(me.Y - pos.Y) < 8f;
+    }
+
+    /// <summary>相手から水平4m以内・高低差8m未満か。</summary>
+    private static bool NearNpc(Dalamud.Game.ClientState.Objects.Types.IGameObject npc)
+    {
+        var me = Me.Position;
+        return Vector2.Distance(new Vector2(npc.Position.X, npc.Position.Z), new Vector2(me.X, me.Z)) <= 4f && MathF.Abs(npc.Position.Y - me.Y) < 8f;
+    }
+
+    /// <summary>
+    /// 話しかけてよい近さか：経路の決まった場所に着いている（Questionable はそこから話しかける。机越しでもゲームの決まりで話せる）か、相手から水平4m以内・高低差8m未満。
+    /// </summary>
+    private bool CloseEnough(Dalamud.Game.ClientState.Objects.Types.IGameObject npc) => this.AtStepPosition() || NearNpc(npc);
 
     internal static string Hex(byte[] v) => v.Length == 0 ? "-" : string.Join(" ", v.Select(b => b.ToString("X2")));
 
