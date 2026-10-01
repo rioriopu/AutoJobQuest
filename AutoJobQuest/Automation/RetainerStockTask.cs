@@ -31,7 +31,10 @@ namespace AutoJobQuest.Automation;
 /// 「操作する前は出ていなかった窓が、操作の後に出た」かで見る（以前は記録を始めておらず、自分で開いた窓を1つも認識できなかった）。
 /// 見分けの決まりは <see cref="RetainerWindows"/> にまとめ、ゲーム無しで試している。
 ///
-/// 1巡目で全員の持ち物を読み、合計から引き出す数を決める。2巡目は引き出す品を持っているリテイナーだけを開く。
+/// 持ち物は、まず Allagan Tools の記録（リテイナーごとの所持数）から読む（以前は1巡目で全員を開いて読み、
+/// 2巡目でまた上から開いて引き出していた。Allagan Tools でどこに何が何個あるか分かっているので、要るリテイナーだけ開く）。
+/// 記録の無いリテイナーと、Allagan Tools が使えないときだけ、開いて読む（従来の1巡目）。合計から引き出す数を決め、
+/// 引き出す品を持っているリテイナーだけを一覧の上から1回ずつ開く。
 /// 引き出しは「リテイナー側が減った」かつ「手持ちが増えた」が頼んだ数と一致したときだけ済んだとする。
 /// 片側だけの反映・対象の変化・応答が分からないときは送り直さずに止める。
 ///
@@ -117,8 +120,12 @@ public sealed unsafe class RetainerStockTask : AutoTask
 
     private HashSet<string> bellNames = new(StringComparer.OrdinalIgnoreCase);
 
-    // リテイナー：1巡目は全員、2巡目は引き出す品を持っている人だけ
+    // リテイナー：読む巡は記録の無い人だけ（Allagan Tools が使えなければ全員）、引き出す巡は引き出す品を持っている人だけ
     private readonly List<ulong> queue = [];
+
+    // Allagan Tools の記録から読んだ、リテイナーごとの数（記録のあるリテイナーだけ。使えなかったら null）
+    private readonly Ipc.AllaganToolsIpc allagan = new();
+    private Dictionary<ulong, Dictionary<(uint Item, bool Hq), int>>? recorded;
     private bool listed;
     private ulong current;
     private bool withdrawing;
@@ -451,17 +458,21 @@ public sealed unsafe class RetainerStockTask : AutoTask
         if (!this.listed)
         {
             this.listed = true;
-            foreach (var r in GameMemory.Retainers())
-            {
-                if (r.Available)
-                    this.queue.Add(r.Id);
-            }
-
-            ctx.Log.Write("リテイナー", $"リテイナー {this.queue.Count} 人の持ち物を読みます");
-            if (this.queue.Count == 0)
+            var available = GameMemory.Retainers().Where(r => r.Available).ToList();
+            if (available.Count == 0)
             {
                 ctx.Log.Warn("リテイナー", "呼べるリテイナーがいません。手持ちだけで計画します");
                 return this.StartClose(list);
+            }
+
+            if (this.ReadFromAllagan(ctx, available, out var unrecorded))
+            {
+                this.queue.AddRange(unrecorded);
+            }
+            else
+            {
+                this.queue.AddRange(available.Select(r => r.Id));
+                ctx.Log.Write("リテイナー", $"リテイナー {this.queue.Count} 人の持ち物を開いて読みます");
             }
         }
 
@@ -469,6 +480,13 @@ public sealed unsafe class RetainerStockTask : AutoTask
         {
             if (!this.withdrawing)
                 return this.BeginWithdraw(ctx, list);
+
+            // 引き出しきれなかった品（Allagan Tools の記録が古かった・収集品やマテリア付きで引き出さない品だった等）を記録に残す。
+            // 足りない分は、引き出した後に作り直す計画で、ほかの手段（マーケット・採集など）に回る
+            var left = this.needed!.Counts.Where(kv => kv.Value > 0).ToList();
+            if (left.Count > 0)
+                ctx.Log.Warn("リテイナー", $"引き出しきれなかった品があります：{string.Join("、", left.Select(kv => $"{CraftPlanner.ItemName(kv.Key.Item)}{(kv.Key.Hq ? " HQ" : string.Empty)}×{kv.Value}"))}"
+                                          + "（引き出した後の計画で、ほかの手段に回します）");
             return this.StartClose(list);
         }
 
@@ -726,14 +744,88 @@ public sealed unsafe class RetainerStockTask : AutoTask
             return this.Fail($"引き出す品に鞄の枠が {slotsNeeded} 枠要りますが、空きは {free} 枠です（残しておく空き {ctx.Config.KeepFreeBagSlots} 枠を除くと足りません）。"
                              + "鞄を空けるか、選ぶ職を減らしてから開始してください（残しておく空きは設定タブで減らせます）");
 
-        // 2巡目は、引き出す品を持っている人だけ
+        // 引き出す巡は、引き出す品を持っている人だけ（開いて読んだ人は読んだ持ち物で、ほかは Allagan Tools の記録で見る）。一覧の上から1回ずつ開く
         foreach (var (id, list2) in this.contents)
             if (list2.Any(s => this.needed.Counts.GetValueOrDefault((s.Item, s.Hq)) > 0))
                 this.queue.Add(id);
+        if (this.recorded != null)
+        {
+            foreach (var (id, counts) in this.recorded)
+                if (!this.queue.Contains(id) && counts.Any(kv => kv.Value > 0 && this.needed.Counts.GetValueOrDefault(kv.Key) > 0))
+                    this.queue.Add(id);
+        }
+
+        var order = GameMemory.Retainers().Select((r, i) => (r.Id, i)).ToDictionary(x => x.Id, x => x.i);
+        this.queue.Sort((a, b) => order.GetValueOrDefault(a, int.MaxValue).CompareTo(order.GetValueOrDefault(b, int.MaxValue)));
         if (this.queue.Count == 0)
             return this.StartClose(list);
+        ctx.Log.Write("リテイナー", $"引き出す品を持っているリテイナー {this.queue.Count} 人だけを開きます：{string.Join("、", this.queue.Select(id => RetainerName(id) ?? id.ToString()))}");
         this.current = 0;
         return TaskResult.Running;
+    }
+
+    /// <summary>
+    /// Allagan Tools の記録から、計画に関係しうる品のリテイナーごとの数を読み、合計（total）に足す。関係しうる品は、手持ちもリテイナーの在庫も
+    /// 無いとみたときの計画が在庫を見る品（レシピの木の全部と納品物・マテリア・秘伝書）。記録の無いリテイナーは <paramref name="unrecorded"/> に返す
+    /// （開いて読む）。Allagan Tools が使えない・読めないときは false（従来どおり全員を開いて読む）。
+    /// </summary>
+    private bool ReadFromAllagan(TaskContext ctx, List<(ulong Id, string Name, bool Available)> available, out List<ulong> unrecorded)
+    {
+        unrecorded = [];
+        if (!this.allagan.IsInitialized())
+        {
+            ctx.Log.Write("リテイナー", "Allagan Tools が使えないので、全員の持ち物を開いて読みます");
+            return false;
+        }
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var (targets, _) = this.Targets(ctx, Inventory.Snapshot());
+        var items = ctx.Data.Planner!.Build(targets, new RetainerPlan.Stock(), _ => true, CraftAbility.FromGame()).StockDemand.Keys
+            .Concat(targets.Select(t => t.ItemId))
+            .Distinct()
+            .ToList();
+
+        var read = new Dictionary<ulong, Dictionary<(uint Item, bool Hq), int>>();
+        foreach (var r in available)
+        {
+            var has = this.allagan.HasRecord(r.Id);
+            if (has == null)
+            {
+                ctx.Log.Warn("リテイナー", $"Allagan Tools の記録を読めません（{string.Join(" / ", this.allagan.LastErrors.Values)}）。全員の持ち物を開いて読みます");
+                return false;
+            }
+
+            if (has == false)
+            {
+                unrecorded.Add(r.Id);
+                continue;
+            }
+
+            var counts = new Dictionary<(uint Item, bool Hq), int>();
+            foreach (var item in items)
+            {
+                if (this.allagan.RetainerCount(item, r.Id, IsCrystal(item)) is not { } c)
+                {
+                    ctx.Log.Warn("リテイナー", $"Allagan Tools の記録を読めません（{string.Join(" / ", this.allagan.LastErrors.Values)}）。全員の持ち物を開いて読みます");
+                    return false;
+                }
+
+                if (c.All - c.Hq > 0)
+                    counts[(item, false)] = c.All - c.Hq;
+                if (c.Hq > 0)
+                    counts[(item, true)] = c.Hq;
+            }
+
+            read[r.Id] = counts;
+        }
+
+        this.recorded = read;
+        foreach (var counts in read.Values)
+            foreach (var (key, n) in counts)
+                this.total.Counts[key] = this.total.Counts.GetValueOrDefault(key) + n;
+        ctx.Log.Write("リテイナー", $"Allagan Tools の記録から、リテイナー {read.Count} 人の持ち物（関係する品 {items.Count} 種類）を読みました（{watch.ElapsedMilliseconds}ms）"
+                                  + (unrecorded.Count > 0 ? $"。記録の無い {unrecorded.Count} 人だけ開いて読みます：{string.Join("、", unrecorded.Select(id => RetainerName(id) ?? id.ToString()))}" : "。開いて読む人はいません"));
+        return true;
     }
 
     private TaskResult StartClose(AtkUnitBase* list)
