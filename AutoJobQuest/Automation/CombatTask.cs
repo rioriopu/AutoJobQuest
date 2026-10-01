@@ -46,6 +46,10 @@ public sealed class CombatTask : AutoTask
     private readonly List<Vector2> spots;
     private readonly TimeSpan limit;
 
+    // 出現点ごとの敵（名前の番号。spots と同じ並び）と、この一巡で回った出現点
+    private readonly List<uint> spotMobs = [];
+    private readonly HashSet<int> visitedSpots = [];
+
     private int spotIndex;
     private MoveToTask? moving;
     private DateTime spotArrivedAt = DateTime.MinValue;
@@ -122,40 +126,72 @@ public sealed class CombatTask : AutoTask
         return this.collectedSince;
     }
 
-    public CombatTask(uint territory, List<CombatNeed> needs, List<Vector2> mapSpots, TimeSpan limit)
+    public CombatTask(uint territory, List<CombatNeed> needs, List<(Vector2 Spot, uint Mob)> mapSpots, TimeSpan limit)
     {
         this.territory = territory;
         this.needs = needs;
         this.limit = limit;
 
-        // 近い出現点どうしは1つにまとめる（地図座標で 1.0 以内）
+        // 同じ敵の近い出現点どうしは1つにまとめる（地図座標で 1.0 以内）。どの敵の出現点かを持たせる（集め終えた敵の出現点は回らない）
         this.spots = [];
-        foreach (var s in mapSpots)
-            if (!this.spots.Any(x => Vector2.Distance(x, s) < 1.0f))
-                this.spots.Add(s);
+        foreach (var (s, mob) in mapSpots)
+            this.AddSpot(s, mob);
+        var baseCount = this.spots.Count;
 
         // 出現点を足す（不具合の例：フリーズドラゴンは出現点が1か所だけで、2匹倒すと湧き直すまでその場で止まり続けた。
         // 「敵がいなければ次の位置へ回る」を独自に作る。フィールドの敵の湧く場所はゲームのデータに無い）。
         //  ・前に戦ったときに見かけた位置（MobSightings：このプラグインが自分で記録したもの）
         //  ・元の出現点の周りの見回りの点（6方向・地図座標で 1.2＝ワールドで約 60m 先）
         var mobs = needs.SelectMany(n => n.Mobs).Distinct().ToList();
-        foreach (var seen in MobSightings.Get(territory, mobs))
+        foreach (var mob in mobs)
         {
-            var m = MapCoords.ToMap(territory, seen.X, seen.Z);
-            if (m != Vector2.Zero && !this.spots.Any(x => Vector2.Distance(x, m) < 1.0f))
-                this.spots.Add(m);
+            foreach (var seen in MobSightings.Get(territory, [mob]))
+            {
+                var m = MapCoords.ToMap(territory, seen.X, seen.Z);
+                if (m != Vector2.Zero)
+                    this.AddSpot(m, mob);
+            }
         }
 
-        foreach (var center in this.spots.Take(mapSpots.Count).ToList())
+        for (var i = 0; i < baseCount; i++)
         {
+            var center = this.spots[i];
             for (var k = 0; k < RoamDirections; k++)
             {
                 var angle = 2f * MathF.PI * k / RoamDirections;
-                var p = center + (new Vector2(MathF.Cos(angle), MathF.Sin(angle)) * RoamRadiusMap);
-                if (!this.spots.Any(x => Vector2.Distance(x, p) < 1.0f))
-                    this.spots.Add(p);
+                this.AddSpot(center + (new Vector2(MathF.Cos(angle), MathF.Sin(angle)) * RoamRadiusMap), this.spotMobs[i]);
             }
         }
+    }
+
+    /// <summary>出現点を足す（同じ敵の出現点が地図座標で 1.0 以内にあれば足さない）。</summary>
+    private void AddSpot(Vector2 p, uint mob)
+    {
+        for (var i = 0; i < this.spots.Count; i++)
+            if (this.spotMobs[i] == mob && Vector2.Distance(this.spots[i], p) < 1.0f)
+                return;
+        this.spots.Add(p);
+        this.spotMobs.Add(mob);
+    }
+
+    /// <summary>
+    /// 次に向かう出現点：まだ集め終えていない敵の出現点のうち、この一巡でまだ回っていない、今いる場所から一番近い点。全部回ったら一巡をやり直す
+    /// （不具合の例：アジス・ラーで長い距離を行ったり来たりした。以前は始めた場所からの距離だけで並べた順に回っていたので、
+    /// エーテライトから同じくらいの距離にある南西〔メラシディアン・アンフィプテレ〕と北東〔アラガン・キマイラ〕の点が交互に並び、約1000m を往復していた）
+    /// </summary>
+    private int NextSpot(HashSet<uint> wanted)
+    {
+        var relevant = Enumerable.Range(0, this.spots.Count).Where(i => wanted.Contains(this.spotMobs[i])).ToList();
+        if (relevant.Count == 0)
+            relevant = Enumerable.Range(0, this.spots.Count).ToList();
+        var open = relevant.Where(i => !this.visitedSpots.Contains(i)).ToList();
+        if (open.Count == 0)
+        {
+            this.visitedSpots.Clear();
+            open = relevant.Count > 1 ? relevant.Where(i => i != this.spotIndex).ToList() : relevant;
+        }
+
+        return open.MinBy(i => this.DistanceToSpot(this.spots[i]));
     }
 
     public override string Name => $"戦闘: {TeleportTask.TerritoryName(this.territory)}";
@@ -173,8 +209,8 @@ public sealed class CombatTask : AutoTask
         if (this.spots.Count == 0)
             return this.Fail("出現位置のデータがありません");
 
-        // 近い出現点から回る
-        this.spots.Sort((a, b) => DistanceToSpot(a).CompareTo(DistanceToSpot(b)));
+        // 今いる場所から一番近い出現点から回る
+        this.spotIndex = this.NextSpot(this.WantedMobs());
         ctx.CombatInProgress = true;
         return TaskResult.Running;
     }
@@ -483,7 +519,15 @@ public sealed class CombatTask : AutoTask
 
             // 着けなかった出現点は「着いた」にしない（以前は着いた印も付けたので、次のフレームで
             // もう1つ進み、出現点を1つ飛ばしていた。出現点が2つだと、遠い方へ一度も行かずに着けない方を繰り返した）
+            var failedSpot = this.spotIndex;
             (this.spotIndex, this.spotArrivedAt) = SpotAfterMove(this.spotIndex, this.spots.Count, r == TaskResult.Failed, DateTime.UtcNow);
+            if (r == TaskResult.Failed)
+            {
+                // 着けなかった点は、この一巡では回った扱いにして、今いる場所から一番近い次の点へ
+                this.visitedSpots.Add(failedSpot);
+                this.spotIndex = this.NextSpot(wanted);
+            }
+
             return TaskResult.Running;
         }
 
@@ -501,7 +545,10 @@ public sealed class CombatTask : AutoTask
         }
 
         if (this.spotArrivedAt != DateTime.MinValue)
-            this.spotIndex = (this.spotIndex + 1) % this.spots.Count;
+        {
+            this.visitedSpots.Add(this.spotIndex);
+            this.spotIndex = this.NextSpot(wanted);
+        }
 
         // 地図（ナビメッシュ）の準備ができるまで待つ（以前は準備前だと床が見つからず、出現点を全部
         // 「床が無い」として毎フレーム飛ばし続けた。読み込みを頼むのは移動の作業の中だけで、そこまで届かなかった）
@@ -530,7 +577,8 @@ public sealed class CombatTask : AutoTask
         if (onFloor == null)
         {
             // 床が見つからない出現点は飛ばす。続けて全部の出現点で見つからなければ、回り続けずに止める
-            this.spotIndex = (this.spotIndex + 1) % this.spots.Count;
+            this.visitedSpots.Add(this.spotIndex);
+            this.spotIndex = this.NextSpot(wanted);
             this.spotArrivedAt = DateTime.MinValue;
             this.floorMisses++;
             this.Status = $"出現点の床が地図（ナビメッシュ）に見つかりません（{this.floorMisses}/{this.spots.Count}）";
@@ -740,7 +788,7 @@ public static class CombatPlanner
         return sources.Get(itemId).DropMobs.Any(m => sources.SpawnsOf(m).Any(s => IsReachable(s.Territory, unlocked)));
     }
 
-    public static List<(uint Territory, List<CombatNeed> Needs, List<Vector2> Spots)> Plan(
+    public static List<(uint Territory, List<CombatNeed> Needs, List<(Vector2 Spot, uint Mob)> Spots)> Plan(
         SourceIndex sources, IReadOnlyDictionary<uint, int> shortfalls, out List<uint> unreachable)
     {
         var inv = Inventory.Snapshot();
@@ -773,7 +821,7 @@ public static class CombatPlanner
 
         // 貪欲法：多くの品目を賄えるエリアから決める（行けるエリアだけが候補に残っている）
         var remaining = shortfalls.Keys.Where(k => options.TryGetValue(k, out var o) && o.Count > 0).ToHashSet();
-        var result = new List<(uint, List<CombatNeed>, List<Vector2>)>();
+        var result = new List<(uint, List<CombatNeed>, List<(Vector2 Spot, uint Mob)>)>();
         while (remaining.Count > 0)
         {
             var best = remaining
@@ -784,13 +832,13 @@ public static class CombatPlanner
                 .First();
 
             var needs = new List<CombatNeed>();
-            var spots = new List<Vector2>();
+            var spots = new List<(Vector2 Spot, uint Mob)>();
             foreach (var item in remaining.Where(i => options[i].ContainsKey(best.Terr)).ToList())
             {
                 var mobs = options[item][best.Terr];
                 needs.Add(new CombatNeed(item, inv.CountAll(item) + shortfalls[item], mobs));
                 foreach (var mob in mobs)
-                    spots.AddRange(sources.SpawnsOf(mob).Where(s => s.Territory == best.Terr).Select(s => new Vector2(s.MapX, s.MapY)));
+                    spots.AddRange(sources.SpawnsOf(mob).Where(s => s.Territory == best.Terr).Select(s => (new Vector2(s.MapX, s.MapY), mob)));
                 remaining.Remove(item);
             }
 

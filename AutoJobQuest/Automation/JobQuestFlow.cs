@@ -906,7 +906,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
 
             foreach (var (terr, needs, spots) in combatPlan)
             {
-                Vector3? firstSpot = spots.Count > 0 ? MapCoords.ToWorld(terr, spots[0].X, spots[0].Y) : null;
+                Vector3? firstSpot = spots.Count > 0 ? MapCoords.ToWorld(terr, spots[0].Spot.X, spots[0].Spot.Y) : null;
                 steps.Add(_ => new EquipJobTask(combatJob.Value.ClassJob));
                 steps.Add(_ => new TeleportTask(terr, firstSpot));
                 steps.Add(_ => this.Track(new CombatTask(terr, needs, spots, TimeSpan.FromMinutes(25))));
