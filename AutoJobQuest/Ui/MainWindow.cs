@@ -65,6 +65,11 @@ public sealed class MainWindow : Window
     // 必須プラグインの導入（「必須プラグイン」タブ）
     private readonly Ipc.PluginInstaller installer = new();
 
+    // キャラクタータブとデバッグタブを出しているか・計画タブを続けて押した回数と最後に押した時刻
+    private bool showHiddenTabs;
+    private int planClicks;
+    private DateTime planClickedAt = DateTime.MinValue;
+
     public MainWindow(Configuration config, RunLog log, Services services)
         : base("ジョブクエ自動化##AutoJobQuest")
     {
@@ -95,6 +100,20 @@ public sealed class MainWindow : Window
 
         using (var t = ImRaii.TabItem("計画"))
         {
+            // 計画タブを5回続けて押すと、キャラクタータブとデバッグタブを出す（もう一度5回で隠す）。
+            // 押す間が 1.5秒より空いたら数え直す
+            if (ImGui.IsItemClicked())
+            {
+                var now = DateTime.UtcNow;
+                this.planClicks = now - this.planClickedAt <= TimeSpan.FromSeconds(1.5) ? this.planClicks + 1 : 1;
+                this.planClickedAt = now;
+                if (this.planClicks >= 5)
+                {
+                    this.showHiddenTabs = !this.showHiddenTabs;
+                    this.planClicks = 0;
+                }
+            }
+
             if (t)
                 this.DrawPlanTab();
         }
@@ -105,8 +124,9 @@ public sealed class MainWindow : Window
                 this.DrawPreflightTab();
         }
 
-        using (var t = ImRaii.TabItem("キャラクター"))
+        if (this.showHiddenTabs)
         {
+            using var t = ImRaii.TabItem("キャラクター");
             if (t)
                 this.DrawCharacterTab();
         }
@@ -123,8 +143,9 @@ public sealed class MainWindow : Window
                 this.DrawSettingsTab();
         }
 
-        using (var t = ImRaii.TabItem("記録"))
+        if (this.showHiddenTabs)
         {
+            using var t = ImRaii.TabItem("デバッグ");
             if (t)
                 this.DrawLogTab();
         }
@@ -202,8 +223,12 @@ public sealed class MainWindow : Window
 
         ImGui.EndGroup();
 
+        // 「ジョブを1つ以上選んでください」の行は専用の行にして、選んでいても空けておく（以前はチェックを入れると
+        // この行が消えて、下の画面全体の位置が上へずれていた）
         if (!anySelected)
             ImGui.TextColored(Grey, "ジョブを1つ以上選んでください");
+        else
+            ImGui.TextUnformatted(" ");
 
         ImGui.PushTextWrapPos(0);
         if (otherBlocker != null)
@@ -816,28 +841,10 @@ public sealed class MainWindow : Window
             ImGui.TextColored(this.config.ConfirmPurchaseAboveGil == 0 ? Red : Grey,
                 this.config.ConfirmPurchaseAboveGil == 0
                     ? "0 になっています：1回の購入額では確かめません（確認なしで買います）"
-                    : "既定は 500,000。0 にすると、1回の購入額では確かめません");
+                    : "既定は 100,000。0 にすると、1回の購入額では確かめません");
 
-            var ratio = (float)this.config.ConfirmUnitPriceRatio;
-            ImGui.SetNextItemWidth(160);
-            if (ImGui.InputFloat("単価が最近の取引の中央値の何倍を超えたら確かめる", ref ratio, 0.5f, 1f, "%.1f"))
-            {
-                // 0（確かめない）か、1.5 倍以上（1倍近くだと、ふつうの値動きで毎回確かめることになる）
-                this.config.ConfirmUnitPriceRatio = ratio <= 0 ? 0 : Math.Clamp(Math.Round(ratio, 1), 1.5, 100);
-                this.config.Save();
-            }
-
-            ImGui.TextColored(Grey, "既定は 3.0。0 で確かめない。取引履歴が届かない品では確かめられません");
-
-            var runTotal = (int)Math.Min(this.config.ConfirmRunTotalAboveGil, 999_999_999);
-            ImGui.SetNextItemWidth(160);
-            if (ImGui.InputInt("この実行でマーケットに払う合計がこれを超えたら確かめる（ギル）", ref runTotal, 100_000, 1_000_000))
-            {
-                this.config.ConfirmRunTotalAboveGil = Math.Clamp(runTotal, 0, 999_999_999);
-                this.config.Save();
-            }
-
-            ImGui.TextColored(Grey, "既定は 0（使わない）。「はい」で続けると、さらにこの額を払ったところでまた確かめます");
+            // 「単価が最近の取引の中央値の何倍を超えたら確かめる」は画面から外した。
+            // 中では既定の 3.0 のまま使う（ConfirmUnitPriceRatio）。「この実行でマーケットに払う合計」はデバッグタブへ移した
 
             var excess = (int)Math.Min(this.config.ConfirmExcessAboveGil, 999_999_999);
             ImGui.SetNextItemWidth(160);
@@ -902,7 +909,7 @@ public sealed class MainWindow : Window
                 this.config.Save();
             }
 
-            ImGui.TextColored(Grey, "既定は 10。材料はクエストがくれて、何度でももらい直せます（失うのは1回ごとのクリスタル）。クリスタルはこの回数分を先に用意します");
+            ImGui.TextColored(Grey, "既定は 10。失敗する度に素材をNPCから貰います。クリスタルは、この回数分を先に用意します");
 
             var otherGear = this.config.RequireGearForOtherCrafters;
             if (ImGui.Checkbox("選んでいない製作職も、主道具〜足が Lv68 以上の装備でなければ、中間素材を作らずにマーケットボードで買う", ref otherGear))
@@ -1012,6 +1019,21 @@ public sealed class MainWindow : Window
 
     private void DrawLogTab()
     {
+        // この実行でマーケットに払う合計の確認（設定タブから移した）
+        using (ImRaii.Disabled(this.services.Runner.IsRunning || this.config.OwnerContentId == 0))
+        {
+            var runTotal = (int)Math.Min(this.config.ConfirmRunTotalAboveGil, 999_999_999);
+            ImGui.SetNextItemWidth(160);
+            if (ImGui.InputInt("この実行でマーケットに払う合計がこれを超えたら確かめる（ギル）", ref runTotal, 100_000, 1_000_000))
+            {
+                this.config.ConfirmRunTotalAboveGil = Math.Clamp(runTotal, 0, 999_999_999);
+                this.config.Save();
+            }
+
+            ImGui.TextColored(Grey, "既定は 0（使わない）。「はい」で続けると、さらにこの額を払ったところでまた確かめます");
+        }
+
+        ImGui.Separator();
         if (ImGui.Button("クリップボードへ写す"))
             ImGui.SetClipboardText(string.Join("\n", this.log.Snapshot()));
         ImGui.SameLine();

@@ -463,7 +463,7 @@ public sealed unsafe class MarketBoardWatcher : IDisposable
 ///   → 結果から欲しいアイテムを選択 → 出品一覧から「必要数以上の数が出ていて、合計金額が一番低い」出品を買う
 ///   （例：5個ほしいとき、4個と7個の出品なら7個を買う）→ 買ったら MB を閉じる。
 /// 必ずカバンの所持数を確かめ、不足分だけを買う（呼び出し側が不足数を渡し、ここでも買う直前に数え直す）。
-/// 1回の購入額が設定値（既定 500,000 ギル）を超えるときは確認窓を出す（
+/// 1回の購入額が設定値（既定 100,000 ギル）を超えるときは確認窓を出す（
 /// 合計ではなく1回ごとで判定）。「いいえ」で自動動作を止める。
 /// さらに、単価が最近の取引の中央値の3倍（設定）を超えるとき、この実行の合計が任意の上限（設定。既定は使わない）を超えるときも
 /// 確認窓を出す（誤ってギルを大量に使わないため。PurchaseGuard.ConfirmReasons）。
@@ -1072,7 +1072,7 @@ public sealed unsafe class MarketBoardTask : AutoTask
             return this.GiveUpCurrent(ctx, $"ギルが足りません（必要 {pick.Total:N0} / 所持 {gil:N0}）");
 
         // 確かめる理由（PurchaseGuard.ConfirmReasons）：
-        //  ・1回の購入額が基準（既定 500,000 ギル）を超える
+        //  ・1回の購入額が基準（既定 100,000 ギル）を超える
         //  ・単価が最近の取引の中央値の何倍か（設定）を超える／この実行の合計が任意の上限を超える
         // 確認をもらった後に取り直した一覧で、同じ出品が同じ額以下のままなら、出品ごとの確認はやり直さない
         var approved = PurchaseGuard.IsApproved(pick.ListingId, pick.Total, this.approvedListingId, this.approvedTotal);

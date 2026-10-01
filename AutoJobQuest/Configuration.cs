@@ -20,7 +20,7 @@ namespace AutoJobQuest;
 [Serializable]
 public sealed class Configuration
 {
-    public int Version { get; set; } = 2;
+    public int Version { get; set; } = 3;
 
     /// <summary>この設定の持ち主のキャラクター名（ファイルを開いた人が分かるように書くだけ。読み込みには使わない）。</summary>
     public string CharacterName { get; set; } = string.Empty;
@@ -51,9 +51,9 @@ public sealed class Configuration
 
     /// <summary>
     /// マーケットボードの購入で、1回の合計金額がこれを超えたら確認窓を出す（ギル）。
-    /// 既定は 500,000。
+    /// 既定は 100,000（以前は 500,000：古い既定のまま保存されている設定は、読み込むときに 100,000 へ移す）。
     /// </summary>
-    public int ConfirmPurchaseAboveGil { get; set; } = 500_000;
+    public int ConfirmPurchaseAboveGil { get; set; } = 100_000;
 
     /// <summary>
     /// マーケットの購入で、出品の単価が「最近の取引（マーケットの取引履歴）の単価の中央値」の何倍を超えたら確認窓を出すか。
@@ -313,6 +313,15 @@ public sealed class Configuration
         Data.CraftAbility.RequireGear = this.RequireGearForOtherCrafters;
 
         this.HqRetryRounds = Math.Clamp(this.HqRetryRounds, 0, 10);
+
+        // 版 3：1回の購入額の既定を 500,000 から 100,000 へ。古い既定のまま（利用者が変えていない）なら 100,000 にする。
+        // 利用者が自分で別の額にしていれば変えない
+        if (this.Version < 3)
+        {
+            if (this.ConfirmPurchaseAboveGil == 500_000)
+                this.ConfirmPurchaseAboveGil = 100_000;
+            this.Version = 3;
+        }
 
         // 古い設定ファイルで配列の長さが違うと、チェックボックスの描画で範囲外になる
         if (this.SelectedCrafters is not { Length: 11 })
