@@ -63,7 +63,22 @@ public sealed class CombatTask : AutoTask
     // 同じ敵に長くダメージが入らない（届かない場所・他人の獲物など）ときは諦める。
     // 「最後に HP が減った時刻」から数える（以前は狙い始めた時の HP と比べていたので、
     // 1回でも減った後に届かなくなると、制限時間の 25 分まで気づけなかった）。数えるのは Engagement の中の StallWatch
-    private readonly HashSet<ulong> giveUp = [];
+    // 諦めた時刻（2分たったら、もう一度狙う。不具合の例：飛んだまま降りずに 45 秒たって諦めた個体を、その後すぐ隣にいても狙わなかった。
+    // 諦めの原因がこちらの不具合や一時的なもの〔届かない位置にいた等〕でも、ずっと狙わないままにしない）
+    private readonly Dictionary<ulong, DateTime> giveUpAt = [];
+
+    /// <summary>諦めた個体をもう一度狙うまでの時間。</summary>
+    private static readonly TimeSpan GiveUpFor = TimeSpan.FromMinutes(2);
+
+    /// <summary>いま諦めている個体（諦めてから <see cref="GiveUpFor"/> たっていないもの）。</summary>
+    private HashSet<ulong> giveUp
+    {
+        get
+        {
+            var now = DateTime.UtcNow;
+            return this.giveUpAt.Where(kv => now - kv.Value < GiveUpFor).Select(kv => kv.Key).ToHashSet();
+        }
+    }
 
     // 敵と戦う処理（近づく・届いたら止まる・降りる・RSR・HP の停滞）。反撃と共通
     private readonly Engagement engage = new();
@@ -248,7 +263,7 @@ public sealed class CombatTask : AutoTask
                 // 最後に HP が減ってから 45 秒たった（届かない・他人が先に攻撃した等）。この個体は諦める。
                 // ハードターゲットも外す（諦めた敵を RSR が殴り続けないように）
                 ctx.Log.Warn("戦闘", $"{t.Name} の HP が 45 秒減っていないので、この個体は諦めて別の個体を探します（HP {t.CurrentHp}）");
-                this.giveUp.Add(t.GameObjectId);
+                this.giveUpAt[t.GameObjectId] = DateTime.UtcNow;
                 this.engage.Forget(this.world);
                 this.targetId = 0;
                 return TaskResult.Running;

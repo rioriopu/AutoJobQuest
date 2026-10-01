@@ -41,6 +41,9 @@ public interface ICombatWorld
 
     bool Mounted { get; }
 
+    /// <summary>飛んでいるか（近づく移動を飛んで行うか決める）。</summary>
+    bool Flying { get; }
+
     /// <summary>自分が詠唱中か（詠唱中に歩き出すと詠唱が切れるので、近づく移動を頼まない）。</summary>
     bool Casting { get; }
 
@@ -196,6 +199,8 @@ public sealed class GameCombatWorld : ICombatWorld
     public bool PlayerDead => Svc.Objects.LocalPlayer is { } me && me.IsDead;
 
     public bool Mounted => GameUi.Mounted;
+
+    public bool Flying => Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.InFlight];
 
     public bool Casting => Svc.Objects.LocalPlayer is { } me && me.IsCasting;
 
