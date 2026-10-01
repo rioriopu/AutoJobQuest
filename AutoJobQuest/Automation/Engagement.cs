@@ -109,7 +109,11 @@ public sealed class Engagement
         var overVoid = world.Mounted && world.Flying && !GroundBelowLikeFoe(nav, world.MyPosition, t.Position);
         if (world.Mounted && !overVoid && (inReach || dist < DismountDistance || flat < DismountDistance))
         {
-            if (now - this.dismountAt > TimeSpan.FromSeconds(2))
+            // 降りると決めたら、飛んで近づく移動を止める（動いたままだと降りる操作とぶつかる）。「降りる」はゲームが受け付けられるとき
+            // （Questionable の LandExecutor と同じ：GetActionStatus が 0）だけ、0.5秒おきに送る（以前は受け付けられない
+            // ときにも2秒おきに送り、「現在の状態では使用できません」で断られるたびに2秒待っていた）
+            this.StopApproach(nav);
+            if (world.DismountReady && now - this.dismountAt >= TimeSpan.FromSeconds(0.5))
             {
                 this.dismountAt = now;
                 world.Dismount();
@@ -206,7 +210,9 @@ public sealed class Engagement
     {
         if (!nav.IsReady())
             return true;
-        if (nav.PointOnFloor(me, true, 1.5f) is not { } mine)
+        // 自分の足もとも 2m 上から下へ探す（地図の床は実際の地面より少し高めに作られることがあり、地面すれすれに浮いていると、
+        // 自分の高さより下に床が無いと答えて「床が無い」と取り違え、敵の真上で15秒近づき直し続けた）
+        if (nav.PointOnFloor(me + new Vector3(0, 2f, 0), true, 1.5f) is not { } mine)
             return false;
         if (nav.PointOnFloor(foe + new Vector3(0, 2f, 0), true, 2f) is { } foeFloor)
             return MathF.Abs(mine.Y - foeFloor.Y) <= 8f;

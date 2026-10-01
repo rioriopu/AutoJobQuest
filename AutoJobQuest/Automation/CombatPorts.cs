@@ -69,6 +69,9 @@ public interface ICombatWorld
     bool? InReach(IFoe foe, out uint code);
 
     void Dismount();
+
+    /// <summary>「降りる」（一般アクション 23）を今ゲームが受け付けられるか（Questionable の LandExecutor と同じ：GetActionStatus が 0）。既定は true。</summary>
+    bool DismountReady => true;
 }
 
 /// <summary>RSR の操作（本番は RotationSolverIpc）。</summary>
@@ -246,4 +249,6 @@ public sealed class GameCombatWorld : ICombatWorld
     }
 
     public void Dismount() => GameUi.UseGeneralAction(23); // 降りる（GeneralAction 23：ゲームデータで確認）
+
+    public bool DismountReady => GameUi.GeneralActionStatus(23) == 0;
 }
