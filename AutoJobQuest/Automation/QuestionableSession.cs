@@ -363,6 +363,11 @@ public sealed class GoToTask : AutoTask
     private bool aethernetRequested;
     private int aethernetTries;
 
+    // 同じエリアの中の都市内転送（SameTerritoryAethernet）：試したか・転送中か・行き先の中継点
+    private bool sameAethernetTried;
+    private bool hopping;
+    private uint hopTarget;
+
     // 同じエリアの中のテレポを試したか（1回だけ）
     private bool shortcutTried;
 
@@ -412,7 +417,7 @@ public sealed class GoToTask : AutoTask
             return TaskResult.Running;
         }
 
-        if (Me.Territory == this.territory)
+        if (Me.Territory == this.territory && !this.hopping)
         {
             this.aethernetRequested = false;
             // 着いたかは MoveToTask と同じ見方（水平の距離が範囲内で、高さの差が 8 未満）。以前は3次元の距離で見ていたので、
@@ -420,6 +425,18 @@ public sealed class GoToTask : AutoTask
             var flat = Vector2.Distance(new Vector2(Me.Position.X, Me.Position.Z), new Vector2(this.position.X, this.position.Z));
             if (flat <= this.range && MathF.Abs(Me.Position.Y - this.position.Y) < 8f)
                 return TaskResult.Done;
+
+            // 同じエリアでも、エーテルネットの都市内転送が近道になれば使う（1回だけ。不具合の例：リムサの下甲板層へテレポした後、
+            // 漁師ギルドまで歩いていた。Questionable は経路の AethernetShortcut で「漁師ギルド」へ飛ぶ）。転送の手順は、下の別のエリアへの都市内転送と同じ
+            if (!this.sameAethernetTried && SameTerritoryAethernet(this.territory, Me.Position, this.position, IsNodeUnlocked) is { } hop)
+            {
+                this.sameAethernetTried = true;
+                this.hopping = true;
+                this.hopTarget = hop.To;
+                ctx.Log.Write("移動", $"{this.label} は同じエリアの遠く（水平 {flat:0}m）なので、エーテルネットで「{AetherytePlaces.Name(hop.To)}」へ飛びます"
+                                     + $"（出発は「{AetherytePlaces.Name(hop.From)}」）");
+                return TaskResult.Running;
+            }
 
             // 同じエリアでも、行き先に近い解放済みのエーテライトがあればテレポする（1回だけ。漁師 Lv68 のワワラゴは同じエリアの約1300m 先で、
             // 歩くと4分の上限に当たりえた。Questionable も経路の AetheryteShortcut でナマイへ飛ぶ）
@@ -445,9 +462,16 @@ public sealed class GoToTask : AutoTask
             }
 
             this.aethernetRequested = false;
+
+            // 同じエリアの中の都市内転送が終わった：着いたかを見直す（歩きで残りを行く）
+            if (this.hopping)
+            {
+                this.hopping = false;
+                return TaskResult.Running;
+            }
         }
 
-        var target = NearestNode(this.territory, this.position, IsNodeUnlocked);
+        var target = this.hopping ? this.hopTarget : NearestNode(this.territory, this.position, IsNodeUnlocked);
         if (target == null)
         {
             // 行き先のエリアに解放済みの中継点が1つも無い（以前は理由が「見つかりません」だけで、未交感だと伝わらなかった）
@@ -533,9 +557,29 @@ public sealed class GoToTask : AutoTask
         }
 
         if (this.aethernetTries++ >= 3)
+        {
+            if (this.hopping)
+            {
+                // 同じエリアの中なら、歩いて行ける（止めずに歩きに戻す）
+                this.hopping = false;
+                ctx.Log.Warn("移動", $"エーテルネットで「{AetherytePlaces.Name(target.Value)}」へ飛べなかったので、歩いて向かいます");
+                return TaskResult.Running;
+            }
+
             return this.Fail($"都市内転送で {TeleportTask.TerritoryName(this.territory)} へ行けませんでした");
+        }
+
         if (!ctx.Lifestream.AethernetTeleportById(target.Value))
+        {
+            if (this.hopping)
+            {
+                this.hopping = false;
+                ctx.Log.Warn("移動", $"Lifestream にエーテルネットの転送を頼めなかったので、歩いて向かいます: {string.Join(" / ", ctx.Lifestream.LastErrors.Values)}");
+                return TaskResult.Running;
+            }
+
             return this.Fail($"Lifestream に都市内転送を頼めませんでした: {string.Join(" / ", ctx.Lifestream.LastErrors.Values)}");
+        }
         this.aethernetRequested = true;
         this.NextPhase($"{TeleportTask.TerritoryName(this.territory)} へ都市内転送します");
         return TaskResult.Running;
@@ -573,6 +617,45 @@ public sealed class GoToTask : AutoTask
         }
 
         return best != null && bestDistance + ShortcutGain <= fromMe ? best : null;
+    }
+
+    /// <summary>同じエリアの中の都市内転送を考える、行き先までの水平の距離の下限（これより近ければ歩く）。</summary>
+    public const float AethernetMinDistance = 120f;
+
+    /// <summary>同じエリアの中の都市内転送で、歩きより縮まなければならない水平の距離（転送の読み込みは、歩いて数十m分の時間がかかる）。</summary>
+    public const float AethernetGain = 80f;
+
+    /// <summary>
+    /// 同じエリアの中で、エーテルネットの都市内転送を使うと近道になるなら（出発の中継点・行き先の中継点。エーテライト表の行）。ならなければ null
+    /// （不具合の例：リムサの下甲板層へテレポした後、漁師ギルドまで歩いていた）。
+    /// 行き先の中継点＝行き先に一番近い、見えている・解放済みの中継点（エーテライトを含む）。出発の中継点＝同じ組で今の位置に一番近いもの。
+    /// 今の位置から行き先まで水平で <see cref="AethernetMinDistance"/> 以上あり、「出発の中継点まで＋行き先の中継点から行き先まで」が
+    /// 歩きより <see cref="AethernetGain"/> 以上短いときだけ。位置は地図の印から求める（水平の距離）。
+    /// </summary>
+    public static (uint From, uint To)? SameTerritoryAethernet(uint territory, Vector3 me, Vector3 destination, Func<uint, bool> unlocked)
+    {
+        var me2 = new Vector2(me.X, me.Z);
+        var dest2 = new Vector2(destination.X, destination.Z);
+        var walk = Vector2.Distance(me2, dest2);
+        if (walk < AethernetMinDistance)
+            return null;
+
+        var nodes = Svc.Data.GetExcelSheet<Aetheryte>()
+            .Where(a => a.Territory.RowId == territory && !a.Invisible && a.AethernetGroup != 0 && unlocked(a.RowId))
+            .Select(a => (Row: a.RowId, Group: a.AethernetGroup, Place: AetherytePlaces.Of(a.RowId)))
+            .Where(x => x.Place != null)
+            .Select(x => (x.Row, x.Group, Flat: x.Place!.Value.Flat))
+            .ToList();
+        if (nodes.Count < 2)
+            return null;
+
+        var to = nodes.OrderBy(x => Vector2.Distance(x.Flat, dest2)).First();
+        var from = nodes.Where(x => x.Group == to.Group).OrderBy(x => Vector2.Distance(x.Flat, me2)).First();
+        if (from.Row == to.Row)
+            return null;
+
+        var via = Vector2.Distance(me2, from.Flat) + Vector2.Distance(to.Flat, dest2);
+        return via + AethernetGain <= walk ? (from.Row, to.Row) : null;
     }
 
     private static unsafe bool IsNodeUnlocked(uint id)

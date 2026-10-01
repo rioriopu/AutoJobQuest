@@ -1513,3 +1513,61 @@ public static class FishBaitPrep
         return Verdict.Equip;
     }
 }
+
+/// <summary>
+/// Questionable が買えない・買わなかった品を、こちらで NPC から買うかの判断（不具合の例：漁師 Lv55「釣り道楽、猟師を救え」で、
+/// Questionable がリムサ・ロミンサの店員に話しかけたが万能ルアーを買えずに先へ進み、釣りの手順で餌が無く、1種類の魚しか釣れなかった）。
+///
+/// 原因（Questionable のソースと記録で確かめた）：受注の前（段 0）の購入の手順では、Questionable は店のメニュー（「アイテムの購入」等）を選べない。
+/// メニューの選択肢は「受注済みのクエスト」（StartedQuest）の手順から探す（DialogueChoiceHandler.HandleListChoice）が、受注の前のクエストは
+/// 「次のクエスト」（NextQuest）の側にあり、StartedQuest は前のクエストかジャーナルのほかのクエスト（この実行では「夢をも釣る船」）のまま。
+/// 話しかける手順はメニューが開いた時点で終わる（Interact.Task）ので、買わずに次の手順へ進む（記録：No dialogue choices to check の後、店の窓が開かない）。
+/// 段 1 以降の購入は、受注した時点で StartedQuest がそのクエストになるので選べる（同じ実行でピルバグ・ストーンラーヴァは買えている）。
+/// 製作8職・採集3職のジョブクエ（Lv1〜70）254 本の購入の手順 78 件のうち、段 0 のものはこの1件（漁師 2087 の万能ルアー×3）。
+///
+/// 買い方：GBR の NPC 購入（VendorTask。実機でプリンセストラウトを買えている）。数と相手は経路データの購入の手順に合わせる。
+/// </summary>
+public static class QuestOwnPurchase
+{
+    /// <summary>こちらで買う品。<paramref name="Count"/> は持っていたい総数、<paramref name="Npc"/> は買う相手（ENpc。経路データの購入の手順の相手）。</summary>
+    public sealed record Order(uint ItemId, int Count, uint? Npc);
+
+    /// <summary>
+    /// 受注の前に、こちらで買う品（段 0 の購入の手順のうち、1個も持っていないもの。数は経路データの数まで買う）。
+    /// 1個でも持っていれば、Questionable は購入の手順を飛ばす（StepIf.Item：持っていれば飛ばす）ので買わない。
+    /// </summary>
+    public static List<Order> BeforeAccept(IReadOnlyList<QuestionableStep> steps, Func<uint, int> owned)
+        => steps.Where(s => s.Sequence == 0 && s.Type == "PurchaseItem" && s.ItemId is > 0)
+                .Select(s => new Order(s.ItemId!.Value, Math.Max(1, s.ItemCount ?? 1), s.DataId))
+                .Where(o => owned(o.ItemId) <= 0)
+                .ToList();
+
+    /// <summary>
+    /// 今の手順（段・番号）から後で、同じ段の釣りの手順の餌を持っておらず、釣りの手順までに Questionable が買う手順も無いなら、こちらで買う餌。
+    /// 段 0 の購入の手順は Questionable が買えないので、買う手順に数えない。
+    /// 数と相手は、経路データの同じ餌の購入の手順に合わせる（漁師のジョブクエの釣りの手順 16 件は、どれも同じクエストに同じ餌の購入の手順がある）。
+    /// 経路データに買う手順の無い餌は、数も相手も分からないので null（Questionable に任せる）。
+    /// </summary>
+    public static Order? MissingBait(IReadOnlyList<QuestionableStep> steps, int sequence, int stepIndex, Func<uint, int> owned)
+    {
+        var fish = steps.Where(s => s.Sequence == sequence && s.Index >= stepIndex && s.Type == "Fish" && s.BaitId is > 0)
+            .OrderBy(s => s.Index)
+            .FirstOrDefault();
+        if (fish == null)
+            return null;
+
+        var bait = fish.BaitId!.Value;
+        if (owned(bait) > 0)
+            return null;
+
+        // Questionable が段の中で、釣りの手順の前に買う（段 1 以降なら買える）
+        if (sequence != 0 && steps.Any(s => s.Sequence == sequence && s.Index >= stepIndex && s.Index < fish.Index && s.Type == "PurchaseItem" && s.ItemId == bait))
+            return null;
+
+        var buy = steps.Where(s => s.Type == "PurchaseItem" && s.ItemId == bait)
+            .OrderBy(s => s.Sequence)
+            .ThenBy(s => s.Index)
+            .FirstOrDefault();
+        return buy == null ? null : new Order(bait, Math.Max(1, buy.ItemCount ?? 1), buy.DataId);
+    }
+}

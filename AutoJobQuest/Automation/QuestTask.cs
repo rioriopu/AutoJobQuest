@@ -257,6 +257,13 @@ public sealed unsafe class QuestTask : AutoTask
         // Questionable の釣りの手順の前に、手順の指定の餌を付けておく（FishBaitPrep）
         this.HandleFishBait(ctx);
 
+        // Questionable が買えない・買わなかった品を、こちらで NPC から買う（QuestOwnPurchase）
+        if (this.ownBuyOrders != null)
+        {
+            this.KeepFishingStopped();
+            return this.RunOwnBuy(ctx);
+        }
+
         // 天気の限られた魚で、いまの天気で釣れないなら、Questionable を止めてマーケットボードで買う（WeatherFishBuy）
         if (this.weatherBuy != null)
         {
@@ -275,6 +282,8 @@ public sealed unsafe class QuestTask : AutoTask
             return TaskResult.Running;
         if (this.HandleWeatherFish(ctx))
             return TaskResult.Running;
+        if (this.HandleMissingBait(ctx, out var baitFail))
+            return baitFail != null ? this.Fail(baitFail) : TaskResult.Running;
 
         // 納品窓が開いたら、条件（HQ・マテリア）に合う品をこちらで自動で入れて渡す（確認は出さない）。
         // TextAdvance は一覧の先頭を入れるので、NQ と HQ を両方持っていると NQ が入る恐れがあった
@@ -287,7 +296,7 @@ public sealed unsafe class QuestTask : AutoTask
         var spearWaited = this.spearfishTotal + (this.spearfishSince is { } ss ? DateTime.UtcNow - ss : TimeSpan.Zero);
         var craftWaited = this.questCraftTotal + (this.questCraftSince is { } cs ? DateTime.UtcNow - cs : TimeSpan.Zero);
         var limit = TimeSpan.FromMinutes(this.paths?.Any(s => s.Type is "Gather" or "Fish") == true ? 90 : 30);
-        if (this.Elapsed - waited - spearWaited - craftWaited - this.weatherBuyTotal > limit)
+        if (this.Elapsed - waited - spearWaited - craftWaited - this.weatherBuyTotal - this.ownBuyTotal > limit)
             return this.Fail($"{limit.TotalMinutes:0}分たってもクエストが完了しません"
                              + (this.restarts > 0 ? $"（その間に Questionable を {this.restarts} 回動かし直しました。最後の手順 {this.lastStepText}）" : string.Empty));
         if (waited > ManualWaitLimit)
@@ -345,6 +354,23 @@ public sealed unsafe class QuestTask : AutoTask
                 this.NextPhase("受注の前の確かめ");
                 return TaskResult.Running;
             }
+        }
+
+        // 受注の前（段 0）の購入の手順の品は、Questionable が店のメニューを選べず買えないので、頼む前にこちらで買う（QuestOwnPurchase）
+        if (!this.started && this.paths != null && GameMemory.QuestAccepted(this.quest.RowId) == false
+            && QuestOwnPurchase.BeforeAccept(this.paths, GameBait.Current.Owned) is { Count: > 0 } before)
+        {
+            if (this.OwnBuyLimitReached(before) is { } over)
+                return this.Fail(over);
+            if (ctx.Questionable.IsRunning() == true)
+                ctx.Questionable.Stop(Plugin.InternalNameConst);
+            this.CountOwnBuys(before);
+            this.ownBuyOrders = before;
+            this.ownBuyStopTerritory = 0; // 受注の前：買った後は、そのまま Questionable に頼む（経路データの購入の手順は、持っていれば飛ばされる）
+            ctx.Log.Write("クエスト", $"{this.quest} の受注の前の購入の手順（{string.Join("、", before.Select(o => $"{CraftPlanner.ItemName(o.ItemId)}×{o.Count}（{NpcStepTask.NpcName(o.Npc)}）"))}）は、"
+                                   + "Questionable が店のメニューを選べず買えないので、頼む前にこちらで NPC から買います");
+            this.NextPhase("受注の前に要る品を NPC から買います");
+            return TaskResult.Running;
         }
 
         if (!this.started)
@@ -574,13 +600,20 @@ public sealed unsafe class QuestTask : AutoTask
     {
         var here = GameWeather.CurrentTerritory;
         var pos = Me.Position;
-        if (this.stillSince == null || System.Numerics.Vector3.Distance(pos, this.stillAt) > 1f)
+        var free = GameUi.PlayerFree();
+        var key = $"{step.Sequence}-{step.Step}";
+
+        // 「手順が同じまま・動ける状態で・手順のエリアの外で・動かずに」が続いた時間だけ数える（以前は釣りの間も
+        // 数えていたので、釣り終えて次の手順〔別のエリアの報告〕に切り替わった0.3秒後に、Questionable がテレポを始める前に割り込んだ）
+        if (this.stillSince == null || !free || key != this.stillStep || step.TerritoryId == 0 || step.TerritoryId == here
+            || System.Numerics.Vector3.Distance(pos, this.stillAt) > 1f)
         {
             this.stillAt = pos;
             this.stillSince = DateTime.UtcNow;
+            this.stillStep = key;
         }
 
-        var verdict = StuckElsewhere.Decide(step.TerritoryId, here, step.InteractionType, GameUi.PlayerFree(), DateTime.UtcNow - this.stillSince.Value, this.relocations);
+        var verdict = StuckElsewhere.Decide(step.TerritoryId, here, step.InteractionType, free, DateTime.UtcNow - this.stillSince.Value, this.relocations);
         if (verdict == StuckElsewhere.Verdict.None && this.relocations >= StuckElsewhere.MaxRelocations && step.TerritoryId != 0 && step.TerritoryId != here
             && !this.relocateLimitNoted && DateTime.UtcNow - this.stillSince.Value >= StuckElsewhere.Still)
         {
@@ -734,6 +767,140 @@ public sealed unsafe class QuestTask : AutoTask
             ctx.Log.Debug("クエスト", $"購入の確認に OK を押しません（{verdict}）：{body.Replace("\n", " ")}"
                                      + $"（読んだ品 {parsed?.Item ?? "なし"}×{parsed?.Count}・{parsed?.Price} ギル／手順の品 {string.Join("、", expected.Select(e => $"{e.Item1}×{e.ItemCount}"))}）");
         }
+    }
+
+    // こちらで NPC から買う（QuestOwnPurchase）：買う品・動かしている作業・試した品・止めた時点のエリア・戻っているか・始めた時刻・かかった時間
+    private List<QuestOwnPurchase.Order>? ownBuyOrders;
+    private AutoTask? ownBuy;
+    private readonly Dictionary<uint, int> ownBuys = [];
+
+    /// <summary>1つのクエストで、同じ品をこちらで買う回数の上限（餌を使い切ったら買い直す。上限まで買ってもまた無くなるなら止める）。</summary>
+    public const int OwnBuyLimit = 3;
+    private uint ownBuyStopTerritory;
+    private bool ownBuyReturning;
+    private DateTime? ownBuySince;
+    private TimeSpan ownBuyTotal;
+
+    /// <summary>検証の仕組み用：設定すると、NPC 購入（GBR）の代わりにこれが作る作業を使う。本番では null のまま。</summary>
+    public static Func<IReadOnlyList<VendorNeed>, AutoTask>? TestVendorTask { get; set; }
+
+    /// <summary>
+    /// Questionable の今の手順から後に、同じ段の釣りの手順があり、その餌を持っておらず、Questionable が釣りの前に買う手順も無いなら、
+    /// Questionable を止めて、こちらで NPC から買う（QuestOwnPurchase.MissingBait。同じ品は <see cref="OwnBuyLimit"/> 回まで：餌を使い切ったら買い直す）。
+    /// 買いに行ったら true。上限まで買っていれば true と止める理由（<paramref name="fail"/>）。
+    /// 受注の前の購入（段 0）を Questionable が買えなかったとき・利用者が餌を手放したとき・受注の後の購入が何かで買えなかったときの立て直し。
+    /// </summary>
+    private bool HandleMissingBait(TaskContext ctx, out string? fail)
+    {
+        fail = null;
+        var step = ctx.Questionable.GetCurrentStepData();
+        if (step == null || ctx.Questionable.IsRunning() != true || step.QuestId != this.quest.ShortId.ToString() || this.paths == null || GameUi.BetweenAreas)
+            return false;
+        if (QuestOwnPurchase.MissingBait(this.paths, step.Sequence, step.Step, GameBait.Current.Owned) is not { } order)
+            return false;
+        if (this.OwnBuyLimitReached([order]) is { } over)
+        {
+            fail = over;
+            return true;
+        }
+
+        ctx.Questionable.Stop(Plugin.InternalNameConst);
+        this.PauseAutoFishing(ctx);
+        this.CountOwnBuys([order]);
+        this.ownBuyOrders = [order];
+        this.ownBuyStopTerritory = GameWeather.CurrentTerritory;
+        ctx.Log.Write("クエスト", $"釣りの手順（段 {step.Sequence}）の餌 {CraftPlanner.ItemName(order.ItemId)} を持っておらず、Questionable が釣りの前に買う手順もありません"
+                               + "（受注の前の購入の手順は、Questionable が店のメニューを選べず買えない）。"
+                               + $"Questionable を止めて、{NpcStepTask.NpcName(order.Npc)} から {order.Count} 個買ってから、釣りに戻ります");
+        this.NextPhase($"釣りの餌 {CraftPlanner.ItemName(order.ItemId)} を NPC から買います");
+        return true;
+    }
+
+    /// <summary>上限まで買った品があれば、止める理由（無ければ null）。</summary>
+    private string? OwnBuyLimitReached(IEnumerable<QuestOwnPurchase.Order> orders)
+    {
+        var over = orders.Where(o => this.ownBuys.GetValueOrDefault(o.ItemId) >= OwnBuyLimit).ToList();
+        return over.Count == 0
+            ? null
+            : $"{string.Join("、", over.Select(o => CraftPlanner.ItemName(o.ItemId)))} をこのクエストで {OwnBuyLimit} 回 NPC から買いましたが、また足りなくなりました"
+              + $"（{string.Join("、", over.Select(o => $"{GameBait.Current.Owned(o.ItemId)}／{o.Count}"))}）。持ち物（売った・捨てた・預けた）と釣りの餌を確かめてから再開してください（続きから進みます）";
+    }
+
+    private void CountOwnBuys(IEnumerable<QuestOwnPurchase.Order> orders)
+    {
+        foreach (var o in orders)
+            this.ownBuys[o.ItemId] = this.ownBuys.GetValueOrDefault(o.ItemId) + 1;
+    }
+
+    /// <summary>
+    /// こちらの NPC 購入を進める。動ける状態になってから GBR の NPC 購入を始める（釣りの構えは KeepFishingStopped で解く）。
+    /// 買いきれなければ止める（その品が無いと Questionable の手順が進まない：餌が無ければ目当ての魚が釣れない）。
+    /// 買えたら、止めた時点のエリアへ戻ってから（釣りの手順の途中で止めたとき）Questionable に頼み直す。
+    /// </summary>
+    private TaskResult RunOwnBuy(TaskContext ctx)
+    {
+        if (this.ownBuy == null)
+        {
+            if (!GameUi.PlayerFree() || GameUi.BetweenAreas)
+            {
+                this.Status = "動ける状態になるのを待ってから、NPC から買います" + OwnWorkNote;
+                return TaskResult.Running;
+            }
+
+            var needs = this.ownBuyOrders!.Select(o => new VendorNeed(o.ItemId, o.Count, o.Npc)).ToList();
+            this.ownBuy = TestVendorTask?.Invoke(needs) ?? new VendorTask(needs);
+            this.ownBuySince = DateTime.UtcNow;
+        }
+
+        var r = this.ownBuy.Step(ctx);
+        this.Status = this.ownBuy.Status + OwnWorkNote;
+        if (r == TaskResult.Running)
+            return TaskResult.Running;
+        var failed = r == TaskResult.Failed ? this.ownBuy.FailReason : null;
+        this.ownBuy.Cleanup(ctx);
+        this.ownBuy = null;
+        if (this.ownBuySince is { } since)
+            this.ownBuyTotal += DateTime.UtcNow - since;
+        this.ownBuySince = null;
+
+        // 戻りのテレポが終わった：Questionable に頼み直す
+        if (this.ownBuyReturning)
+        {
+            this.ownBuyReturning = false;
+            this.ownBuyOrders = null;
+            if (failed != null)
+                ctx.Log.Warn("クエスト", $"{AreaAccess.Name(this.ownBuyStopTerritory)} へ戻れませんでした（{failed}）。そのまま Questionable に頼み直します");
+            this.RestoreAutoFishing(ctx);
+            this.started = false;
+            return TaskResult.Running;
+        }
+
+        var orders = this.ownBuyOrders!;
+        // 1個も無ければ止める（Questionable の手順が進まない）。足りないが1個以上あれば、記録して続ける（釣りにも、購入の手順を飛ばすにも1個で足りる）
+        var missing = orders.Where(o => GameBait.Current.Owned(o.ItemId) <= 0).ToList();
+        foreach (var o in orders.Where(o => GameBait.Current.Owned(o.ItemId) is > 0 and var n && n < o.Count))
+            ctx.Log.Warn("クエスト", $"{CraftPlanner.ItemName(o.ItemId)} を買いきれませんでした（{GameBait.Current.Owned(o.ItemId)}／{o.Count}）。1個以上あるので続けます");
+        if (missing.Count > 0)
+            return this.Fail($"{string.Join("、", missing.Select(o => $"{CraftPlanner.ItemName(o.ItemId)}（{GameBait.Current.Owned(o.ItemId)}／{o.Count}）"))} を NPC から買えませんでした"
+                             + (failed != null ? $"（{failed}）" : string.Empty)
+                             + $"。{string.Join("、", missing.Select(o => $"{NpcStepTask.NpcName(o.Npc)} で {CraftPlanner.ItemName(o.ItemId)} を {o.Count} 個"))}買ってから再開してください（続きから進みます）");
+
+        ctx.Log.Write("クエスト", $"NPC から買いました：{string.Join("、", orders.Select(o => $"{CraftPlanner.ItemName(o.ItemId)} {GameBait.Current.Owned(o.ItemId)}／{o.Count}"))}");
+
+        // 釣りの手順の途中で止めて別の街へ移っていたら、止めた時点のエリアへ戻ってから頼み直す（経路データの釣りの手順はテレポを持たないことがある）
+        if (this.ownBuyStopTerritory != 0 && GameWeather.CurrentTerritory != this.ownBuyStopTerritory)
+        {
+            ctx.Log.Write("クエスト", $"買うために別の街へ移っていたので、{AreaAccess.Name(this.ownBuyStopTerritory)} へ戻ってから Questionable に頼み直します");
+            this.ownBuyReturning = true;
+            this.ownBuySince = DateTime.UtcNow;
+            this.ownBuy = TestReturnTask?.Invoke(this.ownBuyStopTerritory) ?? new TeleportTask(this.ownBuyStopTerritory);
+            return TaskResult.Running;
+        }
+
+        this.ownBuyOrders = null;
+        this.RestoreAutoFishing(ctx);
+        this.started = false; // Questionable に頼む（受注の前なら初めて、釣りの途中なら頼み直し）
+        return TaskResult.Running;
     }
 
     // 天気の限られた魚の購入（HandleWeatherFish）：動かしている購入・試したか・始めた時刻・かかった時間・同じことを2度書かない控え
@@ -918,6 +1085,7 @@ public sealed unsafe class QuestTask : AutoTask
     private AutoTask? relocate;
     private System.Numerics.Vector3 stillAt;
     private DateTime? stillSince;
+    private string stillStep = string.Empty;
     private int relocations;
     private bool relocateLimitNoted;
     private DateTime quitSentAt = DateTime.MinValue;
@@ -1102,7 +1270,7 @@ public sealed unsafe class QuestTask : AutoTask
                 this.baitSettled = true;
                 return;
             case FishBaitPrep.Verdict.NotOwned:
-                this.NoteBait(ctx, $"{bait}:NotOwned", $"釣りの手順の餌（{name}）をまだ持っていません（Questionable が買う手順を待ちます）");
+                this.NoteBait(ctx, $"{bait}:NotOwned", $"釣りの手順の餌（{name}）をまだ持っていません（Questionable が釣りの前に買う手順が無ければ、こちらで買います）");
                 return;
             case FishBaitPrep.Verdict.Equip:
                 break;
@@ -1495,6 +1663,10 @@ public sealed unsafe class QuestTask : AutoTask
 
         this.relocate?.Cleanup(ctx);
         this.relocate = null;
+        this.weatherBuy?.Cleanup(ctx);
+        this.weatherBuy = null;
+        this.ownBuy?.Cleanup(ctx);
+        this.ownBuy = null;
         this.RestoreAutoFishing(ctx);
         ctx.TextAdvance.ReleaseControl();
         ctx.YesAlready.Release();
