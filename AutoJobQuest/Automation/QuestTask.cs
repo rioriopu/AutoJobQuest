@@ -257,6 +257,9 @@ public sealed unsafe class QuestTask : AutoTask
         // Questionable の釣りの手順の前に、手順の指定の餌を付けておく（FishBaitPrep）
         this.HandleFishBait(ctx);
 
+        // Questionable が飛んだまま話しかけてゲームに断られたら、こちらで着地させる
+        this.HandleFlyingRefusal(ctx);
+
         // Questionable が買えない・買わなかった品を、こちらで NPC から買う（QuestOwnPurchase）
         if (this.ownBuyOrders != null)
         {
@@ -1103,6 +1106,45 @@ public sealed unsafe class QuestTask : AutoTask
 
     /// <summary>検証の仕組み用：設定すると、降りる操作（一般アクション 23）の代わりにこれを呼ぶ。本番では null のまま。</summary>
     public static Func<bool>? TestDismount { get; set; }
+
+    // 飛んだまま話しかけて断られたときの着地：最後に着地の操作を送った時刻・知らせたか
+    private DateTime landSentAt = DateTime.MinValue;
+    private bool landNoted;
+
+    /// <summary>
+    /// Questionable が動いている間に、ゲームが「飛行中のため、その操作はできません」と断り、まだ飛んでいたら、着地させる
+    /// （一般アクション 23「降りる」。飛んでいるときは着地になる＝Questionable の LandExecutor と同じ操作。1秒おき）。
+    /// 原因（Questionable のソース）：Questionable は経路の手順に「飛んで行く」（Fly）と「着いたら着地」（Land）の両方があるときだけ着地する（MoveTo.cs）。
+    /// 漁師 Lv58（2088）の段 3（モグックに話しかける）は Fly だけで Land が無く、飛んだまま話しかけ続けて断られた。
+    /// Questionable の話しかけは断られても0.5秒おきにやり直すので、着地すれば次のやり直しで話しかけられる（地上なら乗ったままでも話しかけられる）。
+    /// </summary>
+    private void HandleFlyingRefusal(TaskContext ctx)
+    {
+        if (DateTime.UtcNow - ChatRecorder.LastFlyingRefusal > TimeSpan.FromSeconds(3)
+            || !Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.InFlight]
+            || ctx.Questionable.IsRunning() != true || DateTime.UtcNow - this.landSentAt < TimeSpan.FromSeconds(1))
+            return;
+
+        // 話しかける相手のそば（水平10m以内）にいるときだけ（移動の途中で着地させて、Questionable の飛行を崩さない）。
+        // 手順が無い（終えたことにした）ときは、断られた直後なので着地させる
+        var step = ctx.Questionable.GetCurrentStepData();
+        if (step != null && (step.QuestId != this.quest.ShortId.ToString() || step.Position is not { } target
+                             || System.Numerics.Vector2.Distance(new(Me.Position.X, Me.Position.Z), new(target.X, target.Z)) > 10f))
+            return;
+
+        this.landSentAt = DateTime.UtcNow;
+        if (!this.landNoted)
+        {
+            this.landNoted = true;
+            ctx.Log.Write("クエスト", "Questionable が飛んだまま話しかけて、ゲームに「飛行中のため、その操作はできません」と断られました"
+                                   + "（経路の手順に着地の指定が無い）。こちらで着地させます（一般アクション 23「降りる」）");
+        }
+
+        if (TestDismount is { } test)
+            test();
+        else
+            GameUi.UseGeneralAction(23);
+    }
 
     /// <summary>
     /// Questionable が動いていて、手順が無い（終えた）のに、ゲームの段が変わらず、動ける状態が続いたら（StepDoneStall）、Questionable を止めて

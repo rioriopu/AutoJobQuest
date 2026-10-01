@@ -54,10 +54,18 @@ public sealed class ChatRecorder : IDisposable
         }
     }
 
+    /// <summary>ゲームの知らせ「飛行中のため、その操作はできません。」（LogMessage の行番号）。</summary>
+    public const uint FlyingRefusal = 7777;
+
+    /// <summary>最後に「飛行中のため、その操作はできません。」が出た時刻（QuestTask が着地させる合図に使う）。</summary>
+    public static DateTime LastFlyingRefusal { get; set; } = DateTime.MinValue;
+
     private void OnLogMessage(ILogMessage message)
     {
         try
         {
+            if (message.LogMessageId == FlyingRefusal)
+                LastFlyingRefusal = DateTime.UtcNow;
             if (!this.shouldRecord() || GameUi.InCombat)
                 return;
             DebugLog.Current?.Line("ゲームの記録", $"LogMessage {message.LogMessageId}：{message.FormatLogMessageForDebugging().ExtractText()}");

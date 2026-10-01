@@ -53,9 +53,10 @@ public sealed unsafe class GameBait : IBaitGame
     {
         get
         {
-            // 糸を垂らしている間は Fishing が立つ（投げ直しの合間は Gathering だけ：実機の記録）
+            // 糸を垂らしている間は Fishing が立つ（投げ直しの合間は Gathering だけ：実機の記録）。
+            // 飛んでいる間も送らない（断られると「飛行中のため、その操作はできません」が出て、QuestTask が着地の合図と取り違えるため）
             var c = Svc.Condition;
-            return c[ConditionFlag.Fishing] || c[ConditionFlag.Casting] || c[ConditionFlag.InCombat]
+            return c[ConditionFlag.Fishing] || c[ConditionFlag.Casting] || c[ConditionFlag.InCombat] || c[ConditionFlag.InFlight]
                    || c[ConditionFlag.BetweenAreas] || c[ConditionFlag.BetweenAreas51]
                    || c[ConditionFlag.OccupiedInEvent] || c[ConditionFlag.OccupiedInQuestEvent] || c[ConditionFlag.OccupiedInCutSceneEvent];
         }
