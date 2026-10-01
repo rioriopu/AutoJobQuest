@@ -46,6 +46,24 @@ public sealed class MoveToTask : AutoTask
     /// <summary>この時間動かなければ、動けなくなったとみなす。</summary>
     private static readonly TimeSpan StuckAfter = TimeSpan.FromSeconds(4);
 
+    /// <summary>歩きの経路の最後の2点がこれより離れていたら、歩いては行けない（経路が途中で途切れている：OwnPath.LastGap）。</summary>
+    private const float PartialGapLimit = 3f;
+
+    /// <summary>経路探しがこれより長く続いたら、動けないのと同じに数えて引き直す（行き先がたどり着けない点だと、探し続けて止まった）。</summary>
+    private static readonly TimeSpan SearchLimit = TimeSpan.FromSeconds(10);
+
+    // 経路探しを始めた時刻（探していない間は null）
+    private DateTime? searchSince;
+
+    /// <summary>行き先に 1m も近づかないまま、これだけたったら動けないとみる（崖に押し付けられて体が少しずつずれ、位置は動くのに近づかない）。</summary>
+    private static readonly TimeSpan NotCloserLimit = TimeSpan.FromSeconds(8);
+
+    // 行き先までの一番近かった距離（3次元）と、その時刻。動けなくなった後は、近くても乗って飛ぶ
+    private float closest = float.MaxValue;
+    private DateTime closestAt;
+    private bool forceMount;
+    private int? waypointsLeft;
+
     /// <summary>動けなくなって引き直す回数の上限。</summary>
     private const int StuckLimit = 6;
 
@@ -60,13 +78,17 @@ public sealed class MoveToTask : AutoTask
     private bool usingSimpleMove;
     private Vector3? registeredEnd;
 
-    public MoveToTask(Vector3 destination, float range, string label, TimeSpan? limit = null)
+    /// <param name="mountOver">行き先までこれより遠ければマウントに乗る（既定 60m。戦闘の出現点の巡回は短い移動が続くので小さくする）。</param>
+    public MoveToTask(Vector3 destination, float range, string label, TimeSpan? limit = null, float mountOver = 60f)
     {
         this.destination = destination;
         this.range = range;
         this.label = label;
         this.limit = limit ?? TimeSpan.FromMinutes(4);
+        this.mountOver = mountOver;
     }
+
+    private readonly float mountOver;
 
     public override string Name => $"移動: {this.label}";
 
@@ -171,7 +193,7 @@ public sealed class MoveToTask : AutoTask
             // 遠いならマウントに乗り、飛べるなら飛ぶ（フィールドの移動は、近いとき以外は原則マウントに乗って飛ぶ）。乗れない場所では歩く。
             // 乗り終わるまで歩き出さない（歩くと詠唱が途切れる）。テレポで着いた直後は、頼むと「受け付け」と返るのに詠唱が始まらないことがある
             // （例：着いた0.27秒後に頼んで乗れず、歩いた）ので、使えるようになるのを待ってから頼み、1.5秒たっても詠唱が始まらなければ頼み直す（4回まで）
-            if (this.Distance > 60 && !GameUi.Mounted && !GameUi.InCombat && CanMountHere() && this.mountAttempts < MountAttemptLimit)
+            if ((this.Distance > this.mountOver || this.forceMount) && !GameUi.Mounted && !GameUi.InCombat && CanMountHere() && this.mountAttempts < MountAttemptLimit)
             {
                 var now = DateTime.UtcNow;
                 var c = Svc.Condition;
@@ -213,7 +235,7 @@ public sealed class MoveToTask : AutoTask
             if (Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.Mounting] || Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.Casting])
                 return TaskResult.Running;
 
-            if (this.mountAttempts > 0 && !GameUi.Mounted && this.Distance > 60)
+            if (this.mountAttempts > 0 && !GameUi.Mounted && this.Distance > this.mountOver)
                 Core.DebugLog.Current?.Line("移動", $"マウントを {this.mountAttempts} 回頼みましたが乗れなかったので歩きます");
 
             this.fly = GameUi.Mounted && CanFlyHere();
@@ -239,19 +261,51 @@ public sealed class MoveToTask : AutoTask
             this.interruptionsAtIssue = ctx.OwnMove.Interruptions;
             this.progressAt = Me.Position;
             this.progressSince = DateTime.UtcNow;
+            this.closest = Vector3.Distance(Me.Position, this.destination);
+            this.closestAt = DateTime.UtcNow;
             this.NextPhase($"{this.label} へ移動中（{this.Distance:0}m）");
             return TaskResult.Running;
         }
 
         // 動けなくなった（不具合の例：地上を歩いて段差に引っかかり、経路を引き直さず押し続けた）。4秒動かなければ止めて、
         // 歩いていたならマウントに乗り直して飛んで行き、乗っていたなら経路を引き直す（経路を探している間は数えない）
-        if (Vector3.Distance(Me.Position, this.progressAt) > 1f || this.path.Searching)
+        // 経路探しが長く続くのも、動けないのと同じに数える（不具合の例：高地ドラヴァニアで「経路を探しています」のまま止まった）
+        if (this.path.Searching)
+            this.searchSince ??= DateTime.UtcNow;
+        else
+            this.searchSince = null;
+        var searchTooLong = this.searchSince is { } ss && DateTime.UtcNow - ss > SearchLimit;
+
+        // 行き先に近づいているか（不具合の例：高地ドラヴァニアで崖の上の出現点へ歩き、崖に向かって走り込んだまま止まった。
+        // 崖に押し付けられると体が少しずつずれて「1m 動いた」と数え、動けない判定が働かなかった）。探している間は数えない。
+        // 経路の点を消化していれば（vnavmesh の残りの点が減った）、回り道で直線の距離が縮まなくても進んでいるとみる（町で建物を回り込むときなど）
+        var toGo = Vector3.Distance(Me.Position, this.destination);
+        var left = this.usingSimpleMove ? null : ctx.Navmesh.NumWaypoints();
+        var consumed = left is { } l && this.waypointsLeft is { } prev && l < prev;
+        this.waypointsLeft = left;
+        if (toGo < this.closest - 1f || this.path.Searching || consumed)
+        {
+            this.closest = Math.Min(this.closest, toGo);
+            this.closestAt = DateTime.UtcNow;
+        }
+
+        var notCloser = DateTime.UtcNow - this.closestAt > NotCloserLimit;
+
+        if (!searchTooLong && !notCloser && (Vector3.Distance(Me.Position, this.progressAt) > 1f || this.path.Searching))
         {
             this.progressAt = Me.Position;
             this.progressSince = DateTime.UtcNow;
         }
-        else if (DateTime.UtcNow - this.progressSince > StuckAfter)
+        else if (searchTooLong || notCloser || DateTime.UtcNow - this.progressSince > StuckAfter)
         {
+            this.searchSince = null;
+            this.closest = float.MaxValue;
+            this.closestAt = DateTime.UtcNow;
+
+            // 歩いていたなら、行き先が近くても乗って飛ぶ（崖・段差は飛んで越える。以前は「乗って飛んで行きます」と記録しながら、
+            // 行き先が近いと乗らずにまた歩いていた）
+            if (!GameUi.Mounted)
+                this.forceMount = true;
             if (++this.stuckCount > StuckLimit)
                 return this.Fail($"{this.label} へ向かう途中で {StuckLimit} 回動けなくなりました（残り {this.Distance:0}m）");
             this.path.Stop(ctx.Navmesh);
@@ -261,7 +315,7 @@ public sealed class MoveToTask : AutoTask
             this.mountAttempts = 0;
             this.mountIssuedAt = null;
             this.mountWaitSince = null;
-            ctx.Log.Warn("移動", $"{this.label} へ向かう途中、{StuckAfter.TotalSeconds:0}秒動けませんでした（{this.stuckCount} 回目）。"
+            ctx.Log.Warn("移動", $"{this.label} へ向かう途中、{(searchTooLong ? $"経路探しが {SearchLimit.TotalSeconds:0}秒終わりませんでした" : notCloser ? $"{NotCloserLimit.TotalSeconds:0}秒行き先に近づけませんでした" : $"{StuckAfter.TotalSeconds:0}秒動けませんでした")}（{this.stuckCount} 回目）。"
                                 + (GameUi.Mounted ? "経路を引き直します" : "マウントに乗って飛んで行きます"));
             return TaskResult.Running;
         }
@@ -283,6 +337,22 @@ public sealed class MoveToTask : AutoTask
                     this.Status = $"{this.label} への経路を探しています（残り {this.Distance:0}m）";
                     return TaskResult.Running;
                 case OwnPath.State.Following:
+                    // 歩きの経路が途中までしか引けなかった（最後の区間が壁・崖を貫く直線：OwnPath.LastGap）なら、その経路は使わず、
+                    // 乗って飛ぶ経路に切り替える（不具合の例：高地ドラヴァニアで崖の上の出現点へ、崖に向かって引かれた経路を歩き、
+                    // 崖に走り込んだまま止まった）。乗れない場所（町・戦闘中）では、そのまま歩く（動けない判定が引き直す）
+                    if (!this.fly && !GameUi.Mounted && !this.forceMount && this.path.LastGap > PartialGapLimit && CanMountHere() && CanFlyHere() && !GameUi.InCombat)
+                    {
+                        ctx.Log.Warn("移動", $"{this.label} へは歩いて行けません（vnavmesh の地上の経路が、行き先の {this.path.LastGap:0}m 手前で途切れています）。"
+                                            + "マウントに乗って飛んで行きます");
+                        this.path.Stop(ctx.Navmesh);
+                        this.started = false;
+                        this.forceMount = true;
+                        this.mountAttempts = 0;
+                        this.mountIssuedAt = null;
+                        this.mountWaitSince = null;
+                        return TaskResult.Running;
+                    }
+
                     if (this.path.FollowingEnd is { } following)
                         this.RegisterMovement(ctx, following);
                     this.Status = $"{this.label} へ移動中（残り {this.Distance:0}m）";

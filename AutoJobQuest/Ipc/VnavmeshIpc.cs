@@ -76,6 +76,17 @@ public sealed class VnavmeshIpc : IpcGate, Automation.INavControl
             ? v
             : null;
 
+    /// <summary>
+    /// 近くのメッシュ上の点のうち、本来の地面とつながっている床（vnavmesh が地図を作るときに塗り広げて、たどり着けると印を付けた床）の点。
+    /// 岩の上・物の中など、たどり着けない床は選ばない（vnavmesh の Query.Mesh.NearestPointReachable。IPCProvider.cs で確認）。無ければ null。
+    /// </summary>
+    public Vector3? NearestPointReachable(Vector3 p, float halfExtentXZ, float halfExtentY)
+        => this.TryInvoke("Query.Mesh.NearestPointReachable",
+            () => this.Func<Vector3, float, float, Vector3?>("vnavmesh.Query.Mesh.NearestPointReachable")
+                .InvokeFunc(p, halfExtentXZ, halfExtentY), out var v)
+            ? v
+            : null;
+
     /// <summary>近くのメッシュ上の点。無ければ null。</summary>
     public Vector3? NearestPoint(Vector3 p, float halfExtentXZ, float halfExtentY)
         => this.TryInvoke("Query.Mesh.NearestPoint",
@@ -116,6 +127,11 @@ public sealed class VnavmeshIpc : IpcGate, Automation.INavControl
     public bool? SimplePathfindInProgress()
         => this.TryInvoke("SimpleMove.PathfindInProgress",
             () => this.Func<bool>("vnavmesh.SimpleMove.PathfindInProgress").InvokeFunc(), out var v) ? v : null;
+
+    /// <summary>いまたどっている経路の残りの点の数（vnavmesh の Path.NumWaypoints：通り過ぎた点は消える）。読めなければ null。</summary>
+    public int? NumWaypoints()
+        => this.TryInvoke("Path.NumWaypoints",
+            () => this.Func<int>("vnavmesh.Path.NumWaypoints").InvokeFunc(), out var n) ? n : null;
 
     /// <summary>いまたどっている経路の終点（経路が無い・読めなければ null）。自分の行き先の経路かを確かめるのに使う。</summary>
     public Vector3? LastWaypoint()

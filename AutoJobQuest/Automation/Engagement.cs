@@ -37,6 +37,15 @@ public sealed class Engagement
     /// <summary>乗ったまま近づいてよい距離（これより近いか、攻撃が届くなら降りる）。</summary>
     public const float DismountDistance = 20f;
 
+    /// <summary>飛んでいるときに着地する、相手からの水平の距離（相手の立つ地面の上で降りる。それ以上近づけないときは DismountDistance で降りる）。</summary>
+    public const float FlyingLandDistance = 8f;
+
+    /// <summary>降りる操作を送っても、この間位置が動かず乗ったままなら「ここでは降りられない」とみる。</summary>
+    public static readonly TimeSpan LandStuckAfter = TimeSpan.FromSeconds(2.5);
+
+    /// <summary>降りられない場所から、相手のそばへ動いて降り直す回数の上限（その後は HP が減らない上限で諦める）。</summary>
+    public const int LandRelocationLimit = 3;
+
     /// <summary>RSR へ送れない失敗を、何回続いたら止めるか（数えるのは3秒に1回）。</summary>
     public const int IpcFailureLimit = 3;
 
@@ -47,6 +56,14 @@ public sealed class Engagement
     private bool simpleApproach;
     private DateTime lastApproach = DateTime.MinValue;
     private DateTime dismountAt = DateTime.MinValue;
+
+    // 降りる操作の進み具合（不具合の例：高地ドラヴァニアで物の上にいて、「降りる」は受け付けられるのに着地も降りることも進まず、
+    // 45秒送り続けて諦めた）：降り始めた時刻・最後に位置が動いた時刻と位置・降りられなかった位置・動いて降り直した回数
+    private DateTime landSince = DateTime.MinValue;
+    private DateTime landProgressAt = DateTime.MinValue;
+    private Vector3 landProgressPos;
+    private Vector3? landBlockedAt;
+    private int landRelocations;
     private DateTime lastIpcFailure = DateTime.MinValue;
     private int ipcFailures;
 
@@ -67,6 +84,9 @@ public sealed class Engagement
     {
         this.TargetId = foe.Id;
         this.stall.Start(foe.Hp, world.Now);
+        this.landSince = DateTime.MinValue;
+        this.landBlockedAt = null;
+        this.landRelocations = 0;
     }
 
     /// <summary>待たされていた時間（画面が開いていた等）を「HP が減らない時間」に数えない。</summary>
@@ -107,12 +127,63 @@ public sealed class Engagement
         // 空中で「降りる」を2秒おきに送り続け、真下に床が無いので高さ -100 前後から -601 まで降り続けて止まった）。
         // 床が無い・別の高さの床しか無いときは、降りずに相手の位置へ飛んで近づき、床の上に来てから降りる
         var overVoid = world.Mounted && world.Flying && !GroundBelowLikeFoe(nav, world.MyPosition, t.Position);
-        if (world.Mounted && !overVoid && (inReach || dist < DismountDistance || flat < DismountDistance))
+
+        // 降りる距離：地上で乗っていれば、攻撃が届くか 20m 以内。飛んでいれば、相手の立つ地面の上（水平 8m 以内）まで来てから着地する
+        // （手前で降りると途中の物の上に降りようとしやすい）。それ以上近づけない（近づく移動が止まった）ときは 20m 以内で降りる
+        var near = inReach || dist < DismountDistance || flat < DismountDistance;
+
+        // 飛んでいるときの降りる場所は、vnavmesh の地図で決める：相手の真下の地面のうち、本来の地面とつながっている床
+        // （PointOnFloor の allowUnreachable=false。岩の上など、つながっていない孤立した面は外れる。vnavmesh で物や地形の構造を把握して、
+        // 不安定な動きを避ける）。その点へ飛び、着いたら（水平 2.5m）降りる。
+        // 地図が使えない・点が無いときは、相手から水平 8m 以内で降りる
+        var landAt = world.Mounted && world.Flying ? LandingPoint(nav, t.Position) : null;
+        var overLanding = landAt is { } la
+            ? Vector2.Distance(new Vector2(world.MyPosition.X, world.MyPosition.Z), new Vector2(la.X, la.Z)) <= 2.5f
+            : flat <= FlyingLandDistance;
+        var wantLand = world.Mounted && !overVoid
+                       && (world.Flying ? overLanding || (near && !nav.IsMoving() && this.lastApproach != DateTime.MinValue) : near);
+
+        // 降りられなかった場所から動いている間は降りない。相手のそば（水平 3m）に着いたか、離れて（5m）止まったら降り直す
+        if (this.landBlockedAt is { } blocked)
+        {
+            var away = Vector2.Distance(new Vector2(world.MyPosition.X, world.MyPosition.Z), new Vector2(blocked.X, blocked.Z));
+            if (!world.Mounted || flat <= 3f || (away >= 5f && !nav.IsMoving()))
+                this.landBlockedAt = null;
+            else
+                wantLand = false;
+        }
+
+        if (wantLand)
         {
             // 降りると決めたら、飛んで近づく移動を止める（動いたままだと降りる操作とぶつかる）。「降りる」はゲームが受け付けられるとき
             // （Questionable の LandExecutor と同じ：GetActionStatus が 0）だけ、0.5秒おきに送る（以前は受け付けられない
             // ときにも2秒おきに送り、「現在の状態では使用できません」で断られるたびに2秒待っていた）
             this.StopApproach(nav);
+
+            // 降りる操作が効いているかを位置の変化で見る。送っても 2.5秒位置が動かず乗ったままなら、ここでは降りられない（物の上など）。
+            // 相手のそば（相手の立つ地面の上）へ動いてから降り直す（3回まで。その後は HP が減らない上限で諦める）
+            if (this.landSince == DateTime.MinValue)
+            {
+                this.landSince = now;
+                this.landProgressAt = now;
+                this.landProgressPos = world.MyPosition;
+            }
+            else if (Vector3.Distance(world.MyPosition, this.landProgressPos) >= 0.3f)
+            {
+                this.landProgressAt = now;
+                this.landProgressPos = world.MyPosition;
+            }
+            else if (now - this.landProgressAt >= LandStuckAfter && this.landRelocations < LandRelocationLimit
+                     && (this.dismountAt >= this.landSince || now - this.landSince >= TimeSpan.FromSeconds(5)))
+            {
+                this.landRelocations++;
+                this.landBlockedAt = world.MyPosition;
+                this.landSince = DateTime.MinValue;
+                this.lastApproach = DateTime.MinValue;
+                status = $"{t.Name} の近くですが、ここでは降りられないので（物の上など）、相手のそばまで動いてから降り直します（{this.landRelocations}/{LandRelocationLimit} 回目）";
+                return Result.Running;
+            }
+
             if (world.DismountReady && now - this.dismountAt >= TimeSpan.FromSeconds(0.5))
             {
                 this.dismountAt = now;
@@ -122,6 +193,8 @@ public sealed class Engagement
             status = $"{t.Name} の近くなのでマウントから降ります（飛んでいれば着地してから。水平 {flat:0.0}m）";
             return Result.Running;
         }
+
+        this.landSince = DateTime.MinValue;
 
         // Henched を入れる（こちらが入れていれば送り直さない。RSR が自分で OFF になったときだけ入れ直す）
         if (!rsr.EnsureHenched())
@@ -181,12 +254,14 @@ public sealed class Engagement
         if ((!moving || moved) && now - this.lastApproach > TimeSpan.FromSeconds(1))
         {
             this.lastApproach = now;
-            if (this.path.Request(nav, world.MyPosition, t.Position, world.Flying))
+            // 飛んでいれば、vnavmesh の地図で決めた降りる場所へ飛ぶ（無ければ相手の位置）
+            var goal = landAt ?? t.Position;
+            if (this.path.Request(nav, world.MyPosition, goal, world.Flying))
             {
                 this.simpleApproach = false;
                 this.ApproachDestination = t.Position;
             }
-            else if (nav.MoveCloseTo(t.Position, world.Flying, 2.5f))
+            else if (nav.MoveCloseTo(goal, world.Flying, 2.5f))
             {
                 // 取り消せる探索の窓口が使えない。以前の SimpleMove で代える
                 this.simpleApproach = true;
@@ -194,12 +269,25 @@ public sealed class Engagement
             }
         }
 
-        status = overVoid
+        status = this.landBlockedAt != null
+            ? $"{t.Name} の近くですが、ここでは降りられなかったので、相手のそばまで動いています（水平 {flat:0.0}m）"
+            : overVoid
             ? $"{t.Name} の近くですが、足もとに降りられる床が無いので、床の上まで飛んで近づきます（水平 {flat:0.0}m）"
             : reach == false
                 ? $"{t.Name} に近づいています（{dist:0.0}m・{(code == 562 ? "見えない位置" : "射程外")}）"
                 : $"{t.Name} に近づいています（{dist:0.0}m）";
         return Result.Running;
+    }
+
+    /// <summary>
+    /// 飛んでいるときに降りる場所：相手の真下（水平 3m 以内）の床のうち、本来の地面とつながっている床（vnavmesh の PointOnFloor で
+    /// allowUnreachable=false）。相手の高さから下 20m・上 5m に無ければ null（浮いている敵の下に別の床しか無いなど）。地図が使えなければ null。
+    /// </summary>
+    public static Vector3? LandingPoint(INavControl nav, Vector3 foe)
+    {
+        if (!nav.IsReady())
+            return null;
+        return nav.PointOnFloor(foe + new Vector3(0, 2f, 0), false, 3f) is { } p && p.Y >= foe.Y - 20f && p.Y <= foe.Y + 5f ? p : null;
     }
 
     /// <summary>

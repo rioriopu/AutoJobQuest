@@ -57,6 +57,9 @@ public sealed class CombatTask : AutoTask
     /// <summary>出現点の周りの見回りの点の数（方向）。</summary>
     public const int RoamDirections = 6;
 
+    /// <summary>出現点の巡回で、マウントに乗る距離（これより遠ければ乗って飛ぶ）。</summary>
+    public const float PatrolMountOver = 15f;
+
     /// <summary>見回りの点の、出現点からの距離（地図座標。1.0＝ワールドで 50m）。</summary>
     public const float RoamRadiusMap = 1.2f;
 
@@ -571,7 +574,9 @@ public sealed class CombatTask : AutoTask
         // 出現点の床：今の高さの近く → 少し上から下へ → 地図の上（高さ 1024）から下へ（vnavmesh が地図の旗から床を求めるのと同じ）。
         // 今の高さだけに頼らない（不具合の例：アジス・ラーで島の 500m 下まで降りてしまい、どの出現点も「床が無い」として
         // 表示も移動も無いまま毎フレーム飛ばし続け、3分以上止まった）
-        var onFloor = ctx.Navmesh.NearestPoint(new Vector3(world.X, Me.Position.Y, world.Z), 10f, 300f)
+        // 行き先は、本来の地面とつながっている床の点だけから選ぶ（vnavmesh で行けない場所は分かる。
+        // 以前は岩の上・物の中など、たどり着けない床の点も選び、経路を探し続けて止まった）
+        var onFloor = ctx.Navmesh.NearestPointReachable(new Vector3(world.X, Me.Position.Y, world.Z), 10f, 300f)
                       ?? ctx.Navmesh.PointOnFloor(new Vector3(world.X, Me.Position.Y + 100f, world.Z), false, 10f)
                       ?? ctx.Navmesh.PointOnFloor(new Vector3(world.X, 1024f, world.Z), false, 10f);
         if (onFloor == null)
@@ -605,7 +610,9 @@ public sealed class CombatTask : AutoTask
             return TaskResult.Running;
         }
 
-        this.moving = new MoveToTask(onFloor.Value, 8f, $"出現点 {spot.X:0.0},{spot.Y:0.0}", TimeSpan.FromMinutes(3));
+        // 出現点の巡回は、近い点へ順に回るので1回の移動が短い（50m 前後）。60m 未満は歩く決まりのままだと、ずっと歩いた
+        // （不具合の例：高地ドラヴァニアで、倒した後は徒歩で次の出現点へ向かい、マウントに乗らなかった）。15m を超えれば乗って飛ぶ
+        this.moving = new MoveToTask(onFloor.Value, 8f, $"出現点 {spot.X:0.0},{spot.Y:0.0}", TimeSpan.FromMinutes(3), mountOver: PatrolMountOver);
         this.spotArrivedAt = DateTime.MinValue;
         return TaskResult.Running;
     }

@@ -74,6 +74,14 @@ public sealed class OwnPath
     public Vector3? FollowingEnd => this.followingEnd;
 
     /// <summary>
+    /// 最後に受け取った経路の、最後の2点の隔たり（地上の経路が途中までしか引けなかった目安）。
+    /// vnavmesh の地上の経路探しは、行き先にたどり着けないとき「たどり着ける範囲で一番近い所までの経路」の最後に、元の行き先をそのまま
+    /// 1点足して返す（ffxiv_navmesh の NavmeshQuery.PathfindMesh：手前に詰める処理は無効化されている）。そのため最後の区間が壁・崖を貫く直線になる。
+    /// 届く経路なら最後の2点はほぼ同じ点（string pulling の終点＝行き先に、行き先を足すため）。
+    /// </summary>
+    public float LastGap { get; private set; }
+
+    /// <summary>
     /// 探索を頼む（前の探索は取り消す・捨てる）。取り消せる探索の窓口が使えなければ false（呼び出し側が SimpleMove で代える）。
     /// 前に渡した経路は止めない（新しい経路を渡すまで歩き続ける。止めるのは <see cref="Stop"/>）。
     /// </summary>
@@ -122,6 +130,7 @@ public sealed class OwnPath
             var points = t.Result;
             if (points == null || points.Count == 0)
                 return State.NoPath;
+            this.LastGap = points.Count >= 2 ? Vector3.Distance(points[^2], points[^1]) : 0f;
 
             // いまの位置より先の点だけを渡す（出発点・通り過ぎた点は捨てる）。経路から離れていたら使わない
             // 探索の間に動いていなければ、従来どおり出発点だけを捨てて渡す（出発点が navmesh の外〔台の上など〕で、経路の最初の点から
