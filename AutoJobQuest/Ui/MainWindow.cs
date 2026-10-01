@@ -1031,8 +1031,8 @@ public sealed class MainWindow : Window
         if (!ImGui.CollapsingHeader("モンスターを倒して素材を集める（デバッグ）"))
             return;
 
-        ImGui.TextColored(Grey, "モンスターの名前を押すと、戦闘のジョブに着替えてそのエリアへテレポし、そのモンスターを倒して、指定の数を得たら止まります"
-                                + "（本番の素材集めの戦闘と同じ動き。止めるときは上の「停止」）");
+        ImGui.TextColored(Grey, "モンスターの名前のボタンを押すと、戦闘のジョブに着替えてそのエリアへテレポし、そのエリアの「狙う」になっている敵を倒して、"
+                                + "指定の数を得たら止まります（本番の素材集めの戦闘と同じ動き。止めるときは上の「停止」）。敵の名前のチェックを外すと、その敵は狙いません");
         if (!this.Ctx.Data.IsReady)
         {
             ImGui.TextColored(Grey, "ゲームデータを読み込み中です");
@@ -1090,23 +1090,36 @@ public sealed class MainWindow : Window
             if (ImGui.InputInt("個 集める##count", ref n, 1, 5))
                 this.dropHuntCounts[e.ItemId] = Math.Clamp(n, 1, 999);
 
-            foreach (var m in e.Mobs)
+            // エリアごとに、そのエリアで落とす敵のうち「狙う」になっている敵をまとめて倒しに行く（本番の素材集めの戦闘と同じ：近い群れから回る）。
+            // 敵ごとのチェックで「狙わない」にできる（普段いない敵・その素材を落とさない敵。本番の戦闘にも効く）
+            foreach (var area in e.Mobs)
             {
-                var label = $"{m.Name}（{m.TerritoryName}）##{m.NameIds[0]}_{m.Territory}";
-                var width = ImGui.CalcTextSize(label.Split("##")[0]).X + (ImGui.GetStyle().FramePadding.X * 2);
-                if (ImGui.GetContentRegionAvail().X > width + ImGui.GetStyle().ItemSpacing.X)
-                    ImGui.SameLine();
-                var reachable = CombatPlanner.IsReachable(m.Territory, unlocked);
-                using (ImRaii.Disabled(running || !reachable))
+                var m = area.OnlyTargeted(MobSkips.IsSkipped);
+                var label = $"{m?.Name ?? "（狙う敵がありません）"}（{area.TerritoryName}）##{area.Territory}";
+                var reachable = CombatPlanner.IsReachable(area.Territory, unlocked);
+                using (ImRaii.Disabled(running || !reachable || m == null))
                 {
-                    if (ImGui.Button(label))
+                    if (ImGui.Button(label) && m != null)
                         this.services.Runner.Start(new DropHuntTask(e, m, this.dropHuntCounts.GetValueOrDefault(e.ItemId, e.Needed)));
                 }
 
                 if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
                     ImGui.SetTooltip(!reachable
                         ? "このエリアの入口のエーテライトが未解放です（または野外のエリアではありません）"
-                        : running ? "動いている間は始められません" : $"出現点 {m.Spots.Count} か所：{string.Join(" ", m.Spots.Take(6).Select(s => $"{s.Spot.X:0.0},{s.Spot.Y:0.0}"))}");
+                        : running ? "動いている間は始められません"
+                        : m == null ? "このエリアの敵が全部「狙わない」になっています"
+                        : $"出現点 {m.Spots.Count} か所：{string.Join(" ", m.Spots.Take(6).Select(s => $"{s.Spot.X:0.0},{s.Spot.Y:0.0}"))}");
+
+                // 敵ごとの「狙う」（チェックを外すと、デバッグでも本番の素材集めの戦闘でも狙わない）
+                foreach (var member in area.Members)
+                {
+                    ImGui.SameLine();
+                    var on = member.Ids.Any(id => !MobSkips.IsSkipped(area.Territory, id));
+                    if (ImGui.Checkbox($"{member.Name}（出現点 {member.Spots}）##{area.Territory}_{member.Ids[0]}", ref on))
+                        MobSkips.Set(area.Territory, member.Ids, !on);
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("チェックを外すと、この敵は狙いません（デバッグでも本番の素材集めの戦闘でも）。普段いない敵・この素材を落とさない敵に使います");
+                }
             }
 
             ImGui.Spacing();

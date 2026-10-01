@@ -5,13 +5,36 @@ using AutoJobQuest.Data;
 
 namespace AutoJobQuest.Planning;
 
-/// <summary>倒しに行くモンスター（エリアごと。名前が同じで番号の違うモンスターは1つにまとめる）。</summary>
+/// <summary>
+/// 倒しに行くモンスター（エリアごとに、そのエリアで落とす敵を全部まとめる。例：アルドゴートの粗皮は東ザナラーンの
+/// ミオトラグス・ナニーとビリーの両方を狙う。本番の素材集めの戦闘も、エリアの落とす敵を全部狙って、近い群れから回る）。
+/// </summary>
 /// <param name="NameIds">モンスターの名前（BNpcName の行。同じ名前の別の番号も含む）。</param>
-/// <param name="Name">モンスターの名前（画面用）。</param>
+/// <param name="Name">モンスターの名前（画面用。「ミオトラグス・ナニー／ミオトラグス・ビリー」）。</param>
 /// <param name="Territory">エリア（TerritoryType の行）。</param>
 /// <param name="TerritoryName">エリアの名前（画面用）。</param>
 /// <param name="Spots">そのエリアの出現点（地図座標。LuminaSupplemental の MobSpawn）と、その点のモンスター。</param>
-public sealed record DropHuntMob(List<uint> NameIds, string Name, uint Territory, string TerritoryName, List<(Vector2 Spot, uint Mob)> Spots);
+public sealed record DropHuntMob(List<uint> NameIds, string Name, uint Territory, string TerritoryName, List<(Vector2 Spot, uint Mob)> Spots)
+{
+    /// <summary>名前ごとの内訳（画面の「狙う」のチェック用。同じ名前の別の番号はまとめる）。</summary>
+    public List<(string Name, List<uint> Ids, int Spots)> Members { get; init; } = [];
+
+    /// <summary>「狙う」になっている敵だけにした組（全部「狙わない」なら null）。</summary>
+    public DropHuntMob? OnlyTargeted(System.Func<uint, uint, bool> skipped)
+    {
+        var ids = this.NameIds.Where(id => !skipped(this.Territory, id)).ToList();
+        if (ids.Count == 0)
+            return null;
+        var names = this.Members.Where(m => m.Ids.Any(ids.Contains)).Select(m => m.Name).ToList();
+        return this with
+        {
+            NameIds = ids,
+            Name = string.Join("／", names),
+            Spots = this.Spots.Where(s => ids.Contains(s.Mob)).ToList(),
+            Members = this.Members.Where(m => m.Ids.Any(ids.Contains)).ToList(),
+        };
+    }
+}
 
 /// <summary>モンスターのドロップで集める素材1つ。</summary>
 /// <param name="ItemId">品。</param>
@@ -73,19 +96,24 @@ public static class DropHuntCatalog
             if (!routes.Contains(Route.Combat))
                 continue;
 
-            // 名前とエリアが同じものは1つにまとめる（ゲームデータでは別の番号でも、画面では区別できないため）
+            // エリアごとに、そのエリアで落とす敵を全部まとめる（名前は出現点の多い順。同じ名前の別の番号は名前を1つにする）
             var mobs = sources.Get(item).DropMobs
                 .SelectMany(mob => sources.SpawnsOf(mob).Select(s => (Mob: mob, Name: names.TryGetRow(mob, out var row) ? row.Singular.ExtractText() : $"モンスター {mob}", Spot: s)))
-                .GroupBy(x => (x.Name, x.Spot.Territory))
-                .Select(g => new DropHuntMob(g.Select(x => x.Mob).Distinct().ToList(), g.Key.Name, g.Key.Territory, Automation.TeleportTask.TerritoryName(g.Key.Territory),
-                    g.Select(x => (new Vector2(x.Spot.MapX, x.Spot.MapY), x.Mob)).ToList()))
+                .GroupBy(x => x.Spot.Territory)
+                .Select(g => new DropHuntMob(g.Select(x => x.Mob).Distinct().ToList(),
+                    string.Join("／", g.GroupBy(x => x.Name).OrderByDescending(n => n.Count()).Select(n => n.Key)),
+                    g.Key, Automation.TeleportTask.TerritoryName(g.Key),
+                    g.Select(x => (new Vector2(x.Spot.MapX, x.Spot.MapY), x.Mob)).ToList())
+                {
+                    Members = g.GroupBy(x => x.Name).OrderByDescending(n => n.Count()).Select(n => (n.Key, n.Select(x => x.Mob).Distinct().ToList(), n.Count())).ToList(),
+                })
                 .ToList();
 
             if (mobs.Count == 0)
                 continue;
             var by = neededBy[item].OrderBy(x => x.Level).ToList();
             result.Add(new DropHuntEntry(item, CraftPlanner.ItemName(item), count, string.Join("・", by.Select(x => x.Text)), routes[0], by[0].Level,
-                mobs.OrderBy(m => m.Name).ThenBy(m => m.TerritoryName).ToList()));
+                mobs.OrderBy(m => m.TerritoryName).ToList()));
         }
 
         // 本来の最初の手段が戦闘の品（実際にモンスターを倒して集める品）を先に、NPC 購入などが先の品を後に

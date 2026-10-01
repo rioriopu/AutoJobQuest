@@ -382,6 +382,50 @@ public sealed class SourceIndex
         }
     }
 
+    /// <summary>
+    /// FATE でしか出ない敵（FATE のボス）を、素材を落とす敵から外す（不具合の例：東ザナラーンのエルダー・ロングホーンは普段いない
+    /// ＝FATE「長角の古老『エルダー・ロングホーン』」のボス。素材集めの戦闘は FATE の敵を狙わない作りなので、出現点に入れても倒せず、
+    /// 見つからないまま見回り続けた）。見分け方：ゲームデータの FATE の名前の「」の中と同じ名前で、出現点が2か所以下
+    /// （普通の敵がたまたま同じ名前でも、出現点が多いので外れない。エルダー・ロングホーンの出現点は1か所）。
+    /// </summary>
+    private void ExcludeFateBosses()
+    {
+        var bosses = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var f in Svc.Data.GetExcelSheet<Fate>())
+        {
+            var name = f.Name.ExtractText();
+            var a = name.IndexOf('「');
+            var b = name.LastIndexOf('」');
+            if (a >= 0 && b > a + 1)
+                bosses.Add(name[(a + 1)..b]);
+        }
+
+        if (bosses.Count == 0)
+            return;
+
+        var names = Svc.Data.GetExcelSheet<BNpcName>();
+        var removed = new HashSet<string>();
+        foreach (var s in this.map.Values)
+        {
+            s.DropMobs.RemoveAll(m =>
+            {
+                if (!names.TryGetRow(m, out var row) || row.Singular.ExtractText() is not { Length: > 0 } n || !bosses.Contains(n))
+                    return false;
+                if (this.spawns.TryGetValue(m, out var list) && list.Count > 2)
+                    return false;
+                removed.Add(n);
+                return true;
+            });
+        }
+
+        if (removed.Count > 0)
+            Core.DebugLog.Current?.Line("データ", $"FATE でしか出ない敵（FATE のボス）を、素材を落とす敵から外しました：{removed.Count} 種（{string.Join("・", removed.Take(10))}{(removed.Count > 10 ? " など" : string.Empty)}）");
+        this.FateBosses = removed;
+    }
+
+    /// <summary>素材を落とす敵から外した FATE のボスの名前（調べ用）。</summary>
+    public IReadOnlySet<string> FateBosses { get; private set; } = new HashSet<string>();
+
     private void BuildCombat()
     {
         try
@@ -410,6 +454,8 @@ public sealed class SourceIndex
 
             if (failed1.Count + failed2.Count > 0)
                 this.notes.Add($"戦闘ドロップのデータで読めない行がありました（ドロップ {failed1.Count} 行 / 出現位置 {failed2.Count} 行）");
+
+            this.ExcludeFateBosses();
         }
         catch (Exception ex)
         {

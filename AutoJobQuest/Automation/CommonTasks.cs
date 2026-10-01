@@ -447,8 +447,29 @@ public sealed class MoveToTask : AutoTask
         return TaskResult.Running;
     }
 
+    /// <summary>
+    /// 止めずに手放す（次の移動の作業が引き継ぐ。見回りの点を通り抜けるとき）。この後の <see cref="Cleanup"/> で経路を止めない。
+    /// SimpleMove で代えているときは手放さない（取り消せないので、従来どおり止める）。手放せたら true。
+    /// </summary>
+    public bool ReleaseWithoutStop()
+    {
+        if (this.usingSimpleMove)
+            return false;
+        this.released = true;
+        this.path.Release();
+        return true;
+    }
+
+    private bool released;
+
     public override void Cleanup(TaskContext ctx)
     {
+        if (this.released)
+        {
+            this.ForgetOwnMove(ctx);
+            return;
+        }
+
         // 自分の探索は取り消し（結果は使わない）、自分の経路なら止める
         this.path.Stop(ctx.Navmesh);
         if ((this.started || this.pausedByUi) && this.usingSimpleMove && ctx.Navmesh.IsMoving())

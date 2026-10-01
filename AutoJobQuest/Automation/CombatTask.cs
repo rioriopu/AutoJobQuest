@@ -70,6 +70,27 @@ public sealed class CombatTask : AutoTask
     // 見かけた目当ての敵の位置を記録した時刻（2秒に1回まで）
     private DateTime sightedAt = DateTime.MinValue;
 
+    // 敵ごとの、この戦闘で見かけたか・見かけないまま回ったその敵の出現点の数・回るのをやめた敵・見かけたかを見た時刻
+    // （不具合の例：東ザナラーンのエルダー・ロングホーン＝FATE でしか出ない敵を、見つからないまま見回り続けた。
+    // 実機では、ミオトラグス・ナニーとビリーのほかの敵〔FATE の取り巻き〕はいない）・いま向かっている見回りの行き先
+    private readonly HashSet<uint> seenMobs = [];
+    private readonly Dictionary<uint, int> unseenVisits = [];
+    private readonly HashSet<uint> droppedMobs = [];
+    private DateTime seenCheckAt = DateTime.MinValue;
+    private Vector3? movingTo;
+
+    // いま向かっている点を「回った」と数えたか（1つの点へ向かう間に1回だけ数える）
+    private bool visitCounted;
+
+    /// <summary>飛んでいるときの見回りの高さ（出現点の床から。点ごとに地面まで下りて飛び上がり直さない）。</summary>
+    public const float PatrolAltitude = 12f;
+
+    /// <summary>飛んでいるとき、見回りの点のそば（水平）まで来たら、止めずに次の点へ向かう。</summary>
+    public const float PassThroughDistance = 20f;
+
+    /// <summary>この戦闘でその敵を一度も見かけないまま、その敵の出現点をこの周回数だけ回ったら、その敵の点は回らない。</summary>
+    public const int GiveUpLaps = 2;
+
     // 移動を作らずに着いた扱いにした時刻（続けて着いたままなら間をあける）
     private DateTime lastInPlaceAt = DateTime.MinValue;
 
@@ -241,6 +262,7 @@ public sealed class CombatTask : AutoTask
         => this.needs
             .Where(n => Inventory.CountNow(n.ItemId) < n.TargetOwned)
             .SelectMany(n => n.Mobs)
+            .Where(m => !this.droppedMobs.Contains(m))
             .ToHashSet();
 
     protected override TaskResult OnStart(TaskContext ctx)
@@ -402,7 +424,10 @@ public sealed class CombatTask : AutoTask
             if (GameUi.InCombat)
                 ctx.Log.Warn("戦闘", "2分たっても戦闘状態が解けません。このまま次へ進みます");
 
-            if (!this.timedOut)
+            if (!this.timedOut && this.needs.Any(n => Inventory.CountNow(n.ItemId) < n.TargetOwned))
+                ctx.Log.Warn("戦闘", $"{TeleportTask.TerritoryName(this.territory)}：落とす敵をどれも見かけないので、ここでの戦闘はやめます"
+                                   + "（FATE でしか出ない・出現に条件がある・出現のデータが古い等。集めきれなかった品は次の手段にします）");
+            else if (!this.timedOut)
                 ctx.Log.Write("戦闘", $"{TeleportTask.TerritoryName(this.territory)}: そろいました");
             return TaskResult.Done;
         }
@@ -448,6 +473,7 @@ public sealed class CombatTask : AutoTask
 
         // 3) 指定のモンスターを探す
         this.RecordSightings(wanted);
+        this.NoteSeen(wanted);
         var mob = FindMob(wanted, this.giveUp);
         if (mob != null)
         {
@@ -556,6 +582,32 @@ public sealed class CombatTask : AutoTask
 
         if (this.moving != null)
         {
+            // 飛んでいて見回りの点のそば（水平 20m）まで来たら、止めずに次の点へ（以前は点ごとに止まって飛び直すので、
+            // かくかく動いた）。湧きを待つ必要があるとき（ほかに回る群れが無く、近くに目当ての死体か他人と戦っている個体がいる）だけ、その点で止まる
+            if (this.movingTo is { } to && GameUi.Mounted && Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.InFlight]
+                && Vector2.Distance(new Vector2(Me.Position.X, Me.Position.Z), new Vector2(to.X, to.Z)) <= PassThroughDistance
+                && !(this.WantedClusters(wanted) <= 1 && NearbyWanted(wanted) is var (deadNear, engagedNear) && deadNear + engagedNear > 0))
+            {
+                if (!this.visitCounted)
+                {
+                    this.visitCounted = true;
+                    this.CountVisit(ctx, this.spotIndex);
+                    wanted = this.WantedMobs();
+                    if (wanted.Count == 0)
+                        return TaskResult.Running; // 次のフレームの始めで終わる（落とす敵をどれも見かけない）
+                }
+
+                var next = this.NextSpot(wanted);
+                if (next != this.spotIndex && this.SpotFloor(ctx, next) is { } nextFloor && this.moving.ReleaseWithoutStop())
+                {
+                    this.moving.Cleanup(ctx);
+                    this.spotIndex = next;
+                    this.spotArrivedAt = DateTime.MinValue;
+                    this.StartPatrolMove(nextFloor);
+                    return TaskResult.Running;
+                }
+            }
+
             var r = this.moving.Step(ctx);
             this.Status = $"出現点 {this.spotIndex + 1}/{this.spots.Count} へ: {this.moving.Status}";
             if (r == TaskResult.Running)
@@ -563,6 +615,9 @@ public sealed class CombatTask : AutoTask
 
             this.moving.Cleanup(ctx);
             this.moving = null;
+            this.movingTo = null;
+            if (r != TaskResult.Failed && !this.visitCounted)
+                this.CountVisit(ctx, this.spotIndex);
 
             // 着けなかった出現点は「着いた」にしない（以前は着いた印も付けたので、次のフレームで
             // もう1つ進み、出現点を1つ飛ばしていた。出現点が2つだと、遠い方へ一度も行かずに着けない方を繰り返した）
@@ -609,15 +664,7 @@ public sealed class CombatTask : AutoTask
         }
 
         var spot = this.spots[this.spotIndex];
-        var world = MapCoords.ToWorld(this.territory, spot.X, spot.Y);
-        // 出現点の床：今の高さの近く → 少し上から下へ → 地図の上（高さ 1024）から下へ（vnavmesh が地図の旗から床を求めるのと同じ）。
-        // 今の高さだけに頼らない（不具合の例：アジス・ラーで島の 500m 下まで降りてしまい、どの出現点も「床が無い」として
-        // 表示も移動も無いまま毎フレーム飛ばし続け、3分以上止まった）
-        // 行き先は、本来の地面とつながっている床の点だけから選ぶ（vnavmesh で行けない場所は分かる。
-        // 以前は岩の上・物の中など、たどり着けない床の点も選び、経路を探し続けて止まった）
-        var onFloor = ctx.Navmesh.NearestPointReachable(new Vector3(world.X, Me.Position.Y, world.Z), 10f, 300f)
-                      ?? ctx.Navmesh.PointOnFloor(new Vector3(world.X, Me.Position.Y + 100f, world.Z), false, 10f)
-                      ?? ctx.Navmesh.PointOnFloor(new Vector3(world.X, 1024f, world.Z), false, 10f);
+        var onFloor = this.SpotFloor(ctx, this.spotIndex);
         if (onFloor == null)
         {
             // 床が見つからない出現点は飛ばす。続けて全部の出現点で見つからなければ、回り続けずに止める
@@ -645,14 +692,86 @@ public sealed class CombatTask : AutoTask
 
             this.lastInPlaceAt = DateTime.UtcNow;
             this.spotArrivedAt = DateTime.UtcNow;
+            this.CountVisit(ctx, this.spotIndex);
             return TaskResult.Running;
         }
 
         // 出現点の巡回は、近い点へ順に回るので1回の移動が短い（50m 前後）。60m 未満は歩く決まりのままだと、ずっと歩いた
         // （不具合の例：高地ドラヴァニアで、倒した後は徒歩で次の出現点へ向かい、マウントに乗らなかった）。15m を超えれば乗って飛ぶ
-        this.moving = new MoveToTask(onFloor.Value, 8f, $"出現点 {spot.X:0.0},{spot.Y:0.0}", TimeSpan.FromMinutes(3), mountOver: PatrolMountOver);
+        this.StartPatrolMove(onFloor.Value);
         this.spotArrivedAt = DateTime.MinValue;
         return TaskResult.Running;
+    }
+
+    /// <summary>
+    /// 出現点の床：今の高さの近く → 少し上から下へ → 地図の上（高さ 1024）から下へ（vnavmesh が地図の旗から床を求めるのと同じ）。
+    /// 今の高さだけに頼らない（不具合の例：アジス・ラーで島の 500m 下まで降りてしまい、どの出現点も「床が無い」として
+    /// 表示も移動も無いまま毎フレーム飛ばし続け、3分以上止まった）
+    /// 行き先は、本来の地面とつながっている床の点だけから選ぶ（vnavmesh で行けない場所は分かる。
+    /// 以前は岩の上・物の中など、たどり着けない床の点も選び、経路を探し続けて止まった）
+    /// </summary>
+    private Vector3? SpotFloor(TaskContext ctx, int index)
+    {
+        var spot = this.spots[index];
+        var world = MapCoords.ToWorld(this.territory, spot.X, spot.Y);
+        return ctx.Navmesh.NearestPointReachable(new Vector3(world.X, Me.Position.Y, world.Z), 10f, 300f)
+               ?? ctx.Navmesh.PointOnFloor(new Vector3(world.X, Me.Position.Y + 100f, world.Z), false, 10f)
+               ?? ctx.Navmesh.PointOnFloor(new Vector3(world.X, 1024f, world.Z), false, 10f);
+    }
+
+    /// <summary>
+    /// 出現点へ向かう移動を始める。飛べる状態（乗っていて飛べるエリア）なら、床の 12m 上を行き先にして高さを保つ
+    /// （以前は点ごとに地面まで下りて飛び上がり直すので、かくかく動いた。敵を見つけたら Engagement が降りる場所を決める）。
+    /// 乗っていなければ床を行き先にする（歩く経路は空中の点へ引けない。乗って飛ぶかは MoveToTask が決める）
+    /// </summary>
+    private void StartPatrolMove(Vector3 floor)
+    {
+        var spot = this.spots[this.spotIndex];
+        var dest = GameUi.Mounted && MoveToTask.CanFlyHere() ? floor + new Vector3(0, PatrolAltitude, 0) : floor;
+        this.moving = new MoveToTask(dest, 8f, $"出現点 {spot.X:0.0},{spot.Y:0.0}", TimeSpan.FromMinutes(3), mountOver: PatrolMountOver);
+        this.movingTo = dest;
+        this.visitCounted = false;
+    }
+
+    /// <summary>
+    /// 目当ての敵（FATE の個体を除く。死体も含む＝そこに出る証拠）がいるかを1秒に1回見て、見かけた敵を覚える。一度でも見かけた敵は、
+    /// ここに出るので回るのをやめない（倒し切って湧き直しを待つ間に見えなくなっても、従来どおり見回って待つ）。
+    /// </summary>
+    private void NoteSeen(HashSet<uint> wanted)
+    {
+        if (DateTime.UtcNow - this.seenCheckAt < TimeSpan.FromSeconds(1))
+            return;
+        this.seenCheckAt = DateTime.UtcNow;
+        // 回るのをやめた敵も見る（出現のデータが古いだけで、あとで現れたら、また狙う）
+        var all = this.needs.Where(n => Inventory.CountNow(n.ItemId) < n.TargetOwned).SelectMany(n => n.Mobs).ToHashSet();
+        foreach (var o in Svc.Objects.OfType<IBattleNpc>().Where(o => o.BattleNpcKind == BattleNpcSubKind.Combatant && all.Contains(o.NameId) && !IsFateMob(o)))
+        {
+            this.seenMobs.Add(o.NameId);
+            if (this.droppedMobs.Remove(o.NameId))
+                Core.DebugLog.Current?.Line("戦闘", $"回るのをやめていた {o.Name.TextValue} を見かけたので、また狙います");
+        }
+    }
+
+    /// <summary>
+    /// 出現点を1つ回った（着いた・通り抜けた）。この戦闘でその点の敵を一度も見かけないまま、その敵の出現点を <see cref="GiveUpLaps"/> 周回ったら、
+    /// その敵の点はもう回らない（FATE の取り巻き・出現に条件がある・データが古い等。実機での確認：東ザナラーンでは、
+    /// アルドゴートの粗皮を落とす敵のうち、ミオトラグス・ナニーとビリーのほかはいない）。落とす敵がどれも残らなければ、次のフレームの始めで
+    /// 「どれも見かけない」として終わる（集めきれなかった品は呼び出し側が次の手段にする）。
+    /// </summary>
+    private void CountVisit(TaskContext ctx, int index)
+    {
+        var mob = this.spotMobs[index];
+        if (this.seenMobs.Contains(mob) || this.droppedMobs.Contains(mob))
+            return;
+        var visits = this.unseenVisits[mob] = this.unseenVisits.GetValueOrDefault(mob) + 1;
+        var points = Enumerable.Range(0, this.spots.Count).Count(i => this.spotMobs[i] == mob);
+        if (visits < points * GiveUpLaps)
+            return;
+
+        this.droppedMobs.Add(mob);
+        var name = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.BNpcName>().TryGetRow(mob, out var row) ? row.Singular.ExtractText() : $"モンスター {mob}";
+        ctx.Log.Warn("戦闘", $"{TeleportTask.TerritoryName(this.territory)}：{name} は出現点を {GiveUpLaps} 周（{visits} か所）回っても一度も見かけないので、"
+                           + "この敵の出現点はもう回りません（FATE の敵・出現に条件がある・出現のデータが古い等）");
     }
 
     /// <summary>
@@ -824,7 +943,7 @@ public static class CombatPlanner
     public static bool HasReachableSpawn(SourceIndex sources, uint itemId)
     {
         var unlocked = Svc.Aetherytes.Select(a => a.AetheryteId).ToHashSet();
-        return sources.Get(itemId).DropMobs.Any(m => sources.SpawnsOf(m).Any(s => IsReachable(s.Territory, unlocked)));
+        return sources.Get(itemId).DropMobs.Any(m => sources.SpawnsOf(m).Any(s => IsReachable(s.Territory, unlocked) && !MobSkips.IsSkipped(s.Territory, m)));
     }
 
     public static List<(uint Territory, List<CombatNeed> Needs, List<(Vector2 Spot, uint Mob)> Spots)> Plan(
@@ -843,7 +962,8 @@ public static class CombatPlanner
             {
                 foreach (var spot in sources.SpawnsOf(mob))
                 {
-                    if (!Reachable(spot.Territory))
+                    // 利用者が「狙わない」にした敵は外す（デバッグタブのチェック。例：普段いない敵・その素材を落とさない敵）
+                    if (!Reachable(spot.Territory) || MobSkips.IsSkipped(spot.Territory, mob))
                         continue;
                     if (!byTerr.TryGetValue(spot.Territory, out var l))
                         byTerr[spot.Territory] = l = [];

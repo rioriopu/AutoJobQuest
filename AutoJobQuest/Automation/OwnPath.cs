@@ -230,6 +230,16 @@ public sealed class OwnPath
         this.followingEnd = null;
     }
 
+    /// <summary>
+    /// 探索を捨て、渡した経路は止めずに手放す（次の移動が新しい経路を渡すまで、vnavmesh はそのまま進む。見回りの点を通り抜けるとき：
+    /// 以前は点ごとに止まって飛び直すので、かくかく動いた）。
+    /// </summary>
+    public void Release()
+    {
+        this.Abandon();
+        this.followingEnd = null;
+    }
+
     private bool IsMine(INavControl nav, Vector3 end)
         => nav.IsFollowingPath() && nav.LastWaypoint() is { } w && Vector3.Distance(w, end) < 1f;
 
