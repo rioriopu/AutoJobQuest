@@ -80,7 +80,7 @@ public sealed class MoveToTask : AutoTask
     private int interruptionsAtIssue;
 
     // 自分の経路探索と追従（取り消せる）。使えないときは SimpleMove で代える
-    private readonly OwnPath path = new();
+    private readonly OwnPath path = new() { DropCutOffEnd = true };
     private bool usingSimpleMove;
     private Vector3? registeredEnd;
 

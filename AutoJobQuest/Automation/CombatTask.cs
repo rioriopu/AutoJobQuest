@@ -468,7 +468,7 @@ public sealed class CombatTask : AutoTask
             case Engagement.Result.Stalled:
                 // 最後に HP が減ってから 45 秒たった（届かない・他人が先に攻撃した等）。この個体は諦める。
                 // ハードターゲットも外す（諦めた敵を RSR が殴り続けないように）
-                ctx.Log.Warn("戦闘", $"{t.Name} の HP が 45 秒減っていないので、この個体は諦めて別の個体を探します（HP {t.CurrentHp}）");
+                ctx.Log.Warn("戦闘", $"{t.Name} {this.engage.StallReason ?? "の HP が 45 秒減っていないので"}、この個体は諦めて別の個体を探します（HP {t.CurrentHp}）");
                 this.giveUpAt[t.GameObjectId] = DateTime.UtcNow;
                 this.engage.Forget(this.world);
                 this.targetId = 0;

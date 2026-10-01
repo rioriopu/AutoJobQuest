@@ -177,7 +177,7 @@ public sealed class DefenseWatch
         switch (this.engage.Tick(this.world, rsr, nav, attacker, out status))
         {
             case Engagement.Result.Stalled:
-                log.Warn("反撃", $"{attacker.Name} の HP が 45 秒減っていないので、この敵は諦めて別の敵を狙います（HP {attacker.Hp}）");
+                log.Warn("反撃", $"{attacker.Name} {this.engage.StallReason ?? "の HP が 45 秒減っていないので"}、この敵は諦めて別の敵を狙います（HP {attacker.Hp}）");
                 this.giveUp.Add(attacker.Id);
                 this.engage.Forget(this.world);
                 this.targetId = 0;

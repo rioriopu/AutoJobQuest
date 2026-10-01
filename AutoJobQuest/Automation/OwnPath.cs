@@ -73,6 +73,12 @@ public sealed class OwnPath
     /// <summary>実際に渡した経路の終点（探索中の行き先とは分ける）。</summary>
     public Vector3? FollowingEnd => this.followingEnd;
 
+    /// <summary>歩きの経路の最後の2点がこれより離れていたら、最後の区間（壁・崖を貫く直線）を捨てる。</summary>
+    public const float DropGap = 8f;
+
+    /// <summary>途切れた歩きの経路の最後の区間を捨てるか（移動の処理と敵へ近づく処理で使う。既定は捨てない）。</summary>
+    public bool DropCutOffEnd { get; init; }
+
     /// <summary>
     /// 最後に受け取った経路の、最後の2点の隔たり（地上の経路が途中までしか引けなかった目安）。
     /// vnavmesh の地上の経路探しは、行き先にたどり着けないとき「たどり着ける範囲で一番近い所までの経路」の最後に、元の行き先をそのまま
@@ -130,7 +136,13 @@ public sealed class OwnPath
             var points = t.Result;
             if (points == null || points.Count == 0)
                 return State.NoPath;
-            this.LastGap = points.Count >= 2 ? Vector3.Distance(points[^2], points[^1]) : 0f;
+            // vnavmesh の経路は「出発点・途中の点・終点」に行き先を1点足すので必ず3点以上（届く経路なら最後の2点は同じ点）。2点以下は見ない
+            this.LastGap = points.Count >= 3 ? Vector3.Distance(points[^2], points[^1]) : 0f;
+
+            // 歩きの経路の最後が大きく途切れていたら（たどり着けない行き先）、壁・崖を貫く最後の区間は捨てて、たどり着ける一番近い所で止まる
+            // （不具合の例：崖に向かって走り込んだまま止まった）。小さな途切れ（行き先が机の向こう・台の上など）は従来どおり残す
+            if (this.DropCutOffEnd && !this.fly && this.LastGap > DropGap)
+                points = points.Take(points.Count - 1).ToList();
 
             // いまの位置より先の点だけを渡す（出発点・通り過ぎた点は捨てる）。経路から離れていたら使わない
             // 探索の間に動いていなければ、従来どおり出発点だけを捨てて渡す（出発点が navmesh の外〔台の上など〕で、経路の最初の点から

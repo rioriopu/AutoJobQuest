@@ -55,7 +55,7 @@ public sealed class Engagement
     private readonly StallWatch stall = new();
 
     // 近づく移動（取り消せる探索）。使えないときは SimpleMove で代える
-    private readonly OwnPath path = new();
+    private readonly OwnPath path = new() { DropCutOffEnd = true };
     private bool simpleApproach;
     private DateTime lastApproach = DateTime.MinValue;
     private DateTime dismountAt = DateTime.MinValue;
@@ -83,6 +83,16 @@ public sealed class Engagement
     /// <summary>最後に止まった理由（RsrFailed のとき）。</summary>
     public string Problem { get; private set; } = string.Empty;
 
+    /// <summary>諦めた理由（Stalled のとき。null なら「HP が 45 秒減っていない」）。</summary>
+    public string? StallReason { get; private set; }
+
+    /// <summary>近づく移動で、相手に 1m も近づかないままこれだけたったら、ここからは近づけないとみる。</summary>
+    public static readonly TimeSpan ApproachStuckAfter = TimeSpan.FromSeconds(8);
+
+    // 近づく移動の進み具合：一番近づいた水平の距離と、その時刻
+    private float approachClosest = float.MaxValue;
+    private DateTime approachClosestAt = DateTime.MinValue;
+
     /// <summary>狙い始める（狙い直す）。</summary>
     public void Start(ICombatWorld world, IFoe foe)
     {
@@ -91,6 +101,9 @@ public sealed class Engagement
         this.landSince = DateTime.MinValue;
         this.landBlockedAt = null;
         this.landRelocations = 0;
+        this.StallReason = null;
+        this.approachClosest = float.MaxValue;
+        this.approachClosestAt = world.Now;
     }
 
     /// <summary>待たされていた時間（画面が開いていた等）を「HP が減らない時間」に数えない。</summary>
@@ -116,6 +129,7 @@ public sealed class Engagement
         if (this.stall.Observe(t.Hp, now))
         {
             this.StopApproach(nav);
+            this.StallReason = null;
             return Result.Stalled;
         }
 
@@ -159,6 +173,7 @@ public sealed class Engagement
 
         if (wantLand)
         {
+            this.approachClosestAt = now;
             // 降りると決めたら、飛んで近づく移動を止める（動いたままだと降りる操作とぶつかる）。「降りる」はゲームが受け付けられるとき
             // （Questionable の LandExecutor と同じ：GetActionStatus が 0）だけ、0.5秒おきに送る（以前は受け付けられない
             // ときにも2秒おきに送り、「現在の状態では使用できません」で断られるたびに2秒待っていた）
@@ -236,6 +251,7 @@ public sealed class Engagement
 
         if (inReach && !world.Mounted)
         {
+            this.approachClosestAt = now;
             // 届く。自分の近づく移動は止める（キャスターは動いていると詠唱が始まらない）。あとは RSR に任せる
             this.StopApproach(nav);
             status = $"{t.Name} に攻撃が届く位置です（{dist:0.0}m。攻撃は RSR に任せています）";
@@ -245,6 +261,7 @@ public sealed class Engagement
         // 詠唱中は動かない（歩き出すとゲームが詠唱を中断する。RSR も移動中は詠唱のある魔法を撃たない）
         if (world.Casting)
         {
+            this.approachClosestAt = now;
             status = $"{t.Name} へ詠唱中です（{dist:0.0}m）";
             return Result.Running;
         }
@@ -253,6 +270,7 @@ public sealed class Engagement
         // 乗れないとき（戦闘中・乗れないエリア）は歩く
         if (!world.Mounted && flat > MountApproachDistance && world.CanMountNow)
         {
+            this.approachClosestAt = now;
             if (now - this.mountAt >= TimeSpan.FromSeconds(2))
             {
                 this.mountAt = now;
@@ -266,6 +284,44 @@ public sealed class Engagement
 
         // 乗っていて飛べるエリアなら、飛ぶ経路で近づく（地上で乗った直後でも、飛び立って向かう）
         var flyPath = world.Flying || (world.Mounted && world.CanFlyHere);
+
+        // 詰まりの判定（壁に向かって走り続けないか）。以前は HP が 45 秒減らないときだけ諦め、
+        // その間は崖の上の敵へ壁に向かって走り続けた。
+        //  ・歩きの経路が途中で途切れている（vnavmesh の地上の経路の最後の区間が壁を貫く：OwnPath.LastGap）＝歩いては行けない
+        //  ・近づく移動をしているのに、8秒たっても相手に 1m も近づかない
+        // どちらも、乗れるなら乗って飛んで近づき、乗れない（戦闘中など）なら、この個体は諦めて別の個体を探す
+        if (flat < this.approachClosest - 1f)
+        {
+            this.approachClosest = flat;
+            this.approachClosestAt = now;
+        }
+
+        var cutOff = !flyPath && this.path.Active && this.path.LastGap > 3f;
+        if (cutOff || now - this.approachClosestAt > ApproachStuckAfter)
+        {
+            if (!world.Mounted && world.CanMountNow)
+            {
+                if (now - this.mountAt >= TimeSpan.FromSeconds(2))
+                {
+                    this.mountAt = now;
+                    this.StopApproach(nav);
+                    world.Mount();
+                    this.approachClosestAt = now;
+                }
+
+                status = $"{t.Name} へは歩いて近づけないので、マウントに乗って飛んで近づきます";
+                return Result.Running;
+            }
+
+            if (!flyPath)
+            {
+                this.StopApproach(nav);
+                this.StallReason = cutOff
+                    ? $"へは歩いて行けません（vnavmesh の経路が {this.path.LastGap:0}m 手前で途切れています）。乗れないので"
+                    : $"に {ApproachStuckAfter.TotalSeconds:0}秒近づけません。乗れないので";
+                return Result.Stalled;
+            }
+        }
 
         // 届かない。近づく（止まっていれば頼む。敵が大きく動いたら頼み直す。1秒に1回まで）。
         // 飛んでいれば飛んで近づく（地上の経路では高度が下がらず、上空に浮いたまま止まった）。水平 20m 以内に来たら上で降りる
