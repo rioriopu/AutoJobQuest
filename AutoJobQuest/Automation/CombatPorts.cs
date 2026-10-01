@@ -128,6 +128,11 @@ public interface INavControl
     /// （vnavmesh の Query.Mesh.PointOnFloor）。無ければ null。既定は null。
     /// </summary>
     Vector3? PointOnFloor(Vector3 p, bool allowUnlandable, float halfExtentXZ) => null;
+
+    /// <summary>
+    /// 点の近くのメッシュ上の点のうち、本来の地面とつながっている床の点（vnavmesh の Query.Mesh.NearestPointReachable）。無ければ null。既定は null。
+    /// </summary>
+    Vector3? NearestPointReachable(Vector3 p, float halfExtentXZ, float halfExtentY) => null;
 }
 
 /// <summary>

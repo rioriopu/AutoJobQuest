@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 
 namespace AutoJobQuest.Automation;
@@ -68,6 +70,18 @@ public sealed class Engagement
     private Vector3 landProgressPos;
     private Vector3? landBlockedAt;
     private int landRelocations;
+
+    // 降りる場所の候補（飛んでいるとき。LandingCandidates）：候補・候補を作ったときの相手の位置・今の候補の番号・
+    // 今の候補に一番近づいた水平の距離とその時刻・今の候補の真上で足もとの床が見つからなくなった時刻
+    private List<Vector3>? landCandidates;
+    private Vector3 landCandidatesFor;
+    private int landIndex;
+    private float landTargetClosest = float.MaxValue;
+    private DateTime landTargetClosestAt = DateTime.MinValue;
+    private DateTime? overVoidAtTargetSince;
+
+    /// <summary>飛んで今の候補へ向かって、これだけ近づかなければ、その候補へは届かないとみて次の候補へ。</summary>
+    public static readonly TimeSpan LandTargetStuckAfter = TimeSpan.FromSeconds(6);
     private DateTime lastIpcFailure = DateTime.MinValue;
     private int ipcFailures;
 
@@ -104,6 +118,52 @@ public sealed class Engagement
         this.StallReason = null;
         this.approachClosest = float.MaxValue;
         this.approachClosestAt = world.Now;
+        this.landCandidates = null;
+    }
+
+    /// <summary>次の降りる場所の候補へ移る（今の候補へ向かった記録を消す）。</summary>
+    private void NextLandCandidate(DateTime now, string why)
+    {
+        this.landIndex++;
+        this.landTargetClosest = float.MaxValue;
+        this.landTargetClosestAt = now;
+        this.overVoidAtTargetSince = null;
+        this.landSince = DateTime.MinValue;
+        this.lastApproach = DateTime.MinValue;
+        Core.DebugLog.Current?.Line("戦闘", $"降りる場所の候補を変えます（{why}。{this.landIndex + 1}/{this.landCandidates?.Count ?? 0} 番目へ）");
+    }
+
+    /// <summary>
+    /// 飛んでいるときに降りる場所の候補（不具合の例：西ザナラーンなど物の多い場所で、相手の真下の1か所だけを狙い、
+    /// 木の枝・岩のアーチの下で飛んで届かない・物の上で降りられないまま飛び回った）。相手の真下の床と、周り 5m・10m の8方向の床のうち、
+    /// 本来の地面とつながっている床（vnavmesh：PointOnFloor の allowUnreachable=false と NearestPointReachable）で、相手の床と同じ高さ（6m 以内）のもの。
+    /// 2m 以内に重なるものは1つにし、相手に近い順に8か所まで。地図が使えなければ空。
+    /// </summary>
+    public static List<Vector3> LandingCandidates(INavControl nav, Vector3 foe)
+    {
+        var list = new List<Vector3>();
+        if (!nav.IsReady())
+            return list;
+        var baseY = nav.PointOnFloor(foe + new Vector3(0, 2f, 0), true, 2f)?.Y ?? foe.Y;
+
+        void Add(Vector3? p)
+        {
+            if (p is { } v && MathF.Abs(v.Y - baseY) <= 6f && list.TrueForAll(x => Vector3.Distance(x, v) > 2f))
+                list.Add(v);
+        }
+
+        Add(nav.PointOnFloor(foe + new Vector3(0, 2f, 0), false, 3f));
+        foreach (var r in new[] { 5f, 10f })
+        {
+            for (var k = 0; k < 8; k++)
+            {
+                var a = 2f * MathF.PI * k / 8;
+                Add(nav.NearestPointReachable(new Vector3(foe.X + (MathF.Cos(a) * r), baseY, foe.Z + (MathF.Sin(a) * r)), 2f, 6f));
+            }
+        }
+
+        var f2 = new Vector2(foe.X, foe.Z);
+        return list.OrderBy(p => Vector2.Distance(new Vector2(p.X, p.Z), f2)).Take(8).ToList();
     }
 
     /// <summary>待たされていた時間（画面が開いていた等）を「HP が減らない時間」に数えない。</summary>
@@ -154,12 +214,63 @@ public sealed class Engagement
         // （PointOnFloor の allowUnreachable=false。岩の上など、つながっていない孤立した面は外れる。vnavmesh で物や地形の構造を把握して、
         // 不安定な動きを避ける）。その点へ飛び、着いたら（水平 2.5m）降りる。
         // 地図が使えない・点が無いときは、相手から水平 8m 以内で降りる
-        var landAt = world.Mounted && world.Flying ? LandingPoint(nav, t.Position) : null;
+        // 候補は複数（LandingCandidates）。相手が 6m 以上動いたら作り直す。候補へ飛んで 6秒近づけない・候補の真上で足もとの床が 3秒見つからない・
+        // 降りる操作が効かない（下）ときは次の候補へ。全部だめならこの個体を諦める（以前は1か所だけを狙い、45秒たつまで飛び回った）
+        Vector3? landAt = null;
+        if (world.Mounted && world.Flying)
+        {
+            if (this.landCandidates == null || Vector3.Distance(this.landCandidatesFor, t.Position) > 6f)
+            {
+                this.landCandidates = LandingCandidates(nav, t.Position);
+                this.landCandidatesFor = t.Position;
+                this.landIndex = 0;
+                this.landTargetClosest = float.MaxValue;
+                this.landTargetClosestAt = now;
+                this.overVoidAtTargetSince = null;
+            }
+
+            if (this.landCandidates.Count > 0)
+            {
+                if (this.landIndex >= this.landCandidates.Count)
+                {
+                    this.StopApproach(nav);
+                    this.StallReason = $"の近くに降りられる場所が見つかりません（vnavmesh の床の候補 {this.landCandidates.Count} か所のどこにも、飛んで届かないか降りられませんでした）。";
+                    return Result.Stalled;
+                }
+
+                landAt = this.landCandidates[this.landIndex];
+                var toLand = Vector2.Distance(new Vector2(world.MyPosition.X, world.MyPosition.Z), new Vector2(landAt.Value.X, landAt.Value.Z));
+                if (toLand < this.landTargetClosest - 1f)
+                {
+                    this.landTargetClosest = toLand;
+                    this.landTargetClosestAt = now;
+                }
+
+                if (toLand > 2.5f && now - this.landTargetClosestAt > LandTargetStuckAfter)
+                    this.NextLandCandidate(now, $"飛んで {LandTargetStuckAfter.TotalSeconds:0}秒近づけません（あと水平 {toLand:0.0}m）");
+                else if (toLand <= 2.5f && overVoid)
+                {
+                    this.overVoidAtTargetSince ??= now;
+                    if (now - this.overVoidAtTargetSince.Value > TimeSpan.FromSeconds(3))
+                        this.NextLandCandidate(now, "真上に来ても足もとに床が見つかりません");
+                }
+                else
+                {
+                    this.overVoidAtTargetSince = null;
+                }
+
+                landAt = this.landIndex < this.landCandidates.Count ? this.landCandidates[this.landIndex] : null;
+            }
+        }
+
         var overLanding = landAt is { } la
             ? Vector2.Distance(new Vector2(world.MyPosition.X, world.MyPosition.Z), new Vector2(la.X, la.Z)) <= 2.5f
             : flat <= FlyingLandDistance;
+        var haveCandidates = world.Flying && this.landCandidates is { Count: > 0 };
         var wantLand = world.Mounted && !overVoid
-                       && (world.Flying ? overLanding || (near && !nav.IsMoving() && this.lastApproach != DateTime.MinValue) : near);
+                       && (world.Flying
+                           ? overLanding || (!haveCandidates && near && !nav.IsMoving() && this.lastApproach != DateTime.MinValue)
+                           : near);
 
         // 降りられなかった場所から動いている間は降りない。相手のそば（水平 3m）に着いたか、離れて（5m）止まったら降り直す
         if (this.landBlockedAt is { } blocked)
@@ -191,6 +302,14 @@ public sealed class Engagement
             {
                 this.landProgressAt = now;
                 this.landProgressPos = world.MyPosition;
+            }
+            else if (now - this.landProgressAt >= LandStuckAfter && this.landCandidates is { Count: > 0 } && world.Flying
+                     && (this.dismountAt >= this.landSince || now - this.landSince >= TimeSpan.FromSeconds(5)))
+            {
+                // 候補があれば、次の候補へ（同じ場所へ飛び直しても降りられない）
+                this.NextLandCandidate(now, "降りる操作を送っても位置が動きません（物の上など）");
+                status = $"{t.Name} の近くですが、ここでは降りられないので、別の降りる場所へ移ります（{this.landIndex + 1}/{this.landCandidates.Count} 番目）";
+                return Result.Running;
             }
             else if (now - this.landProgressAt >= LandStuckAfter && this.landRelocations < LandRelocationLimit
                      && (this.dismountAt >= this.landSince || now - this.landSince >= TimeSpan.FromSeconds(5)))
@@ -355,17 +474,6 @@ public sealed class Engagement
                 ? $"{t.Name} に近づいています（{dist:0.0}m・{(code == 562 ? "見えない位置" : "射程外")}）"
                 : $"{t.Name} に近づいています（{dist:0.0}m）";
         return Result.Running;
-    }
-
-    /// <summary>
-    /// 飛んでいるときに降りる場所：相手の真下（水平 3m 以内）の床のうち、本来の地面とつながっている床（vnavmesh の PointOnFloor で
-    /// allowUnreachable=false）。相手の高さから下 20m・上 5m に無ければ null（浮いている敵の下に別の床しか無いなど）。地図が使えなければ null。
-    /// </summary>
-    public static Vector3? LandingPoint(INavControl nav, Vector3 foe)
-    {
-        if (!nav.IsReady())
-            return null;
-        return nav.PointOnFloor(foe + new Vector3(0, 2f, 0), false, 3f) is { } p && p.Y >= foe.Y - 20f && p.Y <= foe.Y + 5f ? p : null;
     }
 
     /// <summary>
