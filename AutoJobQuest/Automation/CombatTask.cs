@@ -71,6 +71,21 @@ public sealed class CombatTask : AutoTask
     /// <summary>見回りの点の、出現点からの距離（地図座標。1.0＝ワールドで 50m）。</summary>
     public const float RoamRadiusMap = 1.2f;
 
+    /// <summary>目当ての敵を探す範囲（自分からの距離）。</summary>
+    public const float SearchRange = 60f;
+
+    /// <summary>見回りを止める、他のプレイヤーとの水平の距離（これより近くに来たら、その場で止まって待つ）。</summary>
+    public const float OtherPlayerStopDistance = 50f;
+
+    /// <summary>止まった後、他のプレイヤーが全員これより離れたら見回りを続ける（境目で止まる・動くを繰り返さないように、止める距離より広い）。</summary>
+    public const float OtherPlayerResumeDistance = 70f;
+
+    /// <summary>他のプレイヤーがいて止まっている間に目当ての敵を探す範囲（動いていないので、ふだんより広く見る）。</summary>
+    public const float WaitingSearchRange = 150f;
+
+    // 他のプレイヤーが近くにいて、見回りを止めて待ち始めた時刻（待っていなければ MinValue）
+    private DateTime playersWaitSince = DateTime.MinValue;
+
     // 見かけた目当ての敵の位置を記録した時刻（2秒に1回まで）
     private DateTime sightedAt = DateTime.MinValue;
 
@@ -504,7 +519,7 @@ public sealed class CombatTask : AutoTask
         // 3) 指定のモンスターを探す
         this.RecordSightings(wanted);
         this.NoteSeen(wanted);
-        var mob = FindMob(wanted, this.giveUp);
+        var mob = FindMob(wanted, this.giveUp, this.playersWaitSince != DateTime.MinValue ? WaitingSearchRange : SearchRange);
         if (mob != null)
         {
             this.CancelMove(ctx);
@@ -609,6 +624,11 @@ public sealed class CombatTask : AutoTask
     {
         // Henched はハードターゲットしか殴らないので、出現点を回る間は入れたままでよい
         // （止めたり入れたりを繰り返すと、RSR の切り替え表示がチャットにあふれる）
+
+        // 他のプレイヤーが近くにいる間は、見回りを止めてその場で待つ（アーリマンの翼のように敵の少ない所では、
+        // 見回りでかなりうろうろするので、そばに人が来ると怪しまれる。目当ての敵が見えたら、この前の FindMob が見つけて倒しに行く）
+        if (this.WaitForPlayers(ctx))
+            return TaskResult.Running;
 
         if (this.moving != null)
         {
@@ -822,6 +842,61 @@ public sealed class CombatTask : AutoTask
     public static (int Index, DateTime ArrivedAt) SpotAfterMove(int index, int count, bool failed, DateTime now)
         => failed ? ((index + 1) % count, DateTime.MinValue) : (index, now);
 
+    /// <summary>
+    /// 他のプレイヤー（自分・パーティ・アライアンスの人を除く）が近くにいれば、見回りの移動を止めて待つ（true）。止めるのは水平 50m 以内に来たとき、
+    /// 続けるのは全員が 70m より離れたとき。レストエリアの中（テレポで着いたキャンプ等）では止めない（人がいるのが普通で、待っても敵は来ない）。
+    /// 待つ長さの上限はこの戦闘の制限時間（それを過ぎたら、集めきれなかった品は次の手段にする）。
+    /// </summary>
+    private bool WaitForPlayers(TaskContext ctx)
+    {
+        var waiting = this.playersWaitSince != DateTime.MinValue;
+        var (count, nearest) = OtherPlayersWithin(waiting ? OtherPlayerResumeDistance : OtherPlayerStopDistance);
+        if (count == 0 || InRestArea())
+        {
+            if (waiting)
+            {
+                ctx.Log.Write("戦闘", $"近くの他のプレイヤーが離れたので、見回りを続けます（{(DateTime.UtcNow - this.playersWaitSince).TotalSeconds:0} 秒待ちました）");
+                this.playersWaitSince = DateTime.MinValue;
+            }
+
+            return false;
+        }
+
+        if (!waiting)
+        {
+            this.playersWaitSince = DateTime.UtcNow;
+            this.CancelMove(ctx);
+            ctx.Log.Write("戦闘", $"近くに他のプレイヤーが {count} 人（いちばん近い人まで水平 {nearest:0}m）いるので、見回りを止めてその場で待ちます"
+                                 + $"（目当ての敵が {WaitingSearchRange:0}m 以内に見えたら倒しに行きます）");
+        }
+
+        this.Status = $"近くに他のプレイヤーが {count} 人いるので、見回りを止めて待っています（目当ての敵が見えたら倒しに行きます。"
+                      + $"{(DateTime.UtcNow - this.playersWaitSince).TotalSeconds:0} 秒）";
+        return true;
+    }
+
+    /// <summary>自分・パーティ・アライアンスの人を除く他のプレイヤーのうち、水平の距離が <paramref name="range"/> 以内の人数と、いちばん近い人の距離。</summary>
+    private static (int Count, float Nearest) OtherPlayersWithin(float range)
+    {
+        var me = Svc.Objects.LocalPlayer;
+        if (me == null)
+            return (0, 0f);
+        var at = new Vector2(me.Position.X, me.Position.Z);
+        var near = Svc.Objects.OfType<Dalamud.Game.ClientState.Objects.SubKinds.IPlayerCharacter>()
+            .Where(p => p.GameObjectId != me.GameObjectId && (p.StatusFlags & (StatusFlags.PartyMember | StatusFlags.AllianceMember)) == 0)
+            .Select(p => Vector2.Distance(at, new Vector2(p.Position.X, p.Position.Z)))
+            .Where(d => d <= range)
+            .ToList();
+        return (near.Count, near.Count == 0 ? 0f : near.Min());
+    }
+
+    /// <summary>レストエリアの中か（ゲームの TerritoryInfo.InSanctuary）。</summary>
+    private static unsafe bool InRestArea()
+    {
+        var info = FFXIVClientStructs.FFXIV.Client.Game.UI.TerritoryInfo.Instance();
+        return info != null && info->InSanctuary;
+    }
+
     private void CancelMove(TaskContext ctx)
     {
         if (this.moving == null)
@@ -897,7 +972,7 @@ public sealed class CombatTask : AutoTask
     }
 
     /// <summary>近くの指定モンスター（生きている・ターゲットできる・他人と戦っていない・FATE の敵でない）。</summary>
-    private static IBattleNpc? FindMob(HashSet<uint> wanted, HashSet<ulong> giveUp)
+    private static IBattleNpc? FindMob(HashSet<uint> wanted, HashSet<ulong> giveUp, float range)
     {
         var meId = Svc.Objects.LocalPlayer?.GameObjectId ?? 0;
         return Svc.Objects
@@ -905,7 +980,7 @@ public sealed class CombatTask : AutoTask
             .Where(o => o.BattleNpcKind == BattleNpcSubKind.Combatant && wanted.Contains(o.NameId) && IsAlive(o) && !giveUp.Contains(o.GameObjectId))
             .Where(o => !o.StatusFlags.HasFlag(StatusFlags.InCombat) || o.TargetObjectId == meId)
             .Where(o => !IsFateMob(o))
-            .Where(o => Vector3.Distance(o.Position, Me.Position) < 60f)
+            .Where(o => Vector3.Distance(o.Position, Me.Position) < range)
             .OrderBy(o => Vector3.Distance(o.Position, Me.Position))
             .FirstOrDefault();
     }
