@@ -172,6 +172,23 @@ public sealed class CraftOneTask : AutoTask
     private bool failureStopRequested;
     private DateTime? idleSince;
 
+    // 装備品の素材の選択（GearIngredients）：選ぶ欄（欄の番号・品）・済んだか・最後に操作した時刻・試した回数・レシピを開いた時刻
+    private List<(int Slot, uint Item)>? gearSlots;
+    private bool gearDone;
+    private DateTime gearActAt = DateTime.MinValue;
+    private int gearTries;
+    private DateTime gearNoteAt = DateTime.MinValue;
+
+    // 簡易製作：簡易製作で作るか・職を合わせる下請け（装備品の素材を選ぶ前にも使う）・最後に操作した時刻・レシピを開いた時刻・試した回数・
+    // 最後に数が増えた時刻と数
+    private bool quick;
+    private AutoTask? jobSub;
+    private DateTime quickActAt = DateTime.MinValue;
+    private DateTime noteOpenedAt = DateTime.MinValue;
+    private int quickTries;
+    private DateTime quickProgressAt = DateTime.MinValue;
+    private int quickProgressMade = -1;
+
     /// <summary>製作に失敗したときに、自分だけに見えるチャットへ出す文。</summary>
     public const string FailureChat = "製作に失敗したので、装備品や食事、スキル回し等を見直して下さい";
 
@@ -230,6 +247,14 @@ public sealed class CraftOneTask : AutoTask
 
         // 材料が足りるかを先に確かめる（足りないまま頼むと Artisan は材料切れで止まるだけ）
         this.recipe = Svc.Data.GetExcelSheet<Recipe>().GetRow(this.craft.RecipeId);
+
+        // NQ でよい品は簡易製作で作る。HQ が要る完成品とその中間素材・収集品は通常の製作（Artisan）。
+        // 簡易製作はゲームの決まりで、簡易製作のできるレシピを一度でも作ったことがあるときだけ（Artisan の判定と同じ）
+        this.quick = !this.craft.WantHq && !this.craft.HqChain && !this.collectable && this.recipe.CanQuickSynth
+                     && !this.recipe.Ingredient.Any(x => x.RowId != 0 && Svc.Data.GetExcelSheet<Item>().TryGetRow(x.RowId, out var gearItem) && gearItem.EquipSlotCategory.RowId != 0)
+                     && GameMemory.IsRecipeComplete(this.craft.RecipeId);
+        if (this.quick)
+            ctx.Log.Write("製作", $"{CraftPlanner.ItemName(this.craft.ItemId)} は NQ でよいので、簡易製作で {this.craft.Crafts} 回作ります");
         foreach (var (ing, amount) in CraftPlanner.Ingredients(this.recipe))
         {
             var have = inv.CountAll(ing);
@@ -243,6 +268,9 @@ public sealed class CraftOneTask : AutoTask
 
     protected override TaskResult Tick(TaskContext ctx)
     {
+        if (this.quick)
+            return this.TickQuick(ctx);
+
         var busy = ctx.Artisan.IsBusy();
 
         if (!this.requested)
@@ -274,6 +302,12 @@ public sealed class CraftOneTask : AutoTask
                     return this.Fail($"Artisan に「この製作では食事・薬を使わない」を頼めませんでした（高価な消耗品を使わないよう、製作を始めません）: {string.Join(" / ", ctx.Artisan.LastErrors.Values)}");
                 this.consumablesDisabled = true;
             }
+
+            // 装備品の素材（製作手帳で「未選択」になる欄）は、Artisan に頼む前にこちらで選ぶ（不具合の例：ハードレザーグリモアDX で、
+            // Artisan 4.0.5.212 が欄のボタンを押す部品で「Unable to cast object of type 'ReceiveEvent' to type 'ReceiveEventDelegate'」となり、
+            // 選ぶ小窓が開かず製作を始められなかった）
+            if (this.SelectGearIngredients(ctx) is { } gear)
+                return gear;
 
             if (!ctx.Artisan.CraftItem((ushort)this.craft.RecipeId, this.requestCrafts))
                 return this.Fail($"Artisan に製作を頼めませんでした: {string.Join(" / ", ctx.Artisan.LastErrors.Values)}");
@@ -395,6 +429,10 @@ public sealed class CraftOneTask : AutoTask
             this.requestCrafts = resume;
             this.requested = false;
             this.sawBusy = false;
+
+            // 装備品の素材は1回ごとに使うので、頼み直す前に欄を見直す（選ばれていれば、そのまま頼む）
+            this.gearDone = false;
+            this.gearTries = 0;
             ctx.Log.Write("製作", $"{CraftPlanner.ItemName(this.craft.ItemId)} の連続製作が {nowCount - this.beforeAll}/{this.expected} 個で止まったので、"
                                  + $"残り {resume} 回を頼み直します（Artisan の「NQ ができたら止める」等の設定で止まることがある）");
             this.NextPhase("残りの製作を Artisan に頼み直します");
@@ -442,8 +480,249 @@ public sealed class CraftOneTask : AutoTask
     private int CountMade(Inventory inv)
         => this.collectable ? Inventory.CountCollectables(this.craft.ItemId, 0) : inv.CountAll(this.craft.ItemId);
 
+    /// <summary>
+    /// 装備品の素材を選ぶ。選び終えた（または選ぶ欄が無い）なら null、途中なら Running、選べなければ Failed。
+    /// 手順は Artisan の SetIngredients と同じ：製作手帳にこのレシピを出し、未選択の欄の「選ぶ」ボタンを押し、開いた候補の小窓（ContextIconMenu）に
+    /// （0, 0, 0, 品の番号, 型の無い値）を送る。ボタンはこちらの押し方（ボタン自身のイベントを送る：確認窓の「はい」と同じ）で押す。
+    /// 欄が埋まったか（未選択の印が消えたか）で確かめる。6回試して選べなければ、手で選んでもらう。
+    /// </summary>
+    private unsafe TaskResult? SelectGearIngredients(TaskContext ctx)
+    {
+        if (this.gearDone)
+            return null;
+
+        // 素材の欄の並び（製作手帳の欄 i は、レシピの素材の i 番目：Artisan の SetIngredients と同じ元の並び。クリスタルは 7・8 番目で欄に無い）と、装備品の素材
+        this.gearSlots ??= this.recipe.Ingredient.Take(6)
+            .Select((x, n) => (Slot: n, Item: x.RowId))
+            .Where(x => x.Item != 0 && !Inventory.IsCrystalItem(x.Item)
+                        && Svc.Data.GetExcelSheet<Item>().TryGetRow(x.Item, out var it) && it.EquipSlotCategory.RowId != 0)
+            .ToList();
+        if (this.gearSlots.Count == 0)
+        {
+            this.gearDone = true;
+            return null;
+        }
+
+        // 職を先に合わせる（職が違うと Artisan が頼まれてから着替え、そのとき製作の構えを解いて製作手帳が閉じるので、選んだ素材が外れる）
+        if (this.AlignJob(ctx, out var jobFailed) is { } aligning)
+            return aligning;
+        if (jobFailed != null)
+            return this.Fail($"装備品の素材を選ぶ前に、職を合わせられませんでした（{jobFailed}）");
+
+        var now = DateTime.UtcNow;
+        if (this.gearTries > 6)
+            return this.Fail($"{CraftPlanner.ItemName(this.craft.ItemId)} の素材の装備品（{string.Join("、", this.gearSlots.Select(g => CraftPlanner.ItemName(g.Item)))}）を自動で選べませんでした。"
+                             + "製作手帳でこのレシピを開き、「未選択」の欄でその品を選んでから「ジョブクエ開始」を押してください（続きから進みます）");
+
+        // 製作手帳にこのレシピを出す
+        if (!GameUi.IsReady("RecipeNote", out var note) || QuickSelectedRecipeId() != this.craft.RecipeId)
+        {
+            if (now - this.gearNoteAt >= TimeSpan.FromSeconds(2))
+            {
+                this.gearNoteAt = now;
+                FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentRecipeNote.Instance()->OpenRecipeByRecipeId(this.craft.RecipeId);
+            }
+
+            this.Status = "装備品の素材を選ぶため、製作手帳を開いています";
+            return TaskResult.Running;
+        }
+
+        var open = this.gearSlots.FirstOrDefault(g => GameUi.RecipeSlotUnselected(note, g.Slot));
+        if (open.Item == 0)
+        {
+            this.gearDone = true;
+            ctx.Log.Write("製作", $"装備品の素材を選びました：{string.Join("、", this.gearSlots.Select(g => CraftPlanner.ItemName(g.Item)))}（Artisan に製作を頼みます）");
+            return null;
+        }
+
+        if (now - this.gearActAt < TimeSpan.FromSeconds(1))
+            return TaskResult.Running;
+        this.gearActAt = now;
+
+        // 候補の小窓が開いていれば品を選ぶ。開いていなければ、欄の「選ぶ」ボタンを押す
+        if (GameUi.IsReady("ContextIconMenu", out var menu))
+        {
+            GameUi.Fire(menu, true, 0, 0, 0, open.Item, null!);
+            ctx.Log.Debug("製作", $"素材の欄 {open.Slot + 1} の候補から {CraftPlanner.ItemName(open.Item)} を選びました");
+        }
+        else
+        {
+            this.gearTries++;
+            GameUi.ClickRecipeSlotSelect(note, open.Slot);
+        }
+
+        this.Status = $"装備品の素材（{CraftPlanner.ItemName(open.Item)}）を選んでいます";
+        return TaskResult.Running;
+    }
+
+    /// <summary>製作手帳で選ばれているレシピ（読めなければ 0）。</summary>
+    private static unsafe uint QuickSelectedRecipeId()
+    {
+        var rn = FFXIVClientStructs.FFXIV.Client.Game.UI.RecipeNote.Instance();
+        if (rn == null || rn->RecipeList == null)
+            return 0;
+        var data = rn->RecipeList;
+        return data->Recipes != null && data->SelectedIndex < data->RecipeCount ? data->Recipes[data->SelectedIndex].RecipeId : 0u;
+    }
+
+    /// <summary>
+    /// 簡易製作で作る（このプラグインが自分で行う。Artisan には品目ごとに簡易製作を頼む手段が無い：IPC に無く、全体の設定だけ）。
+    /// 手順は Artisan の Operations.QuickSynthItem と同じ：レシピノートにこのレシピを出し、選ばれているのがこのレシピだと確かめてから
+    /// 「簡易製作」（コールバック 9）を押し、回数の窓（SynthesisSimpleDialog）に回数を入れて始める。進み具合の窓（SynthesisSimple）は、
+    /// 作り終えたら閉じる（コールバック -1）。30秒数が増えなければ、または始められなければ、残りを通常の製作（Artisan）に切り替える。
+    /// </summary>
+    private unsafe TaskResult TickQuick(TaskContext ctx)
+    {
+        var now = DateTime.UtcNow;
+        var inv = Inventory.Snapshot();
+        var made = this.CountMade(inv) - this.beforeAll;
+
+        if (made >= this.expected)
+        {
+            if (GameUi.IsReady("SynthesisSimple", out var done))
+                GameUi.Fire(done, true, -1);
+            this.Made = made;
+            this.MadeHq = Math.Max(0, inv.CountHq(this.craft.ItemId) - this.beforeHq);
+            this.Finished = true;
+            ctx.Log.Write("製作", $"{CraftPlanner.ItemName(this.craft.ItemId)} を簡易製作で作りました（{made}/{this.expected} 個）");
+            return TaskResult.Done;
+        }
+
+        // 簡易製作でも失敗すると材料を失う。通常の製作と同じく、失敗に見えるのが1秒続いたら、残りを中止して（進み具合の窓に -1：
+        // Artisan の CloseQuickSynthWindow と同じ）止まり、チャットに知らせる
+        if (this.FailedSoFar(inv, inProgress: GameUi.IsVisible("SynthesisSimple")) > 0)
+        {
+            this.failureSeenAt ??= now;
+            if (now - this.failureSeenAt.Value >= TimeSpan.FromSeconds(1))
+            {
+                if (GameUi.IsReady("SynthesisSimple", out var failWin))
+                    GameUi.Fire(failWin, true, -1);
+                Svc.Chat.Print($"[AutoJobQuest] {FailureChat}（{CraftPlanner.ItemName(this.craft.ItemId)}）");
+                return this.Fail($"{CraftPlanner.ItemName(this.craft.ItemId)} の簡易製作に失敗しました（材料を失っています）。"
+                                 + "装備品や食事等を見直してから、もう一度開始してください（続きから進みます）");
+            }
+        }
+        else
+        {
+            this.failureSeenAt = null;
+        }
+
+        if (this.AlignJob(ctx, out var jobFailed) is { } aligning)
+            return aligning;
+        if (jobFailed != null)
+            return this.QuickFallback(ctx, $"職を合わせられませんでした（{jobFailed}）");
+
+        // 進み具合の窓が出ている間は待つ。30秒数が増えなければ、通常の製作に切り替える
+        if (GameUi.IsVisible("SynthesisSimple"))
+        {
+            if (made != this.quickProgressMade)
+            {
+                this.quickProgressMade = made;
+                this.quickProgressAt = now;
+            }
+
+            if (now - this.quickProgressAt > TimeSpan.FromSeconds(30))
+            {
+                if (GameUi.IsReady("SynthesisSimple", out var stuck))
+                    GameUi.Fire(stuck, true, -1);
+                return this.QuickFallback(ctx, "30秒たっても数が増えません");
+            }
+
+            this.Status = $"簡易製作中（{Math.Max(0, made)}/{this.expected} 個）";
+            return TaskResult.Running;
+        }
+
+        // 回数の窓が出ていれば、残りの回数（99回まで）を入れて始める
+        if (GameUi.IsReady("SynthesisSimpleDialog", out var dialog))
+        {
+            if (now - this.quickActAt >= TimeSpan.FromSeconds(1))
+            {
+                this.quickActAt = now;
+                var remaining = Math.Min(99, (this.expected - Math.Max(0, made) + this.craft.Yield - 1) / this.craft.Yield);
+                GameUi.Fire(dialog, true, remaining, true, true);
+                this.quickProgressMade = made;
+                this.quickProgressAt = now;
+                ctx.Log.Debug("製作", $"簡易製作の回数 {remaining} 回を入れて始めました");
+            }
+
+            this.Status = "簡易製作を始めています";
+            return TaskResult.Running;
+        }
+
+        if (this.quickTries > 8)
+            return this.QuickFallback(ctx, "レシピノートから簡易製作を始められませんでした");
+
+        // レシピノートにこのレシピが選ばれていれば「簡易製作」を押す。でなければ、このレシピを開く
+        if (GameUi.IsReady("RecipeNote", out var note) && QuickSelectedRecipeId() == this.craft.RecipeId && now - this.noteOpenedAt > TimeSpan.FromSeconds(0.5))
+        {
+            if (now - this.quickActAt >= TimeSpan.FromSeconds(1.5))
+            {
+                this.quickActAt = now;
+                this.quickTries++;
+                GameUi.Fire(note, true, 9);
+            }
+        }
+        else if (now - this.quickActAt >= TimeSpan.FromSeconds(2))
+        {
+            this.quickActAt = now;
+            this.noteOpenedAt = now;
+            this.quickTries++;
+            FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentRecipeNote.Instance()->OpenRecipeByRecipeId(this.craft.RecipeId);
+        }
+
+        this.Status = "レシピノートで簡易製作を始めています";
+        return TaskResult.Running;
+    }
+
+    /// <summary>
+    /// 職をこのレシピの職に合わせる（製作の構えのままでは着替えられないので、先に解く）。合っていれば null、途中なら Running。
+    /// 合わせられなければ <paramref name="failed"/> に理由を入れて null を返す。
+    /// </summary>
+    private TaskResult? AlignJob(TaskContext ctx, out string? failed)
+    {
+        failed = null;
+        if (this.jobSub != null)
+        {
+            var r = this.jobSub.Step(ctx);
+            this.Status = this.jobSub.Status;
+            if (r == TaskResult.Running)
+                return TaskResult.Running;
+            this.jobSub.Cleanup(ctx);
+            failed = r == TaskResult.Failed ? this.jobSub.FailReason ?? "理由は不明" : null;
+            this.jobSub = null;
+            return failed != null ? null : TaskResult.Running;
+        }
+
+        if (Jobs.CurrentClassJob != this.craft.ClassJobId)
+        {
+            var c = Svc.Condition;
+            this.jobSub = c[Dalamud.Game.ClientState.Conditions.ConditionFlag.PreparingToCraft] || c[Dalamud.Game.ClientState.Conditions.ConditionFlag.Crafting]
+                ? new ExitCraftStanceTask()
+                : new EquipJobTask(this.craft.ClassJobId);
+            return TaskResult.Running;
+        }
+
+        return null;
+    }
+
+    /// <summary>簡易製作をやめ、残りを通常の製作（Artisan）で作る。</summary>
+    private TaskResult QuickFallback(TaskContext ctx, string why)
+    {
+        this.quick = false;
+        var made = Math.Max(0, this.CountMade(Inventory.Snapshot()) - this.beforeAll);
+        var left = (this.expected - made + this.craft.Yield - 1) / this.craft.Yield;
+        this.requestCrafts = Math.Max(1, left);
+        this.attemptBase = this.beforeAll + made;
+        ctx.Log.Warn("製作", $"{CraftPlanner.ItemName(this.craft.ItemId)} の簡易製作をやめ、残りの {this.requestCrafts} 回を通常の製作（Artisan）で作ります（{why}）");
+        return TaskResult.Running;
+    }
+
     public override void Cleanup(TaskContext ctx)
     {
+        // 職を合わせる下請け（簡易製作・装備品の素材の選択）が途中なら、後始末する
+        this.jobSub?.Cleanup(ctx);
+        this.jobSub = null;
+
         // 一時的に「使わない」にした食事・薬を戻す（戻せなければ控えに残し、止まっている間に戻す：Services）。
         // Artisan がまだ製作中なら、止め切るまで戻さない（戻した直後の製作で食べないように、控えに残して後で戻す）
         if (this.consumablesDisabled && ctx.Artisan.IsBusy() == false && ctx.Artisan.RestoreConsumables(this.craft.RecipeId))

@@ -82,6 +82,13 @@ public static unsafe class GameMemory
 
     // ---- クエスト ----
 
+    /// <summary>
+    /// そのレシピを一度でも作ったことがあるか（簡易製作は作ったことがあるレシピだけ：QuestManager.IsRecipeComplete）。
+    /// 試験の間（偽物のゲーム、またはゲームの関数の場所が解決されていない）は false。
+    /// </summary>
+    public static bool IsRecipeComplete(uint recipeId)
+        => Test == null && QuestManager.Addresses.IsRecipeComplete.Value != 0 && QuestManager.IsRecipeComplete(recipeId);
+
     public static bool IsQuestComplete(uint questRowId)
         => Test is { } t ? t.IsQuestComplete(questRowId) : QuestManager.IsQuestComplete(questRowId);
 

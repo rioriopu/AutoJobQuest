@@ -25,7 +25,8 @@ public sealed record PlannedCraft(
     uint SecretRecipeBookId,
     bool Reserve = false,
     int HqTarget = 0,
-    int TurnInTarget = 0)
+    int TurnInTarget = 0,
+    bool HqChain = false)
 {
     /// <summary>
     /// 取り置きの分を、いまの手持ちで数え直した製作回数（取り置きでなければ計画の回数のまま）。
@@ -301,6 +302,22 @@ public sealed class CraftPlanner
         }
 
         var hqItems = hqDemand.Where(x => x.Value > 0).Select(x => x.Key).ToHashSet();
+
+        // HQ が要る品と、その材料としてたどれる中間素材すべて（簡易製作にしない。
+        // 完成品に HQ を求められる製作物なら、中間素材も HQ で作る。NQ でよい品だけ簡易製作でよい）
+        var ridOfItem = craftsOf.Keys.Concat(reserveOf.Keys).Distinct()
+            .GroupBy(x => this.recipes.GetRow(x).ItemResult.RowId)
+            .ToDictionary(g => g.Key, g => g.First());
+        var hqChain = new HashSet<uint>(hqItems);
+        var chainStack = new Stack<uint>(hqItems);
+        while (chainStack.Count > 0)
+        {
+            if (!ridOfItem.TryGetValue(chainStack.Pop(), out var chainRid))
+                continue;
+            foreach (var (ing, _) in Ingredients(this.recipes.GetRow(chainRid)))
+                if (hqChain.Add(ing))
+                    chainStack.Push(ing);
+        }
         var ordered = craftsOf.Keys
             .OrderBy(x => depthOf[x])
             .ThenBy(x => Difficulty(this.recipes.GetRow(x)))
@@ -332,7 +349,8 @@ public sealed class CraftPlanner
                 r.SecretRecipeBook.RowId,
                 isReserve,
                 hqDemand.GetValueOrDefault(item),
-                turnInAny.GetValueOrDefault(item) + hqDemand.GetValueOrDefault(item));
+                turnInAny.GetValueOrDefault(item) + hqDemand.GetValueOrDefault(item),
+                hqChain.Contains(item));
 
             plan.Crafts.Add(pc);
 

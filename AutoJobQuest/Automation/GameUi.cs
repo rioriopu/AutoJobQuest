@@ -170,6 +170,11 @@ public static unsafe class GameUi
                         atk[i].Type = AtkValueType.String;
                         atk[i].String = (byte*)p;
                         break;
+                    case null:
+                        // 型の無い値（ECommons の Callback.ZeroAtkValue と同じ：Type 0・Int 0）
+                        atk[i].Type = 0;
+                        atk[i].Int = 0;
+                        break;
                     default:
                         throw new ArgumentException($"未対応の型: {values[i]?.GetType().Name}");
                 }
@@ -326,6 +331,46 @@ public static unsafe class GameUi
         if (addon == null)
             return false;
         return ClickComponentButton(addon, addon->GetComponentButtonById(nodeId), $"ノード{nodeId}");
+    }
+
+    /// <summary>製作手帳（RecipeNote）の素材の欄 <paramref name="slot"/>（0〜5）が「未選択」か（装備品の素材は、使う品を選ぶまで未選択。Artisan の判定と同じ：欄の部品の 7 番が見える）。</summary>
+    public static bool RecipeSlotUnselected(AtkUnitBase* note, int slot)
+    {
+        if (note == null)
+            return false;
+        var node = note->GetComponentNodeById((uint)(89 + slot));
+        if (node == null || !node->AtkResNode.IsVisible() || node->Component == null)
+            return false;
+        var mark = node->Component->GetNodeById(7);
+        return mark != null && mark->IsVisible();
+    }
+
+    /// <summary>
+    /// 製作手帳の素材の欄 <paramref name="slot"/> の「選ぶ」ボタン（欄の部品の 5 番）を押す（候補の小窓 ContextIconMenu が開く）。押せたら true。
+    /// 送る合図は Artisan（ECommons の ClickAddonButton）と同じ：受け手＝製作手帳、種類＝ButtonClick、番号＝5、対象＝そのボタン。
+    /// ボタンに登録された最初の合図をそのまま送る押し方（ClickComponentButton）は、最初の合図がマウスを重ねたとき用などだと別の合図になるので使わない。
+    /// Artisan 4.0.5.212 は、この合図を送る部品で型の変換に失敗して押せなかったので、ここでは製作手帳の ReceiveEvent を直接呼ぶ。
+    /// </summary>
+    public static bool ClickRecipeSlotSelect(AtkUnitBase* note, int slot)
+    {
+        if (note == null)
+            return false;
+        var node = note->GetComponentNodeById((uint)(89 + slot));
+        if (node == null || node->Component == null)
+            return false;
+        var buttonNode = node->Component->GetNodeById(5);
+        if (buttonNode == null || buttonNode->Type < (NodeType)1000 || !buttonNode->IsVisible())
+            return false;
+
+        AtkEvent evt = default;
+        evt.Target = (AtkEventTarget*)buttonNode;
+        evt.Listener = (AtkEventListener*)note;
+        evt.Param = 5;
+        evt.State.EventType = AtkEventType.ButtonClick;
+        AtkEventData data = default;
+        Core.DebugLog.Current?.Line("操作", $"ボタン押下: {note->NameString} 素材の欄 {slot + 1} の選択");
+        note->ReceiveEvent(AtkEventType.ButtonClick, 5, &evt, &data);
+        return true;
     }
 
     private static bool ClickComponentButton(AtkUnitBase* addon, AtkComponentButton* button, string label)
