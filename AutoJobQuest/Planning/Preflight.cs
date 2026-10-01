@@ -275,7 +275,7 @@ public static class Preflight
             var unlocked = AreaAccess.UnlockedNow();
             foreach (var r in plan.Shortfalls.Where(x => x.Route == Route.Gather))
             {
-                if (PlanBuilder.HiddenGather(hiddenSources.Get(r.ItemId), unlocked, GatherAbilities.Usable, Jobs.Level) is not { LuckUsable: true } hidden)
+                if (PlanBuilder.HiddenGather(hiddenSources.Get(r.ItemId), unlocked, GatherAbilities.Usable, Jobs.Level, GearCheck.HasGearset) is not { LuckUsable: true } hidden)
                     continue;
 
                 var (on, preset, minGp) = ctx.Gbr.ReadLuckSetting(r.ItemId);

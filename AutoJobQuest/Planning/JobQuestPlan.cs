@@ -318,6 +318,10 @@ public static class PlanBuilder
             plan.RetainerTargets.AddRange(prepare);
             plan.Targets.AddRange(prepare);
 
+            // Questionable に任せる品（漁師のジョブクエの魚など）も、リテイナーが持っていれば先に引き出す（
+            // 天気・時間の限られた魚は、リテイナーが持っていなければマーケットで買う。持っていれば釣る・買う必要が無い）。集める対象には入れない
+            plan.RetainerTargets.AddRange(needs.Needed.Where(n => !q.AfterAcceptItems.Contains(n.ItemId) && LeaveToQuestionable(q.ClassJobId, n.ItemId, questGathers, excludedRoutes)));
+
             // 受注後に作る品のクリスタル（クエストはくれない）。まだ渡す前で、作った品も足りていなければ、
             // 作る回数＋作り直しの予備の分を用意する（HQ にならなかったときの作り直し：QuestCraftTask）
             if (stage == Automation.QuestItemStage.Stage.All)
@@ -374,12 +378,16 @@ public static class PlanBuilder
             // 前提が未達で使えない手段は、理由を出す（前提の未達で詰まらないよう確かめる）
             if (shortfall > 0)
             {
-                foreach (var (route, why) in RouteBlockers(data.Sources!.Get(item), ChooseRoutes(data.Sources!, item), QuestManager.IsQuestComplete, unlockedAetherytes, GatherAbilities.Usable, Jobs.Level))
+                foreach (var (route, why) in RouteBlockers(data.Sources!.Get(item), ChooseRoutes(data.Sources!, item), QuestManager.IsQuestComplete, unlockedAetherytes, GatherAbilities.Usable, Jobs.Level, GearCheck.HasGearset))
                     plan.Warnings.Add($"{CraftPlanner.ItemName(item)} ×{shortfall}：{Ui.MainWindow.RouteName(route)}は使えません（{why}）。{(first == Route.Unknown ? "ほかの手段もありません" : $"{Ui.MainWindow.RouteName(first)}で集めます")}");
 
                 // 隠し（HIDDEN）の品を採集で集めるのに眼力が使えないときは、時間がかかることを知らせる
-                if (first == Route.Gather && HiddenGather(data.Sources!.Get(item), unlockedAetherytes, GatherAbilities.Usable, Jobs.Level) is { LuckUsable: false } hidden)
+                if (first == Route.Gather && HiddenGather(data.Sources!.Get(item), unlockedAetherytes, GatherAbilities.Usable, Jobs.Level, GearCheck.HasGearset) is { LuckUsable: false } hidden)
                     plan.Warnings.Add($"{CraftPlanner.ItemName(item)} ×{shortfall}：{hidden.Text}");
+
+                // 時限の採集点でしか採れない品は、時刻を待たずにマーケットで買う
+                if (first == Route.MarketBoard && data.Sources!.Get(item) is { Crystal: CrystalTier.None } timedSrc && TimedOnly(timedSrc))
+                    plan.Warnings.Add($"{CraftPlanner.ItemName(item)} ×{shortfall}：時限の採集点でしか採れないので、時刻を待たずにマーケットで買います（買えなければ採集します）");
             }
         }
 
@@ -673,7 +681,7 @@ public static class PlanBuilder
             routes.Remove(Route.Reduce);
 
         // 前提の解放（前提の未達で詰まらないよう、手段を使う前に確かめる。ゲームデータの調査で分かったもの）
-        foreach (var (route, _) in RouteBlockers(sources.Get(itemId), routes, QuestManager.IsQuestComplete, AreaAccess.UnlockedNow(), GatherAbilities.Usable, Jobs.Level))
+        foreach (var (route, _) in RouteBlockers(sources.Get(itemId), routes, QuestManager.IsQuestComplete, AreaAccess.UnlockedNow(), GatherAbilities.Usable, Jobs.Level, GearCheck.HasGearset))
             routes.Remove(route);
         return routes;
     }
@@ -689,10 +697,13 @@ public static class PlanBuilder
     ///  ・精選：元の収集品を採る「収集品採集」が使えない（クエスト「職人の新たなお仕事」が未完了など）
     ///  ・採掘・園芸・釣り：採集職のレベルが、採集点・魚のレベルに届かない（未解放を含む。
     ///    選ばなかった職はレベルの制限なし。届かなければ採らずにマーケットボードで買う）。<paramref name="jobLevel"/> が null なら見ない
+    ///  ・採掘・園芸・釣り：レベルの届く採集職のギアセットが無い（レベルと装備が足りていれば採集、足りなければ
+    ///    マーケット。GBR はギアセットで着替えるので、無いと採集・釣りで止まる。採集品に「必要な識質力」の条件は品の Lv70 以下に無く、
+    ///    ジョブクエの魚に「要る獲得力」の条件も無いので、装備で見るのはギアセットの有無）。<paramref name="hasGearset"/> が null なら見ない
     /// 能力が使えるかを確かめられない（null）ときは外さない（決め打ちの番号がゲームデータと合わない等。記録に残している）。
     /// </summary>
     public static List<(Route Route, string Reason)> RouteBlockers(ItemSources s, IReadOnlyCollection<Route> routes, Func<uint, bool> isComplete,
-        IReadOnlySet<uint> unlockedAetherytes, Func<uint, bool?> abilityUsable, Func<uint, int>? jobLevel = null)
+        IReadOnlySet<uint> unlockedAetherytes, Func<uint, bool?> abilityUsable, Func<uint, int>? jobLevel = null, Func<uint, bool>? hasGearset = null)
     {
         var list = new List<(Route, string)>();
 
@@ -718,12 +729,19 @@ public static class PlanBuilder
                     .Select(g => $"{Jobs.Name(g.Key)} {LevelText(jobLevel!(g.Key))}・採集点 Lv{g.Min(x => x.GatheringLevel)}");
                 list.Add((Route.Gather, $"採集点のレベルに届く採集職がいません（{string.Join("／", need)}）"));
             }
+            else if (Leveled(reachable, jobLevel, hasGearset).Count == 0)
+            {
+                var jobs = Leveled(reachable, jobLevel).Select(GathererOf).Distinct().OrderBy(x => x).Select(Jobs.Name);
+                list.Add((Route.Gather, $"{string.Join("・", jobs)}のギアセットがありません（GBR がギアセットで着替えるので、無いと採集できません）"));
+            }
         }
 
         if (routes.Contains(Route.Fish) && (s.Fish || s.Spearfish) && jobLevel != null && jobLevel(Fisher) is var fisher && (fisher <= 0 || fisher < s.FishLevel))
             list.Add((Route.Fish, $"漁師のレベルが魚のレベルに届きません（漁師 {LevelText(fisher)}・魚 Lv{s.FishLevel}）"));
         else if (routes.Contains(Route.Fish) && !s.Fish && s.Spearfish && abilityUsable(GatherAbilities.Gig) == false)
             list.Add((Route.Fish, $"銛でしか取れない魚で、刺突漁{GatherAbilities.Requirement(GatherAbilities.Gig)}が要ります"));
+        else if (routes.Contains(Route.Fish) && (s.Fish || s.Spearfish) && hasGearset != null && !hasGearset(Fisher))
+            list.Add((Route.Fish, $"{Jobs.Name(Fisher)}のギアセットがありません（GBR がギアセットで着替えるので、無いと釣りができません）"));
 
         return list;
     }
@@ -737,9 +755,10 @@ public static class PlanBuilder
     /// 採集の作業の上限（残りの採掘・園芸は 90 分）までに集めきれなければ、次の周回で別の手段（マーケット）に回る（JobQuestFlow）。
     /// 能力が使えるかを確かめられない（null）ときは「使える」とみなす（GBR が押せれば押す）。
     /// </summary>
-    public static (bool LuckUsable, string Text)? HiddenGather(ItemSources s, IReadOnlySet<uint> unlockedAetherytes, Func<uint, bool?> abilityUsable, Func<uint, int>? jobLevel = null)
+    public static (bool LuckUsable, string Text)? HiddenGather(ItemSources s, IReadOnlySet<uint> unlockedAetherytes, Func<uint, bool?> abilityUsable,
+        Func<uint, int>? jobLevel = null, Func<uint, bool>? hasGearset = null)
     {
-        var leveled = Leveled(Reachable(s, unlockedAetherytes), jobLevel);
+        var leveled = Leveled(Reachable(s, unlockedAetherytes), jobLevel, hasGearset);
         if (leveled.Count == 0 || !leveled.All(g => g.Hidden))
             return null;
 
@@ -751,13 +770,23 @@ public static class PlanBuilder
                       + "眼力を使わずに、採集点を回って自然に出るのを待つので時間がかかります（ほかの素材を集めた後に採ります。集めきれなければマーケットで買います）");
     }
 
+    /// <summary>
+    /// 時限の採集点（未知・伝説・時限など）でしか採れない品か（時刻を待たずにマーケットで買う）。
+    /// 採掘・園芸で採れない品は false。時限でない採集点が1つでもあれば false（そこで待たずに採れる）。
+    /// </summary>
+    public static bool TimedOnly(ItemSources s) => s.CanGather && !s.CanGatherUntimed;
+
     /// <summary>行ける採集点（エリアの入口のエーテライトが解放済みか、確かめられないもの）。</summary>
     private static List<GatherSpot> Reachable(ItemSources s, IReadOnlySet<uint> unlockedAetherytes)
         => s.Gather.Where(g => AreaAccess.Reachable(g.Territory, unlockedAetherytes) != false).ToList();
 
-    /// <summary>採集点のレベルに届く採集職（採掘点なら採掘師、園芸点なら園芸師）がいる点。<paramref name="jobLevel"/> が null なら見ない。</summary>
-    private static List<GatherSpot> Leveled(List<GatherSpot> spots, Func<uint, int>? jobLevel)
-        => jobLevel == null ? spots : spots.Where(g => jobLevel(GathererOf(g)) >= Math.Max(1, g.GatheringLevel)).ToList();
+    /// <summary>
+    /// 採集点のレベルに届く採集職（採掘点なら採掘師、園芸点なら園芸師）がいる点。<paramref name="jobLevel"/> が null なら見ない。
+    /// <paramref name="hasGearset"/> を渡すと、その職のギアセットがある点だけにする。
+    /// </summary>
+    private static List<GatherSpot> Leveled(List<GatherSpot> spots, Func<uint, int>? jobLevel, Func<uint, bool>? hasGearset = null)
+        => spots.Where(g => (jobLevel == null || jobLevel(GathererOf(g)) >= Math.Max(1, g.GatheringLevel))
+                            && (hasGearset == null || hasGearset(GathererOf(g)))).ToList();
 
     /// <summary>採掘師・園芸師・漁師（ClassJob の行）。</summary>
     private const uint Miner = 16, Botanist = 17, Fisher = 18;
@@ -788,6 +817,12 @@ public static class PlanBuilder
 
         if (s.Vendor)
             list.Add(Route.Vendor);
+
+        // 時限の採集点（未知・伝説・時限など。GatheringPointTransient で時刻が決まっている点）でしか採れない品は、時刻を待つ時間が
+        // 勿体ないので、マーケットで買えるならマーケットを採集より先にする（リテイナーが持っていれば、
+        // 素材集めの前の引き出しで足りる）。買えなければ（出品が無い等）、次の周回で採集する
+        if (TimedOnly(s) && s.Marketable)
+            list.Add(Route.MarketBoard);
         if (s.CanGather)
             list.Add(Route.Gather);
         if (s.Fish || s.Spearfish)
@@ -796,7 +831,7 @@ public static class PlanBuilder
             list.Add(Route.Combat);
         if (s.CanReduce)
             list.Add(Route.Reduce);
-        if (s.Marketable)
+        if (s.Marketable && !list.Contains(Route.MarketBoard))
             list.Add(Route.MarketBoard);
 
         return list;

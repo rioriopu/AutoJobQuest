@@ -881,11 +881,13 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         var gather = raw.Where(r => r.Routes[0] == Route.Gather).ToList();
         var gatheredInMap = new HashSet<uint>();
 
-        // 眼力が使えない隠し（HIDDEN）の品は、自然に出るのを待つので時間がかかる。ほかの素材を先に集め、隠しの品は最後の別の作業（6）にする
-        // （一緒に渡すと、GBR が隠しの品の採集点を回り続けて上限の時間を使い、ほかの品まで集めきれずに
-        // マーケットへ回るおそれがある）。眼力が使える隠しの品は、GBR が眼力で出すので、ほかの品と一緒でよい
+        // 隠し（HIDDEN）の品は、ほかの素材を先に集め、最後の別の作業（6）にまとめる。
+        //  ・眼力が使えなければ自然に出るのを待つので時間がかかる。一緒に渡すと、GBR が隠しの品の採集点を回り続けて上限の時間を使い、
+        //    ほかの品まで集めきれずにマーケットへ回るおそれがある
+        //  ・隠しの品を採る間だけ GBR の「Abandon nodes without needed items」を ON にして、出ていない採集点を採らずに離れ、速く回る
+        //    （眼力が使えても、GP が足りない採集点では出ないので同じ）
         var unlockedForHidden = AreaAccess.UnlockedNow();
-        var slowHidden = gather.Where(g => PlanBuilder.HiddenGather(sourcesIdx.Get(g.Item), unlockedForHidden, GatherAbilities.Usable, Jobs.Level) is { LuckUsable: false }).ToList();
+        var hiddenItems = gather.Where(g => PlanBuilder.HiddenGather(sourcesIdx.Get(g.Item), unlockedForHidden, GatherAbilities.Usable, Jobs.Level, GearCheck.HasGearset) != null).ToList();
         if (combat.Count > 0)
         {
             var combatJob = CombatJobPicker.Pick();
@@ -919,7 +921,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
 
                 // 同じ採集品が複数のマップで採れても、割り当てるのは最初のマップだけ
                 // （複数のマップに同じ不足数で入れると、その数だけ余計に採る）
-                var here = gather.Where(g => !gatheredInMap.Contains(g.Item) && !slowHidden.Contains(g) && ctx.Gbr.GatherableTerritories(g.Item)?.Contains(terr) == true).ToList();
+                var here = gather.Where(g => !gatheredInMap.Contains(g.Item) && !hiddenItems.Contains(g) && ctx.Gbr.GatherableTerritories(g.Item)?.Contains(terr) == true).ToList();
                 foreach (var g in here)
                     gatheredInMap.Add(g.Item);
                 if (here.Count > 0)
@@ -931,8 +933,8 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
             }
         }
 
-        // 4) 残りの採集（シャード含む）。GBR が場所とジョブを選ぶ。眼力が使えない隠しの品は、最後の別の作業（6）
-        var usual = gather.Where(g => !gatheredInMap.Contains(g.Item) && !slowHidden.Contains(g)).ToList();
+        // 4) 残りの採集（シャード含む）。GBR が場所とジョブを選ぶ。隠しの品は、最後の別の作業（6）
+        var usual = gather.Where(g => !gatheredInMap.Contains(g.Item) && !hiddenItems.Contains(g)).ToList();
         if (usual.Count > 0)
         {
             steps.Add(_ => this.Track(new GatherTask(
@@ -968,13 +970,16 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
                 fish.Select(f => new GatherNeed(f.Item, inv.CountAll(f.Item) + f.Need)), null, "釣り", TimeSpan.FromMinutes(90), Route.Fish)));
         }
 
-        // 6) 眼力が使えない隠し（HIDDEN）の採集物（上の slowHidden）。自然に出るのを待つので、ほかの素材を集めた後に別の作業で採る。
+        // 6) 隠し（HIDDEN）の採集物（上の hiddenItems）。ほかの素材を集めた後に、別の作業で速く回って採る。
         //    上限までに集めきれなければ、次の周回で別の手段（マーケット）に回る
-        if (slowHidden.Count > 0)
+        if (hiddenItems.Count > 0)
         {
-            ctx.Log.Write("素材", $"眼力が未解放の隠し（HIDDEN）の採集物は、ほかの素材を集めた後に、自然に出るのを待って採ります：{string.Join("、", slowHidden.Select(g => $"{CraftPlanner.ItemName(g.Item)}×{g.Need}"))}");
+            ctx.Log.Write("素材", $"隠し（HIDDEN）の採集物は、ほかの素材を集めた後に、出ていない採集点を採らずに離れて速く回って採ります：{string.Join("、", hiddenItems.Select(g => $"{CraftPlanner.ItemName(g.Item)}×{g.Need}"))}");
             steps.Add(_ => this.Track(new GatherTask(
-                slowHidden.Select(g => new GatherNeed(g.Item, inv.CountAll(g.Item) + g.Need)), null, "採掘・園芸（隠しの品）", TimeSpan.FromMinutes(90))));
+                hiddenItems.Select(g => new GatherNeed(g.Item, inv.CountAll(g.Item) + g.Need)), null, "採掘・園芸（隠しの品）", TimeSpan.FromMinutes(90))
+            {
+                FastCycle = true,
+            }));
         }
 
         this.child = new SequenceTask($"素材集め {this.rounds.AcquireRounds}周目", steps);
@@ -996,7 +1001,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
 
         var sources = ctx.Data.Sources!;
         var natural = PlanBuilder.ChooseRoutes(sources, item);
-        var blockers = PlanBuilder.RouteBlockers(sources.Get(item), natural, FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete, AreaAccess.UnlockedNow(), GatherAbilities.Usable, Jobs.Level);
+        var blockers = PlanBuilder.RouteBlockers(sources.Get(item), natural, FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete, AreaAccess.UnlockedNow(), GatherAbilities.Usable, Jobs.Level, GearCheck.HasGearset);
         if (blockers.Count > 0)
             return string.Join(" / ", blockers.Select(b => $"{Ui.MainWindow.RouteName(b.Route)}は使えません：{b.Reason}"));
         if (sources.Get(item).CanReduce)

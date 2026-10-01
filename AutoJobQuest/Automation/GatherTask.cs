@@ -132,6 +132,14 @@ public sealed class GatherTask : AutoTask
     /// <summary>刺突漁の GBR を動かす作業か（エサを使わない。刺突漁の設定は SpearfishTask が合わせる）。</summary>
     public bool Spearfish { get; init; }
 
+    /// <summary>
+    /// 速く回る（隠しの品を採る作業）。true なら採集の間だけ GBR の「Abandon nodes without needed items」
+    /// （AutoGatherConfig.AbandonNodes）を ON にする：目当ての品が出ていない採集点は、ほかの品を採らずに窓を閉じて次の点へ行く
+    /// （GBR の AutoGather.Gather.cs の GetItemSlotToGather と AutoGather.cs の CloseGatheringAddons。直前に行った点は覚えていて続けては戻らない）。
+    /// 隠しの品は採集点の中を見るたびに出るかが決まるので、採らずに次へ回るほど早く出会える。控えを取り、終わったら元に戻る。
+    /// </summary>
+    public bool FastCycle { get; init; }
+
     // 竿の釣り（エサを使う）
     private bool RodFishing => this.Route == Planning.Route.Fish && !this.Spearfish;
 
@@ -240,6 +248,15 @@ public sealed class GatherTask : AutoTask
         // 精選に使う収集品を、GBR が収集品納品窓口へ持っていかないように（GBR は収集品が溜まると納品しに行く：AutoGather.cs:1062）
         if (this.KeepCollectables && !ctx.Gbr.OverrideBool(GbrHandle.CollectablePrefix + "AutoTurnInCollectables", false))
             return this.Fail($"GBR の収集品の自動納品を一時的に切れませんでした（採った収集品を納品されてしまうため止めます）: {ctx.Gbr.LastError}");
+
+        // 隠しの品を採る間だけ、出ていない採集点を採らずに離れて速く回る。切れなくても採集はできるので止めない
+        if (this.FastCycle)
+        {
+            if (ctx.Gbr.OverrideBool("AbandonNodes", true))
+                ctx.Log.Write("採集", "隠しの品を採る間だけ、GBR の「Abandon nodes without needed items」を ON にしました（出ていない採集点は採らずに次へ）。終わったら戻します");
+            else
+                ctx.Log.Warn("採集", $"GBR の「Abandon nodes without needed items」を一時的に ON にできませんでした（速く回らずに採ります）: {ctx.Gbr.LastError}");
+        }
 
         // GBR が集められる設定になっていなければ、この作業の間だけ合わせる（終わったら後始末で戻す。
         // 以前は vnavmesh の移動・採集窓の操作が OFF だと始める前に止め、UseAutoHook が OFF だと釣りを止めていた）。

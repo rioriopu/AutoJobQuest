@@ -19,6 +19,12 @@ public sealed record AutoHookFish(uint ItemId, bool IsSpearFish, int Size, int S
 {
     /// <summary>釣れる天気（ゲームデータ Weather の行。空ならいつでも）。例：雨乞魚（4905）は 7・15（導入版 6.0.2.3）。</summary>
     public IReadOnlyList<uint> Weathers { get; init; } = [];
+
+    /// <summary>
+    /// 釣れる時間帯（エオルゼア時間の始まりの時と、続く時間。AutoHook の Spawn・Duration。17.5 時・0.5 時間のような小数もある）。
+    /// 無ければ null（いつでも）。例：フルムーンサーディン（4898）は 18 時から 12 時間＝18:00〜06:00（導入版 6.0.2.3）。
+    /// </summary>
+    public (double Start, double Hours)? Window { get; init; }
 }
 
 /// <summary>
@@ -93,6 +99,11 @@ public static class AutoHookData
                 Weathers = f.TryGetProperty("Weathers", out var wv) && wv.ValueKind == JsonValueKind.Array
                     ? wv.EnumerateArray().Where(w => w.ValueKind == JsonValueKind.Number && w.GetInt64() > 0).Select(w => (uint)w.GetInt64()).ToList()
                     : [],
+                Window = f.TryGetProperty("Spawn", out var st) && st.ValueKind == JsonValueKind.Number
+                         && f.TryGetProperty("Duration", out var du) && du.ValueKind == JsonValueKind.Number
+                         && du.GetDouble() is > 0 and < 24
+                    ? (st.GetDouble() % 24, du.GetDouble())
+                    : null,
             });
         }
 

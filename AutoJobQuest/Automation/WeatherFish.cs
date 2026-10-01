@@ -61,11 +61,32 @@ public static class FishConditions
     private static Dictionary<uint, AutoHookFish>? cache;
     private static string? cachePath;
 
+    /// <summary>検証の仕組み用：設定すると、魚のデータの代わりにこれを使う（品 → 釣れる時間帯。無ければ null）。</summary>
+    public static Func<uint, (double Start, double Hours)?>? TestWindows { get; set; }
+
     /// <summary>その魚が釣れる天気（空ならいつでも）。データが無い・読めないときは null。</summary>
     public static IReadOnlyList<uint>? Weathers(uint itemId, Version? autoHookVersion)
     {
         if (TestWeathers is { } test)
             return test(itemId);
+        return Find(itemId, autoHookVersion)?.Weathers;
+    }
+
+    /// <summary>
+    /// その魚が釣れる時間帯（エオルゼア時間。時限性の採取物も待たずに買う）。いつでも釣れる・データが無いときは null。
+    /// 検証の仕組みで天気だけを差し替えているときは、実物のデータを読まない（差し替えが無ければ null）。
+    /// </summary>
+    public static (double Start, double Hours)? Window(uint itemId, Version? autoHookVersion)
+    {
+        if (TestWindows is { } test)
+            return test(itemId);
+        if (TestWeathers != null)
+            return null;
+        return Find(itemId, autoHookVersion)?.Window;
+    }
+
+    private static AutoHookFish? Find(uint itemId, Version? autoHookVersion)
+    {
         try
         {
             var path = AutoHookData.FishListPath(autoHookVersion);
@@ -77,7 +98,7 @@ public static class FishConditions
                 cachePath = path;
             }
 
-            return cache.TryGetValue(itemId, out var f) ? f.Weathers : null;
+            return cache.TryGetValue(itemId, out var f) ? f : null;
         }
         catch (Exception ex)
         {
@@ -87,9 +108,52 @@ public static class FishConditions
     }
 }
 
+/// <summary>エオルゼア時間（1 時間＝現実の 175 秒。ゲームのサーバーの時刻から出す）。</summary>
+public static class EorzeaTime
+{
+    /// <summary>検証の仕組み用：設定すると、今のエオルゼア時間（時。小数で分も表す）をこれで読む。</summary>
+    public static Func<double>? TestHour { get; set; }
+
+    /// <summary>今のエオルゼア時間（0 以上 24 未満の時。17.5 は 17:30）。サーバーの時刻を読めなければ、PC の時計で出す。</summary>
+    public static double Hour()
+    {
+        if (TestHour is { } test)
+            return test();
+        long unix;
+        try
+        {
+            unix = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.GetServerTime();
+        }
+        catch
+        {
+            unix = 0;
+        }
+
+        if (unix <= 0)
+            unix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        return unix % (175L * 24) / 175.0;
+    }
+
+    /// <summary>その時刻が時間帯に入っているか（日をまたぐ時間帯も扱う：18 時から 12 時間＝18:00〜06:00）。</summary>
+    public static bool InWindow(double hour, (double Start, double Hours) window)
+        => window.Hours >= 24 || (hour - window.Start + 24) % 24 < window.Hours;
+
+    /// <summary>時刻の表示（17.5 → 「17:30」）。</summary>
+    public static string Clock(double hour)
+    {
+        var minutes = (int)Math.Floor(hour * 60) % (24 * 60);
+        return $"{minutes / 60:00}:{minutes % 60:00}";
+    }
+
+    /// <summary>時間帯の表示（「ET 18:00〜06:00」）。</summary>
+    public static string Text((double Start, double Hours) window)
+        => $"ET {Clock(window.Start)}〜{Clock((window.Start + window.Hours) % 24)}";
+}
+
 /// <summary>
 /// Questionable の釣りの手順の魚が、天気の限られた魚で、いまの天気で釣れないなら、マーケットボードで買うかの判断
 /// （雨天でなかった場合のみマーケットボードで買う）。
+/// 時間帯の限られた魚（ET 18:00〜06:00 のフルムーンサーディンなど）も同じ扱い（時限性・天候の採取物は待たずに買う）。
 /// 天気の条件は AutoHook の魚のデータ（Weathers）から読む（品や天気は埋め込まない）。天気が合っていれば Questionable が釣る。
 /// 判断は、釣りの手順のエリアにいるときに行う（釣れるかは、実際にいる場所の天気で決まる）。釣っている途中で天気が外れたときも買う。
 /// Questionable の釣りの手順は NQ の数で「そろった」を見る（GetInventoryItemCount の既定）ので、NQ で数え、NQ を買う。
@@ -129,17 +193,26 @@ public static class WeatherFishBuy
                 .OrderBy(s => s.Index)
                 .FirstOrDefault();
 
-    public static Verdict Decide(IReadOnlyList<uint>? weathers, int nqOwned, int count, bool inArea, uint? weather, bool marketable, bool tried)
+    /// <summary>
+    /// 買うかの判断。天気の条件（<paramref name="weathers"/>）と時間帯の条件（<paramref name="window"/>。
+    /// 時限性の採取物も待たずに買う）のどちらかがある魚が対象。両方が合っていれば Questionable が釣り、どちらかが合わなければ買う。
+    /// 時間帯はエリアに着いたときのエオルゼア時間（<paramref name="eorzeaHour"/>）で見る。
+    /// </summary>
+    public static Verdict Decide(IReadOnlyList<uint>? weathers, int nqOwned, int count, bool inArea, uint? weather, bool marketable, bool tried,
+        (double Start, double Hours)? window = null, double? eorzeaHour = null)
     {
-        if (weathers is not { Count: > 0 })
+        var byWeather = weathers is { Count: > 0 };
+        if (!byWeather && window == null)
             return Verdict.NoWeatherFish;
         if (nqOwned >= count)
             return Verdict.Enough;
         if (!inArea)
             return Verdict.NotInArea;
-        if (weather is not { } w)
+        if ((byWeather && weather == null) || (window != null && eorzeaHour == null))
             return Verdict.WeatherUnknown;
-        if (weathers.Contains(w))
+        var weatherOk = !byWeather || weathers!.Contains(weather!.Value);
+        var timeOk = window is not { } w || EorzeaTime.InWindow(eorzeaHour!.Value, w);
+        if (weatherOk && timeOk)
             return Verdict.InWeather;
         if (!marketable)
             return Verdict.CannotBuy;

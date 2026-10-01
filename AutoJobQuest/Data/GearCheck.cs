@@ -119,6 +119,9 @@ public static class GearCheck
         return result;
     }
 
+    /// <summary>そのジョブのギアセットがあるか。</summary>
+    public static bool HasGearset(uint classJobId) => FindGearset(classJobId) >= 0;
+
     /// <summary>そのジョブの最初のギアセットの番号。無ければ -1。</summary>
     public static unsafe int FindGearset(uint classJobId)
     {

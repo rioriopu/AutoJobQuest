@@ -1076,7 +1076,7 @@ public sealed unsafe class QuestTask : AutoTask
     public static Func<uint, AutoTask>? TestReturnTask { get; set; }
 
     /// <summary>
-    /// Questionable の今の手順から後に、同じ段の釣りの手順があり、その魚が天気の限られた魚なら、釣りの手順のエリアに着いたところで天気を見る
+    /// Questionable の今の手順から後に、同じ段の釣りの手順があり、その魚が天気・時間帯の限られた魚なら、釣りの手順のエリアに着いたところで天気・時間を見る
     /// （WeatherFishBuy の説明）。天気が合わなければ、Questionable を止めて、足りない分（NQ）をマーケットボードで買う（1つのクエストで1回だけ）。
     /// 天気が合っていれば何もしない（Questionable が釣る）。買いに行ったら true。
     /// </summary>
@@ -1090,17 +1090,29 @@ public sealed unsafe class QuestTask : AutoTask
 
         var item = fish.GatherItemId!.Value;
         var count = fish.GatherCount!.Value;
-        var weathers = FishConditions.Weathers(item, ctx.AutoHook.LoadedVersion);
-        if (weathers is not { Count: > 0 })
+        var weathers = FishConditions.Weathers(item, ctx.AutoHook.LoadedVersion) ?? [];
+        // 時間帯の限られた魚も同じ扱い（時限性・天候の採取物は待たずに買う。フルムーンサーディンは ET 18:00〜06:00 だけ）
+        var window = FishConditions.Window(item, ctx.AutoHook.LoadedVersion);
+        if (weathers.Count == 0 && window == null)
             return false;
 
         var nq = Inventory.Snapshot().CountNq(item);
         var inArea = GameWeather.CurrentTerritory == fish.Territory;
-        var weather = inArea ? GameWeather.CurrentIn(fish.Territory) : null;
-        var verdict = WeatherFishBuy.Decide(weathers, nq, count, inArea, weather, WeatherFishBuy.Marketable(item), this.weatherBuyTried);
+        var weather = inArea && weathers.Count > 0 ? GameWeather.CurrentIn(fish.Territory) : null;
+        double? hour = inArea && window != null ? EorzeaTime.Hour() : null;
+        var verdict = WeatherFishBuy.Decide(weathers, nq, count, inArea, weather, WeatherFishBuy.Marketable(item), this.weatherBuyTried, window, hour);
         var name = CraftPlanner.ItemName(item);
-        var want = string.Join("・", weathers.Select(GameWeather.Name));
-        var now = weather is { } w ? GameWeather.Name(w) : "不明";
+        // 文言：天気は「天気が「雨・雪」」、時間帯は「時間が「ET 18:00〜06:00」」（天気だけの魚は従来の言い回しのまま）
+        var want = string.Join("・", new[]
+        {
+            weathers.Count > 0 ? $"天気が「{string.Join("・", weathers.Select(GameWeather.Name))}」" : null,
+            window is { } wnd ? $"時間が「{EorzeaTime.Text(wnd)}」" : null,
+        }.Where(x => x != null));
+        var now = string.Join("・", new[]
+        {
+            weathers.Count > 0 ? $"天気は「{(weather is { } w ? GameWeather.Name(w) : "不明")}」" : null,
+            hour is { } h ? $"時間は「ET {EorzeaTime.Clock(h)}」" : null,
+        }.Where(x => x != null));
         var zone = AreaAccess.Name(fish.Territory);
         switch (verdict)
         {
@@ -1117,23 +1129,24 @@ public sealed unsafe class QuestTask : AutoTask
                 this.weatherStopTerritory = GameWeather.CurrentTerritory;
                 var order = new MarketNeed([item], need, name, Inventory.CountNow(item) + need, NqOnly: true);
                 this.weatherBuy = TestMarketTask?.Invoke(order) ?? new MarketBoardTask([order], ctx.MarketWatcher);
-                ctx.Log.Write("クエスト", $"{name} は天気が「{want}」のときしか釣れません。いまの{zone}の天気は「{now}」なので、Questionable を止めて、"
-                                       + $"足りない {need} 匹（NQ。持っている NQ {nq}／要る {count}）をマーケットボードで買います（天気が合わないときだけ買う）");
-                this.NextPhase($"天気が合わないので {name} をマーケットボードで買います");
+                ctx.Log.Write("クエスト", $"{name} は{want}のときしか釣れません。いまの{zone}の{now}なので、Questionable を止めて、"
+                                       + $"足りない {need} 匹（NQ。持っている NQ {nq}／要る {count}）をマーケットボードで買います"
+                                       + "（天気・時間が合わないときは待たずに買う）");
+                this.NextPhase($"天気・時間が合わないので {name} をマーケットボードで買います");
                 return true;
             case WeatherFishBuy.Verdict.InWeather:
-                this.NoteWeather(ctx, $"{item}:In:{weather}", $"{name} は天気が「{want}」のときに釣れます。いまの{zone}の天気は「{now}」なので、Questionable が釣ります");
+                this.NoteWeather(ctx, $"{item}:In:{weather}:{(hour is { } ih ? (int)ih : -1)}", $"{name} は{want}のときに釣れます。いまの{zone}の{now}なので、Questionable が釣ります");
                 return false;
             case WeatherFishBuy.Verdict.CannotBuy:
-                this.NoteWeather(ctx, $"{item}:NoMarket", $"{name} は天気が「{want}」のときしか釣れず、いまの{zone}の天気は「{now}」ですが、マーケットで売買できない品なので、"
-                                                        + "天気が変わるのを待って Questionable が釣ります", warn: true);
+                this.NoteWeather(ctx, $"{item}:NoMarket", $"{name} は{want}のときしか釣れず、いまの{zone}の{now}ですが、マーケットで売買できない品なので、"
+                                                        + "天気・時間が合うのを待って Questionable が釣ります", warn: true);
                 return false;
             case WeatherFishBuy.Verdict.AlreadyTried:
-                this.NoteWeather(ctx, $"{item}:Tried", $"{name} をマーケットボードで買いきれなかったので、天気が「{want}」に変わるのを待って Questionable が釣ります"
-                                                     + $"（いまの{zone}の天気は「{now}」・NQ {nq}／{count}）", warn: true);
+                this.NoteWeather(ctx, $"{item}:Tried", $"{name} をマーケットボードで買いきれなかったので、{want}に変わるのを待って Questionable が釣ります"
+                                                     + $"（いまの{zone}の{now}・NQ {nq}／{count}）", warn: true);
                 return false;
             case WeatherFishBuy.Verdict.WeatherUnknown:
-                this.NoteWeather(ctx, $"{item}:Unknown", $"{zone}の天気を読めないので、{name} は Questionable に釣りを任せます（釣れる天気：{want}）", warn: true);
+                this.NoteWeather(ctx, $"{item}:Unknown", $"{zone}の天気・時間を読めないので、{name} は Questionable に釣りを任せます（釣れる条件：{want}）", warn: true);
                 return false;
             default:
                 return false;
