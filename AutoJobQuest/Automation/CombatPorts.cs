@@ -83,6 +83,11 @@ public interface ICombatWorld
     void Mount()
     {
     }
+
+    /// <summary>ジャンプする（一般アクション 2：ゲームデータで確認）。既定は何もしない。</summary>
+    void Jump()
+    {
+    }
 }
 
 /// <summary>RSR の操作（本番は RotationSolverIpc）。</summary>
@@ -273,4 +278,6 @@ public sealed class GameCombatWorld : ICombatWorld
     public bool CanFlyHere => MoveToTask.CanFlyHere();
 
     public void Mount() => GameUi.UseGeneralAction(9); // マウント・ルーレット（GeneralAction 9：MoveToTask と同じ）
+
+    public void Jump() => GameUi.UseGeneralAction(2); // ジャンプ（GeneralAction 2：ゲームデータで確認。ICE の詰まったときと同じ）
 }

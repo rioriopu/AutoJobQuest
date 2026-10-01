@@ -103,9 +103,10 @@ public sealed class Engagement
     /// <summary>近づく移動で、相手に 1m も近づかないままこれだけたったら、ここからは近づけないとみる。</summary>
     public static readonly TimeSpan ApproachStuckAfter = TimeSpan.FromSeconds(8);
 
-    // 近づく移動の進み具合：一番近づいた水平の距離と、その時刻
+    // 近づく移動の進み具合：一番近づいた水平の距離と、その時刻・歩いて詰まったときにジャンプを試したか
     private float approachClosest = float.MaxValue;
     private DateTime approachClosestAt = DateTime.MinValue;
+    private bool jumpTried;
 
     /// <summary>狙い始める（狙い直す）。</summary>
     public void Start(ICombatWorld world, IFoe foe)
@@ -119,6 +120,7 @@ public sealed class Engagement
         this.approachClosest = float.MaxValue;
         this.approachClosestAt = world.Now;
         this.landCandidates = null;
+        this.jumpTried = false;
     }
 
     /// <summary>次の降りる場所の候補へ移る（今の候補へ向かった記録を消す）。</summary>
@@ -135,11 +137,13 @@ public sealed class Engagement
 
     /// <summary>
     /// 飛んでいるときに降りる場所の候補（不具合の例：西ザナラーンなど物の多い場所で、相手の真下の1か所だけを狙い、
-    /// 木の枝・岩のアーチの下で飛んで届かない・物の上で降りられないまま飛び回った）。相手の真下の床と、周り 5m・10m の8方向の床のうち、
+    /// 木の枝・岩のアーチの下で飛んで届かない・物の上で降りられないまま飛び回った）。相手の真下の床と、周り 5m・10m・20m の8方向の床のうち、
     /// 本来の地面とつながっている床（vnavmesh：PointOnFloor の allowUnreachable=false と NearestPointReachable）で、相手の床と同じ高さ（6m 以内）のもの。
-    /// 2m 以内に重なるものは1つにし、相手に近い順に8か所まで。地図が使えなければ空。
+    /// 2m 以内に重なるものは1つにし、12か所まで（試す順は下）。地図が使えなければ空。
+    /// 20m の輪は、物の多い場所の真ん中ではなく開けた所に降りて、降りた後は地上の経路で近づくため（ICE がコスモで、立ち位置を
+    /// つながっている床に吸着させ、地上の経路だけで動いて物をよけているのに合わせた）。
     /// </summary>
-    public static List<Vector3> LandingCandidates(INavControl nav, Vector3 foe)
+    public static List<Vector3> LandingCandidates(INavControl nav, Vector3 foe, Vector3 me)
     {
         var list = new List<Vector3>();
         if (!nav.IsReady())
@@ -153,7 +157,8 @@ public sealed class Engagement
         }
 
         Add(nav.PointOnFloor(foe + new Vector3(0, 2f, 0), false, 3f));
-        foreach (var r in new[] { 5f, 10f })
+        var centerCount = list.Count;
+        foreach (var r in new[] { 5f, 10f, 20f })
         {
             for (var k = 0; k < 8; k++)
             {
@@ -162,8 +167,12 @@ public sealed class Engagement
             }
         }
 
-        var f2 = new Vector2(foe.X, foe.Z);
-        return list.OrderBy(p => Vector2.Distance(new Vector2(p.X, p.Z), f2)).Take(8).ToList();
+        // 試す順：相手の真下（最初の1つ）を先に、残りは今いる場所から近い順（こちらから来る途中の、開けた空に近い所から）。
+        // 相手に近い順だと、物の多い場所では近い候補ほど同じ理由でだめになり、HP が減らない上限（45秒）までに開けた候補へ届かなかった
+        var m2 = new Vector2(me.X, me.Z);
+        var first = list.Take(centerCount);
+        var rest = list.Skip(centerCount).OrderBy(p => Vector2.Distance(new Vector2(p.X, p.Z), m2));
+        return first.Concat(rest).Take(12).ToList();
     }
 
     /// <summary>待たされていた時間（画面が開いていた等）を「HP が減らない時間」に数えない。</summary>
@@ -221,7 +230,7 @@ public sealed class Engagement
         {
             if (this.landCandidates == null || Vector3.Distance(this.landCandidatesFor, t.Position) > 6f)
             {
-                this.landCandidates = LandingCandidates(nav, t.Position);
+                this.landCandidates = LandingCandidates(nav, t.Position, world.MyPosition);
                 this.landCandidatesFor = t.Position;
                 this.landIndex = 0;
                 this.landTargetClosest = float.MaxValue;
@@ -267,10 +276,15 @@ public sealed class Engagement
             ? Vector2.Distance(new Vector2(world.MyPosition.X, world.MyPosition.Z), new Vector2(la.X, la.Z)) <= 2.5f
             : flat <= FlyingLandDistance;
         var haveCandidates = world.Flying && this.landCandidates is { Count: > 0 };
+
+        // 候補の上に着地した（乗ったまま地上にいる）なら、相手まで遠くても降りる（20m の輪の候補に着地したあと、相手まで 20m 以上あると
+        // 「近くない」として乗ったまま飛び立ち、物の多い相手の真上へまた向かってしまう）
+        var onCandidate = world.Mounted && !world.Flying && this.landCandidates is { Count: > 0 } lc && this.landIndex < lc.Count
+                          && Vector2.Distance(new Vector2(world.MyPosition.X, world.MyPosition.Z), new Vector2(lc[this.landIndex].X, lc[this.landIndex].Z)) <= 4f;
         var wantLand = world.Mounted && !overVoid
                        && (world.Flying
                            ? overLanding || (!haveCandidates && near && !nav.IsMoving() && this.lastApproach != DateTime.MinValue)
-                           : near);
+                           : near || onCandidate);
 
         // 降りられなかった場所から動いている間は降りない。相手のそば（水平 3m）に着いたか、離れて（5m）止まったら降り直す
         if (this.landBlockedAt is { } blocked)
@@ -416,12 +430,27 @@ public sealed class Engagement
         }
 
         var cutOff = !flyPath && this.path.Active && this.path.LastGap > 3f;
+
+        // 歩いていて近づかないときは、まず1回ジャンプを試す（ICE の詰まったときと同じ。小さな段差・物の角に引っかかったときに抜けられる）。
+        // 経路が途切れている（歩いては行けない）ときは試さない
+        if (!cutOff && !world.Mounted && !flyPath && !this.jumpTried && now - this.approachClosestAt > ApproachStuckAfter)
+        {
+            this.jumpTried = true;
+            this.approachClosestAt = now;
+            world.Jump();
+            status = $"{t.Name} へ近づけないので、ジャンプして抜けます";
+            return Result.Running;
+        }
+
         if (cutOff || now - this.approachClosestAt > ApproachStuckAfter)
         {
             if (!world.Mounted && world.CanMountNow)
             {
                 if (now - this.mountAt >= TimeSpan.FromSeconds(2))
                 {
+                    // 降りた候補から歩いて行けないなら、次の候補へ移ってから乗る（同じ候補へ飛んで降りる、を繰り返さない）
+                    if (this.landCandidates is { Count: > 0 } && this.landIndex < this.landCandidates.Count)
+                        this.NextLandCandidate(now, "降りた所から歩いて近づけません");
                     this.mountAt = now;
                     this.StopApproach(nav);
                     world.Mount();
@@ -451,8 +480,9 @@ public sealed class Engagement
         if ((!moving || moved) && now - this.lastApproach > TimeSpan.FromSeconds(1))
         {
             this.lastApproach = now;
-            // 飛んでいれば、vnavmesh の地図で決めた降りる場所へ飛ぶ（無ければ相手の位置）
-            var goal = landAt ?? t.Position;
+            // 飛んでいれば、vnavmesh の地図で決めた降りる場所へ飛ぶ。地上なら、相手のそばの本来の地面とつながっている床へ歩く
+            // （ICE がコスモで立ち位置を NearestPointReachable に吸着させるのと同じ。相手が岩の上・物の際にいても、届く床へ向かう）。無ければ相手の位置
+            var goal = landAt ?? (flyPath ? null : nav.NearestPointReachable(t.Position, 3f, 5f)) ?? t.Position;
             if (this.path.Request(nav, world.MyPosition, goal, flyPath))
             {
                 this.simpleApproach = false;
