@@ -527,7 +527,8 @@ public sealed class GoToTask : AutoTask
                 var guess = new Vector3(node.Flat.X, node.Height ?? Me.Position.Y, node.Flat.Y);
                 var dest = node.Height != null
                     ? guess
-                    : ctx.Navmesh.NearestPoint(guess, 10f, 300f) ?? ctx.Navmesh.PointOnFloor(new Vector3(guess.X, Me.Position.Y + 100f, guess.Z), false, 10f);
+                    : ctx.Navmesh.NearestPoint(guess, 10f, 300f) ?? ctx.Navmesh.PointOnFloor(new Vector3(guess.X, Me.Position.Y + 100f, guess.Z), false, 10f)
+                      ?? ctx.Navmesh.PointOnFloor(new Vector3(guess.X, 1024f, guess.Z), false, 10f);
                 if (dest == null)
                     return this.Fail($"エーテルネットの中継点（{AetherytePlaces.Name(node.Row)}）の足元の位置が分かりません（vnavmesh の経路の地図に床が見つかりません）");
                 this.sub = new MoveToTask(dest.Value, 5f, $"エーテルネットの中継点（{AetherytePlaces.Name(node.Row)}）");

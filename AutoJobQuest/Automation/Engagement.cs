@@ -102,7 +102,12 @@ public sealed class Engagement
         // 飛んだまま敵の上空に浮き、高さの差で3次元の距離が 56m あったので降りず、地上の経路で近づこうとして高度が下がらないまま止まっていた）。
         // 降りる操作（一般アクション 23）は、飛んでいれば着地、地上なら降りる
         var flat = Vector2.Distance(new Vector2(world.MyPosition.X, world.MyPosition.Z), new Vector2(t.Position.X, t.Position.Z));
-        if (world.Mounted && (inReach || dist < DismountDistance || flat < DismountDistance))
+
+        // 飛んでいるときは、真下に相手と同じ高さの床があるときだけ降りる（不具合の例：アジス・ラーで、島の縁にいる敵の手前の
+        // 空中で「降りる」を2秒おきに送り続け、真下に床が無いので高さ -100 前後から -601 まで降り続けて止まった）。
+        // 床が無い・別の高さの床しか無いときは、降りずに相手の位置へ飛んで近づき、床の上に来てから降りる
+        var overVoid = world.Mounted && world.Flying && !GroundBelowLikeFoe(nav, world.MyPosition, t.Position);
+        if (world.Mounted && !overVoid && (inReach || dist < DismountDistance || flat < DismountDistance))
         {
             if (now - this.dismountAt > TimeSpan.FromSeconds(2))
             {
@@ -148,7 +153,7 @@ public sealed class Engagement
         if (world.HardTargetId != t.Id)
             world.SetHardTarget(t);
 
-        if (inReach)
+        if (inReach && !world.Mounted)
         {
             // 届く。自分の近づく移動は止める（キャスターは動いていると詠唱が始まらない）。あとは RSR に任せる
             this.StopApproach(nav);
@@ -185,10 +190,27 @@ public sealed class Engagement
             }
         }
 
-        status = reach == false
-            ? $"{t.Name} に近づいています（{dist:0.0}m・{(code == 562 ? "見えない位置" : "射程外")}）"
-            : $"{t.Name} に近づいています（{dist:0.0}m）";
+        status = overVoid
+            ? $"{t.Name} の近くですが、足もとに降りられる床が無いので、床の上まで飛んで近づきます（水平 {flat:0.0}m）"
+            : reach == false
+                ? $"{t.Name} に近づいています（{dist:0.0}m・{(code == 562 ? "見えない位置" : "射程外")}）"
+                : $"{t.Name} に近づいています（{dist:0.0}m）";
         return Result.Running;
+    }
+
+    /// <summary>
+    /// 真下（水平 1.5m 以内）に、相手のいる床と同じ高さ（8m 以内）の床があるか。相手の床は相手の真下の床（浮いている敵でも床で比べる）で、
+    /// 見つからなければ相手の高さから下 20m・上 5m の範囲で見る。地図の準備ができていなければ分からないので true（従来どおり降りる）。
+    /// </summary>
+    public static bool GroundBelowLikeFoe(INavControl nav, Vector3 me, Vector3 foe)
+    {
+        if (!nav.IsReady())
+            return true;
+        if (nav.PointOnFloor(me, true, 1.5f) is not { } mine)
+            return false;
+        if (nav.PointOnFloor(foe + new Vector3(0, 2f, 0), true, 2f) is { } foeFloor)
+            return MathF.Abs(mine.Y - foeFloor.Y) <= 8f;
+        return mine.Y >= foe.Y - 20f && mine.Y <= foe.Y + 5f;
     }
 
     /// <summary>自分が頼んだ近づく移動を止める（探索は取り消し、自分の経路なら止める。他人の経路は止めない）。</summary>

@@ -79,6 +79,9 @@ public sealed class CombatTask : AutoTask
     // 諦めの原因がこちらの不具合や一時的なもの〔届かない位置にいた等〕でも、ずっと狙わないままにしない）
     private readonly Dictionary<ulong, DateTime> giveUpAt = [];
 
+    // 出現点の床が続けて見つからなかった回数（全部の出現点で見つからなければ止める）
+    private int floorMisses;
+
     /// <summary>諦めた個体をもう一度狙うまでの時間。</summary>
     private static readonly TimeSpan GiveUpFor = TimeSpan.FromMinutes(2);
 
@@ -518,15 +521,26 @@ public sealed class CombatTask : AutoTask
 
         var spot = this.spots[this.spotIndex];
         var world = MapCoords.ToWorld(this.territory, spot.X, spot.Y);
+        // 出現点の床：今の高さの近く → 少し上から下へ → 地図の上（高さ 1024）から下へ（vnavmesh が地図の旗から床を求めるのと同じ）。
+        // 今の高さだけに頼らない（不具合の例：アジス・ラーで島の 500m 下まで降りてしまい、どの出現点も「床が無い」として
+        // 表示も移動も無いまま毎フレーム飛ばし続け、3分以上止まった）
         var onFloor = ctx.Navmesh.NearestPoint(new Vector3(world.X, Me.Position.Y, world.Z), 10f, 300f)
-                      ?? ctx.Navmesh.PointOnFloor(new Vector3(world.X, Me.Position.Y + 100f, world.Z), false, 10f);
+                      ?? ctx.Navmesh.PointOnFloor(new Vector3(world.X, Me.Position.Y + 100f, world.Z), false, 10f)
+                      ?? ctx.Navmesh.PointOnFloor(new Vector3(world.X, 1024f, world.Z), false, 10f);
         if (onFloor == null)
         {
-            // 床が見つからない出現点は飛ばす
+            // 床が見つからない出現点は飛ばす。続けて全部の出現点で見つからなければ、回り続けずに止める
             this.spotIndex = (this.spotIndex + 1) % this.spots.Count;
             this.spotArrivedAt = DateTime.MinValue;
+            this.floorMisses++;
+            this.Status = $"出現点の床が地図（ナビメッシュ）に見つかりません（{this.floorMisses}/{this.spots.Count}）";
+            if (this.floorMisses >= this.spots.Count)
+                return this.Fail($"{TeleportTask.TerritoryName(this.territory)} のどの出現点も、床が地図（ナビメッシュ）に見つかりません。"
+                                 + "vnavmesh の地図を作り直してから（/vnav rebuild）、もう一度始めてください");
             return TaskResult.Running;
         }
+
+        this.floorMisses = 0;
 
         // もう着いている点なら、移動を作らずに着いた扱いにする（以前は移動を作っては即座に終わる、を毎フレーム繰り返した：記録で6千回）。
         // 続けて着いたままなら、湧きを待つ間をあける（全部の点が近いときに空回りしない）

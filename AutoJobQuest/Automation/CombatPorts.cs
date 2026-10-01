@@ -105,6 +105,15 @@ public interface INavControl
 
     /// <summary>求めた経路をたどらせる。</summary>
     bool MoveAlong(List<Vector3> waypoints, bool fly);
+
+    /// <summary>地図（ナビメッシュ）の準備ができていて、床を問い合わせられるか。既定は false（床の有無で判断しない）。</summary>
+    bool IsReady() => false;
+
+    /// <summary>
+    /// 点 <paramref name="p"/> の真下（水平 <paramref name="halfExtentXZ"/> 以内）で、p より低い床のうち一番高いもの
+    /// （vnavmesh の Query.Mesh.PointOnFloor）。無ければ null。既定は null。
+    /// </summary>
+    Vector3? PointOnFloor(Vector3 p, bool allowUnlandable, float halfExtentXZ) => null;
 }
 
 /// <summary>
