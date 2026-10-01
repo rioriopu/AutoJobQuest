@@ -1110,32 +1110,31 @@ public sealed unsafe class QuestTask : AutoTask
     /// <summary>検証の仕組み用：設定すると、降りる操作（一般アクション 23）の代わりにこれを呼ぶ。本番では null のまま。</summary>
     public static Func<bool>? TestDismount { get; set; }
 
-    // 釣りの位置で投げられないときの向きの合わせ直し（HandleCastFacing）：投げられない状態が始まった時刻・変えた回数・始めの向き・最後に変えた時刻・あきらめを知らせたか
+    // 釣りの位置で投げられないときの立ち位置の合わせ直し（HandleCastFacing）：投げられない状態が始まった時刻・試す立ち位置・いま試している番号・
+    // 移動中か・段階の時刻・あきらめを知らせたか
     private DateTime? castBlockedSince;
-    private int castTurns;
-    private float castStartRad;
-    private DateTime castTurnAt = DateTime.MinValue;
+    private List<Data.CastSpot>? castSpots;
+    private int castIndex = -1;
+    private bool castMoving;
+    private DateTime castPhaseAt = DateTime.MinValue;
     private bool castGaveUpNoted;
 
     /// <summary>投げる行動（Action 289「キャスティング」。GBR・AutoHook と同じ番号）。</summary>
     public const uint CastAction = 289;
 
-    /// <summary>向きを変えて試す回数（30度ずつ一周）。</summary>
-    public const int CastTurnSteps = 12;
-
-    /// <summary>検証の仕組み用：設定すると、投げる行動の状態と向きの変更をこれで行う。本番では null のまま（偽物のゲームでは、設定しなければ見ない）。</summary>
+    /// <summary>検証の仕組み用：設定すると、投げる行動の状態をこれで読む。本番では null のまま（偽物のゲームでは、設定しなければ見ない）。</summary>
     public static Func<uint>? TestCastStatus { get; set; }
 
     /// <summary>検証の仕組み用：向きの変更。</summary>
     public static Action<float>? TestSetRotation { get; set; }
 
     /// <summary>
-    /// Questionable の釣りの手順の位置（水平1.5m以内）に、動ける・乗っていない・構えていない状態で着いたのに、投げる行動が2秒使えないままなら、
-    /// 向きを30度ずつ変えて試す（0.4秒おき・一周まで）。使えるようになったら止める。
-    /// 原因（記録とソース）：漁師 Lv58（2088）の釣りの手順で、AutoHook が「You can't cast right now」を25秒くり返した（投げる行動が使えない）。
-    /// 位置は GBR の釣りの記録（その場所でバルーンパファーを釣った記録の位置と0.1m差）と同じで、餌も万能ルアーを付けていた。
-    /// ゲームは釣り場での向きでも投げられるかを決め、GBR の自動採集は記録の向きに合わせてから投げ、それでも使えなければ少し動く（AutoGather.cs）。
-    /// Questionable は歩いて着いた向きのまま /ahstart を送り、1秒おきにやり直す（Fish.cs）ので、向きが合えば次のやり直しで投げられる。
+    /// Questionable の釣りの手順の位置（10m以内）に、動ける・乗っていない・構えていない状態で着いたのに、投げる行動が2秒使えないままなら、
+    /// GBR の釣りの記録（実際に投げた立ち位置と向き：Data.FishCastSpots）のうち、手順の位置に近いものへ順に移り、記録の向きに合わせて試す（最大5か所）。
+    /// 投げられるようになったら止める（Questionable の釣りの手順は1秒おきに /ahstart をやり直すので、そのまま投げる）。
+    /// 不具合の例：漁師 Lv58（2088）で、Questionable の釣りの位置（445.4,-31.7,222.6）では投げる行動が使えず（状態 1128）、
+    /// その場で向きを一周させても使えなかった（その場で回すのはやめた）。
+    /// 約1m先（446.1,-31.5,222.2）へ動いて谷間へ向いたら投げられた。ゲームは立ち位置と向きで投げられるかを決め、GBR は記録の位置へ動いて向きを合わせる。
     /// </summary>
     private void HandleCastFacing(TaskContext ctx)
     {
@@ -1144,15 +1143,14 @@ public sealed unsafe class QuestTask : AutoTask
 
         var step = ctx.Questionable.GetCurrentStepData();
         var c = Svc.Condition;
-        var near = step?.Position is { } target
-                   && System.Numerics.Vector2.Distance(new(Me.Position.X, Me.Position.Z), new(target.X, target.Z)) <= 1.5f;
-        if (step == null || step.InteractionType != "Fish" || step.QuestId != this.quest.ShortId.ToString() || !near
+        var target = step?.Position;
+        if (step == null || step.InteractionType != "Fish" || step.QuestId != this.quest.ShortId.ToString() || target == null
+            || System.Numerics.Vector3.Distance(Me.Position, target.Value) > 10f
             || ctx.Questionable.IsRunning() != true || Jobs.CurrentClassJob != SpearfishTask.Fisher
             || c[Dalamud.Game.ClientState.Conditions.ConditionFlag.Mounted] || c[Dalamud.Game.ClientState.Conditions.ConditionFlag.InFlight]
-            || c[Dalamud.Game.ClientState.Conditions.ConditionFlag.Gathering] || !GameUi.PlayerFree() || GameUi.BetweenAreas)
+            || c[Dalamud.Game.ClientState.Conditions.ConditionFlag.Gathering] || GameUi.BetweenAreas)
         {
-            this.castBlockedSince = null;
-            this.castTurns = 0;
+            this.ResetCastSpot(ctx);
             return;
         }
 
@@ -1160,45 +1158,77 @@ public sealed unsafe class QuestTask : AutoTask
         var now = DateTime.UtcNow;
         if (status == 0)
         {
-            if (this.castTurns > 0)
-                ctx.Log.Write("クエスト", $"向きを {this.castTurns * 360 / CastTurnSteps} 度変えたら、投げられるようになりました（Questionable が次のやり直しで投げます）");
-            this.castBlockedSince = null;
-            this.castTurns = 0;
+            if (this.castIndex >= 0 && this.castSpots is { } tried && this.castIndex < tried.Count)
+                ctx.Log.Write("クエスト", $"記録の立ち位置 {this.castIndex + 1} か所目（{Fmt(tried[this.castIndex].Position)}）に移って向きを合わせたら、投げられるようになりました"
+                                       + "（Questionable が次のやり直しで投げます）");
+            this.ResetCastSpot(ctx);
             return;
         }
 
         this.castBlockedSince ??= now;
-        if (now - this.castBlockedSince.Value < TimeSpan.FromSeconds(2) || now - this.castTurnAt < TimeSpan.FromMilliseconds(400))
+        if (now - this.castBlockedSince.Value < TimeSpan.FromSeconds(2))
             return;
 
-        if (this.castTurns >= CastTurnSteps)
+        // 移動中：着いたら（0.3m以内・止まった・10秒）記録の向きに合わせ、1秒待って状態を見る
+        if (this.castMoving)
+        {
+            var spot = this.castSpots![this.castIndex];
+            if (System.Numerics.Vector3.Distance(Me.Position, spot.Position) > 0.3f && ctx.Navmesh.IsMoving() && now - this.castPhaseAt < TimeSpan.FromSeconds(10))
+                return;
+            if (ctx.Navmesh.IsMoving())
+                ctx.Navmesh.Stop();
+            this.castMoving = false;
+            this.castPhaseAt = now;
+            if (TestSetRotation is { } set)
+                set(spot.Rotation);
+            else
+                GameUi.SetPlayerRotation(spot.Rotation);
+            return;
+        }
+
+        if (this.castIndex >= 0 && now - this.castPhaseAt < TimeSpan.FromSeconds(1))
+            return;
+
+        // 試す立ち位置を決める（記録は裏で読む。読み終わるまで待つ）
+        if (this.castSpots == null)
+        {
+            if (Data.FishCastSpots.All is not { } all)
+                return;
+            this.castSpots = Data.FishCastSpots.Near(all, target.Value);
+            ctx.Log.Write("クエスト", $"釣りの位置に着きましたが、投げられません（投げる行動の状態 {status}）。ゲームは立ち位置と向きで投げられるかを決めます。"
+                                   + $"GBR の釣りの記録で実際に投げられた立ち位置のうち、手順の位置に近い {this.castSpots.Count} か所へ順に移り、記録の向きに合わせて試します"
+                                   + (Data.FishCastSpots.LoadError is { } err ? $"（記録を読めませんでした：{err}）" : string.Empty));
+        }
+
+        if (++this.castIndex >= this.castSpots.Count)
         {
             if (!this.castGaveUpNoted)
             {
                 this.castGaveUpNoted = true;
-                ctx.Log.Warn("クエスト", $"釣りの位置で、どの向きでも投げられません（投げる行動の状態 {status}）。向きでなく立ち位置の問題かもしれません。"
-                                        + "少し動いてから Questionable の画面で釣りの手順をやり直してください");
+                ctx.Log.Warn("クエスト", $"記録の立ち位置 {this.castSpots.Count} か所のどこでも投げられませんでした（投げる行動の状態 {status}）。"
+                                        + "釣り場の水辺へ少し動いて水の方を向いてください（Questionable がそのまま投げます）");
             }
 
             return;
         }
 
-        if (this.castTurns == 0)
-        {
-            this.castStartRad = GameUi.PlayerRotation;
-            ctx.Log.Write("クエスト", $"釣りの位置に着きましたが、投げられません（投げる行動の状態 {status}）。Questionable は着いた向きのまま釣ろうとするので、"
-                                   + "向きを30度ずつ変えて試します（GBR の自動採集も、向きを合わせてから投げる）");
-        }
+        var next = this.castSpots[this.castIndex];
+        ctx.Navmesh.MoveCloseTo(next.Position, false, 0.1f);
+        this.castMoving = true;
+        this.castPhaseAt = now;
+    }
 
-        this.castTurns++;
-        this.castTurnAt = now;
-        var rad = this.castStartRad + this.castTurns * (2f * MathF.PI / CastTurnSteps);
-        if (rad > MathF.PI)
-            rad -= 2f * MathF.PI;
-        if (TestSetRotation is { } set)
-            set(rad);
-        else
-            GameUi.SetPlayerRotation(rad);
+    private static string Fmt(System.Numerics.Vector3 v) => $"{v.X:0.0},{v.Y:0.0},{v.Z:0.0}";
+
+    /// <summary>立ち位置の合わせ直しを初めに戻す（こちらが動かしていれば止める）。</summary>
+    private void ResetCastSpot(TaskContext ctx)
+    {
+        if (this.castMoving && ctx.Navmesh.IsMoving())
+            ctx.Navmesh.Stop();
+        this.castMoving = false;
+        this.castBlockedSince = null;
+        this.castSpots = null;
+        this.castIndex = -1;
     }
 
     // 飛んだまま話しかけて断られたときの着地：最後に着地の操作を送った時刻・知らせたか
