@@ -77,6 +77,9 @@ public sealed unsafe class QuestTask : AutoTask
     private int submittedInSequence = -1;
     private Dictionary<uint, int> countsBeforeSubmit = [];
 
+    // 渡す前のクエストの段（見せるだけの納品は品が減らないので、クエストが進んだかでも確かめる）
+    private byte seqBeforeSubmit;
+
     // 頼むまでの準備と進行中の見張り（着替え・受注できるか・優先リスト・TextAdvance・別のクエストへ移った）
     private readonly QuestionableStarter starter;
 
@@ -1587,6 +1590,13 @@ public sealed unsafe class QuestTask : AutoTask
                 this.submittedAt = null;
                 ctx.Log.Write("納品", $"納品を確かめました（{string.Join("、", dropped.Select(kv => $"{CraftPlanner.ItemName(kv.Key)} {kv.Value}→{GameRequestWindow.Current.CountOwned(kv.Key)}"))}）");
             }
+            else if (GameMemory.QuestSequence(this.quest.RowId) is var seqNow && (seqNow != this.seqBeforeSubmit || this.IsComplete))
+            {
+                // 品は減らないがクエストが進んだ＝見せるだけの納品（不具合の例：漁師 Lv58「モグックにバルーンパファーを見せる」で、
+                // 所持数だけを見て「渡せていない可能性」と誤って警告した）
+                this.submittedAt = null;
+                ctx.Log.Write("納品", $"品は減りませんでしたが、クエストが進みました（見せるだけの納品。段 {this.seqBeforeSubmit}→{seqNow}）");
+            }
             else if (DateTime.UtcNow - at > TimeSpan.FromSeconds(15))
             {
                 // 二度は送らない（二重に渡さないため）。クエストが進まなければ、全体の上限で止まる
@@ -1633,6 +1643,7 @@ public sealed unsafe class QuestTask : AutoTask
                 this.submittedAt = DateTime.UtcNow;
                 this.submittedInSequence = GameMemory.QuestSequence(this.quest.RowId);
                 this.countsBeforeSubmit = new Dictionary<uint, int>(this.filler.CountsBeforeSubmit);
+                this.seqBeforeSubmit = GameMemory.QuestSequence(this.quest.RowId);
                 ctx.Log.Write("納品", detail);
                 break;
             case RequestFiller.Outcome.NotOurs:

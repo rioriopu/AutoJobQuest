@@ -45,6 +45,12 @@ public sealed class GatherTask : AutoTask
     private readonly Dictionary<uint, uint> targets = [];
     private bool enabledByMe;
 
+    // GBR を動かしてすぐ止まったときの動かし直し：動かした時刻・そのときの所持数・動かし直した回数・次に動かしてよい時刻
+    private DateTime enabledAt = DateTime.MinValue;
+    private Dictionary<uint, int> countsAtEnable = [];
+    private int quickStops;
+    private DateTime nextEnableAt = DateTime.MinValue;
+
     /// <summary>集めきれなかった品目（呼び出し側が次の手段を選ぶのに使う）。</summary>
     public List<uint> Unfinished { get; } = [];
 
@@ -228,8 +234,16 @@ public sealed class GatherTask : AutoTask
         var on = ctx.GatherBuddy.IsAutoGatherEnabled();
         if (!this.enabledByMe)
         {
+            if (DateTime.UtcNow < this.nextEnableAt)
+            {
+                this.Status = "GBR がすぐ止まったので、少し待ってから動かし直します";
+                return TaskResult.Running;
+            }
+
             // ON を頼むのは1回だけ（GBR は断るときその場で断り、毎回チャットに理由を出すため、繰り返さない）
             this.enabledByMe = true;
+            this.enabledAt = DateTime.UtcNow;
+            this.countsAtEnable = remaining.ToDictionary(r => r.Key, r => GbrCount(r.Key));
             if (!ctx.GatherBuddy.SetAutoGatherEnabled(true))
             {
                 this.enabledByMe = ctx.GatherBuddy.IsAutoGatherEnabled() != false;
@@ -248,6 +262,18 @@ public sealed class GatherTask : AutoTask
         {
             ctx.Log.Warn("採集", $"{this.label}: 万能ルアーが全部なくなったので、釣りを止めます（次の周回で {VersatileLure.BuyCount} 個買い直してから続けます）");
             return TaskResult.Done;
+        }
+
+        // GBR を動かしてすぐ（10秒以内）、何も集めないまま止まったら、3秒あけて動かし直す（2回まで。不具合の例：漁師 Lv68 の刺突漁で、
+        // GBR を動かした0.03秒後に GBR が止まり〔食事を使った直後に後片付けまで進んだ〕、こちらは集めきれなかったとして手作業を頼んだ。2分後のやり直しでは動いた）
+        if (on == false && DateTime.UtcNow - this.enabledAt < TimeSpan.FromSeconds(10) && this.quickStops < 2
+            && remaining.All(r => GbrCount(r.Key) <= this.countsAtEnable.GetValueOrDefault(r.Key)))
+        {
+            this.quickStops++;
+            this.enabledByMe = false;
+            this.nextEnableAt = DateTime.UtcNow + TimeSpan.FromSeconds(3);
+            ctx.Log.Warn("採集", $"GBR を動かしてすぐ、何も集めないまま止まりました（{ctx.GatherBuddy.StatusText()}）。3秒あけて動かし直します（{this.quickStops} 回目）");
+            return TaskResult.Running;
         }
 
         if (on == false)
