@@ -376,6 +376,10 @@ public static class PlanBuilder
             {
                 foreach (var (route, why) in RouteBlockers(data.Sources!.Get(item), ChooseRoutes(data.Sources!, item), QuestManager.IsQuestComplete, unlockedAetherytes, GatherAbilities.Usable, Jobs.Level))
                     plan.Warnings.Add($"{CraftPlanner.ItemName(item)} ×{shortfall}：{Ui.MainWindow.RouteName(route)}は使えません（{why}）。{(first == Route.Unknown ? "ほかの手段もありません" : $"{Ui.MainWindow.RouteName(first)}で集めます")}");
+
+                // 隠し（HIDDEN）の品を採集で集めるのに眼力が使えないときは、時間がかかることを知らせる
+                if (first == Route.Gather && HiddenGather(data.Sources!.Get(item), unlockedAetherytes, GatherAbilities.Usable, Jobs.Level) is { LuckUsable: false } hidden)
+                    plan.Warnings.Add($"{CraftPlanner.ItemName(item)} ×{shortfall}：{hidden.Text}");
             }
         }
 
@@ -677,8 +681,10 @@ public static class PlanBuilder
     /// <summary>
     /// 前提が未達で使えない入手手段と、その理由（ゲームを起動せずに試せるように、状態は外から渡す）。
     ///  ・NPC 購入：売っている店がすべて、未完了のクエスト（友好部族など）か確かめられない条件付き
-    ///  ・採掘・園芸：行ける採集点が無い（採集点のエリアの入口のエーテライトが未解放。GBR は解放済みのエーテライトから向かう）、
-    ///    または隠しの品しか無く「眼力」が使えない（未解放かレベル不足）
+    ///  ・採掘・園芸：行ける採集点が無い（採集点のエリアの入口のエーテライトが未解放。GBR は解放済みのエーテライトから向かう）。
+    ///    隠し（HIDDEN）の品は、眼力が使えなくても外さない（眼力は隠しの品を「強制的に」出す能力で、
+    ///    無くても採集点を回るうちに運で出る。ゲームデータの説明文と GBR の作り（AutoGather.Actions.cs：自然に出た隠しの品があれば
+    ///    眼力を使わない）で確認。以前は眼力が無ければ外してマーケットで買っていた）。眼力の有無は <see cref="HiddenGather"/> で知らせる
     ///  ・釣り：竿では釣れず銛でしか取れない品で、刺突漁が使えない
     ///  ・精選：元の収集品を採る「収集品採集」が使えない（クエスト「職人の新たなお仕事」が未完了など）
     ///  ・採掘・園芸・釣り：採集職のレベルが、採集点・魚のレベルに届かない（未解放を含む。
@@ -700,31 +706,17 @@ public static class PlanBuilder
 
         if (routes.Contains(Route.Gather) && s.Gather.Count > 0)
         {
-            var reachable = s.Gather.Where(g => AreaAccess.Reachable(g.Territory, unlockedAetherytes) != false).ToList();
+            var reachable = Reachable(s, unlockedAetherytes);
             if (reachable.Count == 0)
             {
                 list.Add((Route.Gather, $"採集点のあるエリア（{string.Join("・", s.Gather.Select(g => AreaAccess.Name(g.Territory)).Distinct())}）のエーテライトが未解放です"));
             }
-            else
+            else if (Leveled(reachable, jobLevel).Count == 0)
             {
-                // 採集点のレベルに届く採集職（採掘点なら採掘師、園芸点なら園芸師）がいるか
-                var leveled = jobLevel == null ? reachable : reachable.Where(g => jobLevel(GathererOf(g)) >= Math.Max(1, g.GatheringLevel)).ToList();
-                if (leveled.Count == 0)
-                {
-                    var need = reachable.GroupBy(GathererOf).OrderBy(g => g.Key)
-                        .Select(g => $"{Jobs.Name(g.Key)} {LevelText(jobLevel!(g.Key))}・採集点 Lv{g.Min(x => x.GatheringLevel)}");
-                    list.Add((Route.Gather, $"採集点のレベルに届く採集職がいません（{string.Join("／", need)}）"));
-                }
-                else if (leveled.All(g => g.Hidden))
-                {
-                    // 隠しの品：採掘なら採掘師の、園芸なら園芸師の眼力が要る
-                    var usable = leveled.Any(g => abilityUsable(g.Mining ? GatherAbilities.MinerLuck : GatherAbilities.BotanistLuck) != false);
-                    if (!usable)
-                    {
-                        var need = leveled.Select(g => g.Mining ? GatherAbilities.MinerLuck : GatherAbilities.BotanistLuck).Distinct().Select(GatherAbilities.Requirement);
-                        list.Add((Route.Gather, $"隠し（HIDDEN）の採集物で、{string.Join("か", need)}が要ります"));
-                    }
-                }
+                // 採集点のレベルに届く採集職（採掘点なら採掘師、園芸点なら園芸師）がいない
+                var need = reachable.GroupBy(GathererOf).OrderBy(g => g.Key)
+                    .Select(g => $"{Jobs.Name(g.Key)} {LevelText(jobLevel!(g.Key))}・採集点 Lv{g.Min(x => x.GatheringLevel)}");
+                list.Add((Route.Gather, $"採集点のレベルに届く採集職がいません（{string.Join("／", need)}）"));
             }
         }
 
@@ -735,6 +727,37 @@ public static class PlanBuilder
 
         return list;
     }
+
+    /// <summary>
+    /// 隠し（HIDDEN）の採集物の知らせ（採るなら山師の眼力・開拓者の眼力を使う）。
+    /// 行ける採集点のうちレベルの届く点が、すべて隠しの点のときだけ返す（隠しでない点があればそちらで採れるので null。行ける点・届く点が無ければ
+    /// 採集は <see cref="RouteBlockers"/> で外れるので null）。
+    /// 眼力は GBR が使う（GBR の AutoGather.Actions.cs の ShouldUseLuck：隠しの品を狙い、自然に出ていなければ、GP がプリセットの下限以上のとき使う。
+    /// 使える状態でなければ押さずに進む）。眼力が使えない（未解放）ときは、採集点を回るうちに運で出るのを待つので時間がかかる。
+    /// 採集の作業の上限（残りの採掘・園芸は 90 分）までに集めきれなければ、次の周回で別の手段（マーケット）に回る（JobQuestFlow）。
+    /// 能力が使えるかを確かめられない（null）ときは「使える」とみなす（GBR が押せれば押す）。
+    /// </summary>
+    public static (bool LuckUsable, string Text)? HiddenGather(ItemSources s, IReadOnlySet<uint> unlockedAetherytes, Func<uint, bool?> abilityUsable, Func<uint, int>? jobLevel = null)
+    {
+        var leveled = Leveled(Reachable(s, unlockedAetherytes), jobLevel);
+        if (leveled.Count == 0 || !leveled.All(g => g.Hidden))
+            return null;
+
+        var lucks = leveled.Select(g => g.Mining ? GatherAbilities.MinerLuck : GatherAbilities.BotanistLuck).Distinct().ToList();
+        var usable = lucks.Where(a => abilityUsable(a) != false).ToList();
+        return usable.Count > 0
+            ? (true, $"隠し（HIDDEN）の採集物です。GBR が{string.Join("か", usable.Select(GatherAbilities.Name))}を使って出します")
+            : (false, $"隠し（HIDDEN）の採集物で、{string.Join("か", lucks.Select(GatherAbilities.Requirement))}が未解放です。"
+                      + "眼力を使わずに、採集点を回って自然に出るのを待つので時間がかかります（ほかの素材を集めた後に採ります。集めきれなければマーケットで買います）");
+    }
+
+    /// <summary>行ける採集点（エリアの入口のエーテライトが解放済みか、確かめられないもの）。</summary>
+    private static List<GatherSpot> Reachable(ItemSources s, IReadOnlySet<uint> unlockedAetherytes)
+        => s.Gather.Where(g => AreaAccess.Reachable(g.Territory, unlockedAetherytes) != false).ToList();
+
+    /// <summary>採集点のレベルに届く採集職（採掘点なら採掘師、園芸点なら園芸師）がいる点。<paramref name="jobLevel"/> が null なら見ない。</summary>
+    private static List<GatherSpot> Leveled(List<GatherSpot> spots, Func<uint, int>? jobLevel)
+        => jobLevel == null ? spots : spots.Where(g => jobLevel(GathererOf(g)) >= Math.Max(1, g.GatheringLevel)).ToList();
 
     /// <summary>採掘師・園芸師・漁師（ClassJob の行）。</summary>
     private const uint Miner = 16, Botanist = 17, Fisher = 18;

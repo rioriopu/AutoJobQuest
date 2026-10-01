@@ -273,6 +273,10 @@ public static class GatherAbilities
         }
     }
 
+    /// <summary>能力の名前（「山師の眼力」など。ゲームデータから読む）。</summary>
+    public static string Name(uint action)
+        => Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Action>().TryGetRow(action, out var a) ? $"「{a.Name.ExtractText()}」" : $"アクション {action}";
+
     /// <summary>その能力を使えるようにする条件の説明（「〇〇 Lv55・クエスト『…』」）。</summary>
     public static string Requirement(uint action)
     {

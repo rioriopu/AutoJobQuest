@@ -70,6 +70,37 @@ public sealed class GbrOperations
         }
     }
 
+    /// <summary>
+    /// GBR がその採集品で眼力（山師の眼力・開拓者の眼力）を使う設定か（読むだけ。採るなら眼力を使う）。
+    /// GBR は品ごとに当てはまるプリセットを選び（Interface.MatchConfigPreset）、その GatherableActions.Luck.Enabled が ON なら、
+    /// 隠しの品を狙うとき眼力を使う（AutoGather.Actions.cs の ShouldUseLuck。GBR 7.5.6.1＝a204f2f で確認）。
+    /// 読めなければ Enabled が null。
+    /// </summary>
+    public (bool? Enabled, string? Preset, int MinGp) ReadLuckSetting(uint itemId)
+    {
+        var h = this.reflection.Get();
+        if (h == null)
+            return (null, null, 0);
+        try
+        {
+            var g = h.FindGatherable(itemId) ?? throw new InvalidOperationException($"GBR の採集品にありません（{itemId}）");
+            var ui = h.PluginType.GetField("Interface", GbrHandle.NonPubInst)!.GetValue(h.Plugin)!;
+            var match = ui.GetType().GetMethods(GbrHandle.PubInst).First(m => m.Name == "MatchConfigPreset" && m.GetParameters().Length == 1);
+            var preset = match.Invoke(ui, [g])!;
+            var name = (string?)preset.GetType().GetProperty("Name", GbrHandle.PubInst)!.GetValue(preset);
+            var actions = preset.GetType().GetProperty("GatherableActions", GbrHandle.PubInst)!.GetValue(preset)!;
+            var luck = actions.GetType().GetProperty("Luck", GbrHandle.PubInst)!.GetValue(actions)!;
+            var enabled = (bool)luck.GetType().GetProperty("Enabled", GbrHandle.PubInst)!.GetValue(luck)!;
+            var minGp = (int)luck.GetType().GetProperty("MinGP", GbrHandle.PubInst)!.GetValue(luck)!;
+            return (enabled, name, minGp);
+        }
+        catch (Exception ex)
+        {
+            this.SetError($"GBR の眼力の設定を読めません: {(ex is System.Reflection.TargetInvocationException { InnerException: { } inner } ? inner.Message : ex.Message)}");
+            return (null, null, 0);
+        }
+    }
+
     /// <summary>収集品を自動で納品しに行く設定か（true だと採った収集品を勝手に納品しに行く）。</summary>
     public bool? ReadAutoTurnInCollectables()
     {

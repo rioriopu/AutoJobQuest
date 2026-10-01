@@ -816,7 +816,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         // 本来の最初の手段がマーケットでない品目が、マーケットに回ったときは、買う前に利用者に確かめる
         // （時間切れや拒否で、聞かずにギルを使う手段へ切り替えない。精選で集めるはずだった霊砂も同じ）。
         // 誤ってギルを大量に使わないよう、前提が未達で採集・NPC 購入などが使えず
-        // マーケットに回る品（眼力が未解放の隠し採集物など）も、聞かずに買わない。以前は「前の周回で失敗した」か「精選の品」のときだけだった
+        // マーケットに回る品（採集職のレベルが届かない素材など）も、聞かずに買わない。以前は「前の周回で失敗した」か「精選の品」のときだけだった
         var sourcesIdx = ctx.Data.Sources!;
         var switched = raw
             .Where(r => r.Routes.Count > 0 && r.Routes[0] == Route.MarketBoard
@@ -880,6 +880,12 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         var combat = raw.Where(r => r.Routes[0] == Route.Combat).ToDictionary(r => r.Item, r => r.Need);
         var gather = raw.Where(r => r.Routes[0] == Route.Gather).ToList();
         var gatheredInMap = new HashSet<uint>();
+
+        // 眼力が使えない隠し（HIDDEN）の品は、自然に出るのを待つので時間がかかる。ほかの素材を先に集め、隠しの品は最後の別の作業（6）にする
+        // （一緒に渡すと、GBR が隠しの品の採集点を回り続けて上限の時間を使い、ほかの品まで集めきれずに
+        // マーケットへ回るおそれがある）。眼力が使える隠しの品は、GBR が眼力で出すので、ほかの品と一緒でよい
+        var unlockedForHidden = AreaAccess.UnlockedNow();
+        var slowHidden = gather.Where(g => PlanBuilder.HiddenGather(sourcesIdx.Get(g.Item), unlockedForHidden, GatherAbilities.Usable, Jobs.Level) is { LuckUsable: false }).ToList();
         if (combat.Count > 0)
         {
             var combatJob = CombatJobPicker.Pick();
@@ -913,7 +919,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
 
                 // 同じ採集品が複数のマップで採れても、割り当てるのは最初のマップだけ
                 // （複数のマップに同じ不足数で入れると、その数だけ余計に採る）
-                var here = gather.Where(g => !gatheredInMap.Contains(g.Item) && ctx.Gbr.GatherableTerritories(g.Item)?.Contains(terr) == true).ToList();
+                var here = gather.Where(g => !gatheredInMap.Contains(g.Item) && !slowHidden.Contains(g) && ctx.Gbr.GatherableTerritories(g.Item)?.Contains(terr) == true).ToList();
                 foreach (var g in here)
                     gatheredInMap.Add(g.Item);
                 if (here.Count > 0)
@@ -925,13 +931,14 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
             }
         }
 
-        // 4) 残りの採集（シャード含む）。GBR が場所とジョブを選ぶ
-        var rest = gather.Where(g => !gatheredInMap.Contains(g.Item)).ToList();
-        if (rest.Count > 0)
+        // 4) 残りの採集（シャード含む）。GBR が場所とジョブを選ぶ。眼力が使えない隠しの品は、最後の別の作業（6）
+        var usual = gather.Where(g => !gatheredInMap.Contains(g.Item) && !slowHidden.Contains(g)).ToList();
+        if (usual.Count > 0)
         {
             steps.Add(_ => this.Track(new GatherTask(
-                rest.Select(g => new GatherNeed(g.Item, inv.CountAll(g.Item) + g.Need)), null, "採掘・園芸", TimeSpan.FromMinutes(90))));
+                usual.Select(g => new GatherNeed(g.Item, inv.CountAll(g.Item) + g.Need)), null, "採掘・園芸", TimeSpan.FromMinutes(90))));
         }
+
 
         // 4.5) 採集→精選（霊砂など。収集品を GBR に採らせて精選で得る）
         foreach (var r in raw.Where(r => r.Routes[0] == Route.Reduce))
@@ -959,6 +966,15 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
                 : null);
             steps.Add(_ => this.Track(new GatherTask(
                 fish.Select(f => new GatherNeed(f.Item, inv.CountAll(f.Item) + f.Need)), null, "釣り", TimeSpan.FromMinutes(90), Route.Fish)));
+        }
+
+        // 6) 眼力が使えない隠し（HIDDEN）の採集物（上の slowHidden）。自然に出るのを待つので、ほかの素材を集めた後に別の作業で採る。
+        //    上限までに集めきれなければ、次の周回で別の手段（マーケット）に回る
+        if (slowHidden.Count > 0)
+        {
+            ctx.Log.Write("素材", $"眼力が未解放の隠し（HIDDEN）の採集物は、ほかの素材を集めた後に、自然に出るのを待って採ります：{string.Join("、", slowHidden.Select(g => $"{CraftPlanner.ItemName(g.Item)}×{g.Need}"))}");
+            steps.Add(_ => this.Track(new GatherTask(
+                slowHidden.Select(g => new GatherNeed(g.Item, inv.CountAll(g.Item) + g.Need)), null, "採掘・園芸（隠しの品）", TimeSpan.FromMinutes(90))));
         }
 
         this.child = new SequenceTask($"素材集め {this.rounds.AcquireRounds}周目", steps);

@@ -267,6 +267,28 @@ public static class Preflight
         if (ctx.Gbr.ReadAutoTurnInCollectables() == true)
             list.Add(new PreflightItem(Severity.Warn, "GBR の収集品の自動納品が ON です。採った収集品を途中で納品しに行くことがあります"));
 
+        // 隠し（HIDDEN）の採集物（採るなら山師の眼力・開拓者の眼力を使う）。眼力を押すのは GBR なので、
+        // 眼力が使えるときは、GBR がその品で使う設定か（品に当たるプリセットの眼力が ON か）を読む。GBR の設定は変えない。
+        // 眼力が未解放の品は、計画の注意（自然に出るのを待つので時間がかかる）で知らせている
+        if (plan != null && ctx.Data.Sources is { } hiddenSources)
+        {
+            var unlocked = AreaAccess.UnlockedNow();
+            foreach (var r in plan.Shortfalls.Where(x => x.Route == Route.Gather))
+            {
+                if (PlanBuilder.HiddenGather(hiddenSources.Get(r.ItemId), unlocked, GatherAbilities.Usable, Jobs.Level) is not { LuckUsable: true } hidden)
+                    continue;
+
+                var (on, preset, minGp) = ctx.Gbr.ReadLuckSetting(r.ItemId);
+                list.Add(on switch
+                {
+                    true => new PreflightItem(Severity.Ok, $"{r.Name}×{r.Shortfall}：{hidden.Text}（GBR のプリセット「{preset}」で眼力が ON・GP {minGp} 以上で使う）"),
+                    false => new PreflightItem(Severity.Warn, $"{r.Name}×{r.Shortfall}：隠し（HIDDEN）の採集物ですが、GBR のプリセット「{preset}」で眼力が OFF です。"
+                                                              + "GBR の「Config Presets」で眼力を ON にしてください（OFF のままだと、自然に出るのを待つので時間がかかります）"),
+                    _ => new PreflightItem(Severity.Warn, $"{r.Name}×{r.Shortfall}：隠し（HIDDEN）の採集物ですが、GBR が眼力を使う設定かを読めませんでした（{ctx.Gbr.LastError}）"),
+                });
+            }
+        }
+
         var needsFish = plan?.Shortfalls.Any(x => x.Route == Route.Fish) ?? false;
         if (needsFish)
         {

@@ -13,7 +13,7 @@ namespace AutoJobQuest.Data;
 /// <param name="GatheringLevel">採集点のレベル。</param>
 /// <param name="Timed">時間限定の採集点にしか無いか。</param>
 /// <param name="Mining">採掘（true）か園芸（false）か。</param>
-/// <param name="Hidden">隠し（HIDDEN）の品か（採集職の「眼力」が要る）。</param>
+/// <param name="Hidden">隠し（HIDDEN）の品か（採集職の「眼力」で確実に出せる。無くても採集点を回るうちに運で出る）。</param>
 public sealed record GatherSpot(uint Territory, int GatheringLevel, bool Timed, bool Mining, bool Hidden = false);
 
 /// <summary>その品を売るギルショップの1件（店の条件）。</summary>
@@ -212,7 +212,8 @@ public sealed class SourceIndex
     ///    （低地ドラヴァニア・Lv55・隠し）が見えず、実体の無いエリアの点で「採れる」と数えていた。
     ///  ・実在する野外のエリア（TerritoryType.TerritoryIntendedUse＝1）だけを使う。エリア 1 などの実体の無い採集点や、
     ///    ディアデムなどの特別なエリアは除く（GBR もこれらを除いている）。
-    ///  ・隠し（GatheringItem.IsHidden）の品は、採集職の「眼力」が要る（AvailableRoutes で確かめる）。
+    ///  ・隠し（GatheringItem.IsHidden）の品は、採集職の「眼力」で確実に出せる。無くても運で出るので採集から外さない
+    ///    （眼力の有無は PlanBuilder.HiddenGather で知らせる）。
     ///  ・時間限定は採集点ごと（GatheringPointTransient）。
     /// </summary>
     private void BuildGathering()
