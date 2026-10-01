@@ -49,6 +49,59 @@ public sealed class GatherTask : AutoTask
     private DateTime? doneSince;
     private DateTime quitSentAt = DateTime.MinValue;
 
+    // そろった後の採集の窓の片付け：最後に「収集品採集」を押した時刻・押した回数・最後に閉じる操作を送った時刻
+    private DateTime collectSentAt = DateTime.MinValue;
+    private int extraCollects;
+    private DateTime closeSentAt = DateTime.MinValue;
+
+    /// <summary>収集品採集（ゲームデータで確認：採掘師 240・園芸師 815。耐久を1消費して、今の収集価値で収集品を1つ採る）。</summary>
+    private const uint CollectMiner = 240;
+    private const uint CollectBotanist = 815;
+
+    /// <summary>
+    /// そろった後、採集の窓が開いていれば片付ける。片付け中なら true（呼び出し側は Running を返す）。
+    /// 収集品の窓（GatheringMasterpiece。AtkValues 13＝今の収集価値・62＝今の耐久・65＝一番低い報酬の必要値：GBR の GatheringMasterpieceReader と同じ）で
+    /// 耐久が残り、収集価値が必要値以上なら「収集品採集」を押す。それ以外は窓を閉じる。
+    /// </summary>
+    private unsafe bool FinishNode(TaskContext ctx)
+    {
+        var now = DateTime.UtcNow;
+        if (GameUi.IsReady("GatheringMasterpiece", out var mp))
+        {
+            var collectability = GameUi.AtkInt(mp, 13) ?? 0;
+            var integrity = GameUi.AtkInt(mp, 62) ?? 0;
+            var low = GameUi.AtkInt(mp, 65) ?? 0;
+            if (integrity > 0 && low > 0 && collectability >= low)
+            {
+                if (!Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.Casting] && now - this.collectSentAt >= TimeSpan.FromSeconds(1.5))
+                {
+                    this.collectSentAt = now;
+                    if (this.extraCollects++ == 0)
+                        ctx.Log.Write("採集", $"{this.label}: そろいましたが、採集場所の耐久が {integrity} 残り、収集価値 {collectability}（一番低い報酬の必要値 {low}）なので、"
+                                             + "残りの耐久で収集品を採り切ります（GBR はそろうと窓を閉じて、残りを掘らないため）");
+                    GameUi.UseAction(Jobs.CurrentClassJob == 17 ? CollectBotanist : CollectMiner); // 17＝園芸師・16＝採掘師（ClassJob）
+                }
+
+                this.Status = $"{this.label}: そろったので、残りの耐久（{integrity}）で収集品を採っています";
+                return true;
+            }
+        }
+
+        // 採れない（収集価値が足りない・耐久が無い・普通の採集の窓）→ 窓を閉じる。収集品の窓を閉じると普通の採集の窓に戻るので、それも閉じる
+        if (now - this.closeSentAt >= TimeSpan.FromSeconds(1))
+        {
+            this.closeSentAt = now;
+            if (GameUi.IsReady("GatheringMasterpiece", out var m2))
+                GameUi.Fire(m2, true, -1);
+            else if (GameUi.IsReady("Gathering", out var g))
+                GameUi.Fire(g, true, -1);
+        }
+
+        this.Status = $"{this.label}: そろったので、採集の窓を閉じています";
+        return GameUi.IsVisible("GatheringMasterpiece") || GameUi.IsVisible("Gathering")
+               || Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.Gathering];
+    }
+
     // GBR を動かしてすぐ止まったときの動かし直し：動かした時刻・そのときの所持数・動かし直した回数・次に動かしてよい時刻
     private DateTime enabledAt = DateTime.MinValue;
     private Dictionary<uint, int> countsAtEnable = [];
@@ -251,6 +304,28 @@ public sealed class GatherTask : AutoTask
                 }
 
                 ctx.Log.Warn("採集", $"{this.label}: 15秒たっても釣りの構えが解けません（このまま次へ進みます）");
+            }
+
+            // 採集場所（陸）の窓が開いたままそろったら、窓を片付けてから終える（不具合の例：強火性岩の収集品が1個そろった瞬間に
+            // GBR を止め、耐久 1/4・収集価値 1000 の窓が開いたまま誰も掘らず閉じず、精選の「動ける状態」を待って止まった。竿の釣りと同じ形の誤り）。
+            // GBR はそろうと窓を閉じて止まる作りで、残りの耐久は掘らない（AutoGather.cs の終わりの処理）。そこで、収集品の窓で耐久が残り、
+            // 今の収集価値が一番低い報酬の必要値以上なら、こちらで「収集品採集」を押して採り切る。それ以外は窓を閉じる（GBR と同じ：収集品の窓に -1、
+            // 普通の採集の窓が出たらそれにも -1）。GBR は窓を閉じに来るので先に止める。20秒で片付かなければ、このまま次へ進む
+            if (!this.RodFishing && (Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.Gathering]
+                                     || GameUi.IsVisible("GatheringMasterpiece") || GameUi.IsVisible("Gathering")))
+            {
+                this.doneSince ??= DateTime.UtcNow;
+                if (ctx.GatherBuddy.IsAutoGatherEnabled() == true)
+                    ctx.GatherBuddy.SetAutoGatherEnabled(false);
+                if (DateTime.UtcNow - this.doneSince.Value < TimeSpan.FromSeconds(20))
+                {
+                    if (this.FinishNode(ctx))
+                        return TaskResult.Running;
+                }
+                else
+                {
+                    ctx.Log.Warn("採集", $"{this.label}: 20秒たっても採集の窓が閉じません（このまま次へ進みます）");
+                }
             }
 
             ctx.Log.Write("採集", $"{this.label}: そろいました");
