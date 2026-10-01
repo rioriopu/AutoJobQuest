@@ -88,6 +88,15 @@ public interface ICombatWorld
     void Jump()
     {
     }
+
+    /// <summary>深い水に入って泳いでいるか（乗ったまま水面にいるときも含む）。泳いでいる間は攻撃できない。既定は false。</summary>
+    bool Swimming => false;
+
+    /// <summary>
+    /// その位置の真上（80m 上）から真下へ当たり判定のレイキャストをして、最初に当たった面の高さと材質を返す（上に物があるか・水面か・
+    /// 降りられない面かを見る）。当たらない・当たり判定がまだ読み込まれていない（遠い）ときは null。既定は null。
+    /// </summary>
+    (float TopY, ulong Material)? SkyAbove(Vector3 p) => null;
 }
 
 /// <summary>RSR の操作（本番は RotationSolverIpc）。</summary>
@@ -280,4 +289,15 @@ public sealed class GameCombatWorld : ICombatWorld
     public void Mount() => GameUi.UseGeneralAction(9); // マウント・ルーレット（GeneralAction 9：MoveToTask と同じ）
 
     public void Jump() => GameUi.UseGeneralAction(2); // ジャンプ（GeneralAction 2：ゲームデータで確認。ICE の詰まったときと同じ）
+
+    public bool Swimming => Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.Swimming];
+
+    public (float TopY, ulong Material)? SkyAbove(Vector3 p)
+    {
+        // BGCollisionModule.RaycastMaterialFilter（ClientStructs の既製の呼び方：材質 0x4000 の当たり判定を除く。水面・岩・木は当たる）
+        if (FFXIVClientStructs.FFXIV.Common.Component.BGCollision.BGCollisionModule.RaycastMaterialFilter(
+                new Vector3(p.X, p.Y + 80f, p.Z), new Vector3(0, -1, 0), out var hit, 120f))
+            return (hit.Point.Y, hit.Material);
+        return null;
+    }
 }

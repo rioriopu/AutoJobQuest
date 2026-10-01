@@ -87,6 +87,12 @@ public sealed class OwnPath
     /// </summary>
     public float LastGap { get; private set; }
 
+    /// <summary>
+    /// 経路の最後の区間の長さ（<see cref="LastGap"/> と同じ計算）。vnavmesh の経路は、たどり着けない行き先でも途中までの経路の最後に
+    /// 元の行き先を1点足して返すので、3点以上の経路でこれが大きければ、歩いては行き先に着かない（2点以下は 0）。
+    /// </summary>
+    public static float GapOf(IReadOnlyList<Vector3> points) => points.Count >= 3 ? Vector3.Distance(points[^2], points[^1]) : 0f;
+
     /// <summary>最後に渡した経路の長さ（今の位置から経路の点を順にたどった長さ）。</summary>
     public float RouteLength { get; private set; }
 
@@ -140,7 +146,7 @@ public sealed class OwnPath
             if (points == null || points.Count == 0)
                 return State.NoPath;
             // vnavmesh の経路は「出発点・途中の点・終点」に行き先を1点足すので必ず3点以上（届く経路なら最後の2点は同じ点）。2点以下は見ない
-            this.LastGap = points.Count >= 3 ? Vector3.Distance(points[^2], points[^1]) : 0f;
+            this.LastGap = GapOf(points);
 
             // 歩きの経路の最後が大きく途切れていたら（たどり着けない行き先）、壁・崖を貫く最後の区間は捨てて、たどり着ける一番近い所で止まる
             // （不具合の例：崖に向かって走り込んだまま止まった）。小さな途切れ（行き先が机の向こう・台の上など）は従来どおり残す

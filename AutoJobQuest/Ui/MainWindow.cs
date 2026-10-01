@@ -65,6 +65,11 @@ public sealed class MainWindow : Window
     // 必須プラグインの導入（「必須プラグイン」タブ）
     private readonly Ipc.PluginInstaller installer = new();
 
+    // デバッグ：モンスターを倒して素材を集める。一覧（作業用のスレッドで作る）・品ごとの集める数・絞り込み
+    private System.Threading.Tasks.Task<List<DropHuntEntry>>? dropHuntBuild;
+    private readonly Dictionary<uint, int> dropHuntCounts = [];
+    private string dropHuntFilter = string.Empty;
+
     // キャラクタータブとデバッグタブを出しているか・計画タブを続けて押した回数と最後に押した時刻
     private bool showHiddenTabs;
     private int planClicks;
@@ -1017,6 +1022,89 @@ public sealed class MainWindow : Window
         }
     }
 
+    /// <summary>
+    /// デバッグ：モンスターのドロップで集める素材の一覧と、落とすモンスターのボタン。ボタンを押すと、
+    /// 戦闘のジョブに着替えてそのエリアへテレポし、そのモンスターを倒して、指定の数を得たら止まる（DropHuntTask）。
+    /// </summary>
+    private void DrawDropHunt()
+    {
+        if (!ImGui.CollapsingHeader("モンスターを倒して素材を集める（デバッグ）"))
+            return;
+
+        ImGui.TextColored(Grey, "モンスターの名前を押すと、戦闘のジョブに着替えてそのエリアへテレポし、そのモンスターを倒して、指定の数を得たら止まります"
+                                + "（本番の素材集めの戦闘と同じ動き。止めるときは上の「停止」）");
+        if (!this.Ctx.Data.IsReady)
+        {
+            ImGui.TextColored(Grey, "ゲームデータを読み込み中です");
+            return;
+        }
+
+        this.dropHuntBuild ??= System.Threading.Tasks.Task.Run(() => DropHuntCatalog.Build(this.Ctx.Data));
+        if (!this.dropHuntBuild.IsCompleted)
+        {
+            ImGui.TextColored(Grey, "一覧を作っています…");
+            return;
+        }
+
+        if (!this.dropHuntBuild.IsCompletedSuccessfully)
+        {
+            ImGui.TextColored(Red, $"一覧を作れませんでした：{this.dropHuntBuild.Exception?.InnerException?.Message ?? this.dropHuntBuild.Exception?.Message}");
+            if (ImGui.Button("作り直す"))
+                this.dropHuntBuild = null;
+            return;
+        }
+
+        var list = this.dropHuntBuild.Result;
+        ImGui.SetNextItemWidth(260);
+        ImGui.InputTextWithHint("##dropHuntFilter", "品・モンスター・エリアで絞り込む", ref this.dropHuntFilter, 64);
+        ImGui.SameLine();
+        ImGui.TextColored(Grey, $"{list.Count} 品目（全ジョブクエを在庫 0 から作るときに要る数）");
+
+        var unlocked = Svc.Aetherytes.Select(a => a.AetheryteId).ToHashSet();
+        var running = this.services.Runner.IsRunning;
+        var filter = this.dropHuntFilter.Trim();
+        foreach (var e in list)
+        {
+            if (filter.Length > 0 && !e.ItemName.Contains(filter, StringComparison.Ordinal)
+                && !e.Mobs.Any(m => m.Name.Contains(filter, StringComparison.Ordinal) || m.TerritoryName.Contains(filter, StringComparison.Ordinal)))
+                continue;
+
+            using var id = ImRaii.PushId((int)e.ItemId);
+            ImGui.TextUnformatted($"{e.ItemName}　{e.Needed} 個（{e.NeededBy}）");
+            if (e.FirstRoute != Route.Combat)
+            {
+                ImGui.SameLine();
+                ImGui.TextColored(Grey, $"※本来は{RouteName(e.FirstRoute)}で集める品");
+            }
+
+            var n = this.dropHuntCounts.GetValueOrDefault(e.ItemId, e.Needed);
+            ImGui.SetNextItemWidth(100);
+            if (ImGui.InputInt("個 集める##count", ref n, 1, 5))
+                this.dropHuntCounts[e.ItemId] = Math.Clamp(n, 1, 999);
+
+            foreach (var m in e.Mobs)
+            {
+                var label = $"{m.Name}（{m.TerritoryName}）##{m.NameIds[0]}_{m.Territory}";
+                var width = ImGui.CalcTextSize(label.Split("##")[0]).X + (ImGui.GetStyle().FramePadding.X * 2);
+                if (ImGui.GetContentRegionAvail().X > width + ImGui.GetStyle().ItemSpacing.X)
+                    ImGui.SameLine();
+                var reachable = CombatPlanner.IsReachable(m.Territory, unlocked);
+                using (ImRaii.Disabled(running || !reachable))
+                {
+                    if (ImGui.Button(label))
+                        this.services.Runner.Start(new DropHuntTask(e, m, this.dropHuntCounts.GetValueOrDefault(e.ItemId, e.Needed)));
+                }
+
+                if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                    ImGui.SetTooltip(!reachable
+                        ? "このエリアの入口のエーテライトが未解放です（または野外のエリアではありません）"
+                        : running ? "動いている間は始められません" : $"出現点 {m.Spots.Count} か所：{string.Join(" ", m.Spots.Take(6).Select(s => $"{s.Spot.X:0.0},{s.Spot.Y:0.0}"))}");
+            }
+
+            ImGui.Spacing();
+        }
+    }
+
     private void DrawLogTab()
     {
         // この実行でマーケットに払う合計の確認（設定タブから移した）
@@ -1033,6 +1121,8 @@ public sealed class MainWindow : Window
             ImGui.TextColored(Grey, "既定は 0（使わない）。「はい」で続けると、さらにこの額を払ったところでまた確かめます");
         }
 
+        ImGui.Separator();
+        this.DrawDropHunt();
         ImGui.Separator();
         if (ImGui.Button("クリップボードへ写す"))
             ImGui.SetClipboardText(string.Join("\n", this.log.Snapshot()));

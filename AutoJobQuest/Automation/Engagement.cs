@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace AutoJobQuest.Automation;
 
@@ -79,6 +81,21 @@ public sealed class Engagement
     private float landTargetClosest = float.MaxValue;
     private DateTime landTargetClosestAt = DateTime.MinValue;
     private DateTime? overVoidAtTargetSince;
+
+    // 降りる場所の候補の確かめ（ICE を手本に、地上の地形を把握して降りる）。
+    //  ・地上の経路：候補ごとに、候補から相手のそばの床まで歩いて行けるかを vnavmesh に問い合わせる（取り消さない：公式版の vnavmesh は
+    //    順番待ちの問い合わせを取り消すと後ろが止まることがあるので、要らなくなったら結果を捨てるだけ）
+    //  ・空と足もと：相手に近づいて当たり判定が読み込まれたら、候補の真上からレイキャストして、上に物があるか・水面か・降りられない面かを見る
+    private List<(Vector3 Pos, Task<List<Vector3>>? Ground)>? landSurvey;
+    private DateTime landSurveySince;
+    private bool landGroundOrdered;
+    private bool landSkyChecked;
+
+    /// <summary>地上の経路の問い合わせを待つ上限（これを過ぎたら、返ってきた分だけで並べる）。</summary>
+    public static readonly TimeSpan LandGroundWait = TimeSpan.FromSeconds(2.5);
+
+    /// <summary>相手からこの水平の距離に来たら、候補の空と足もとをレイキャストで確かめる（当たり判定は自分の周りしか読み込まれない）。</summary>
+    public const float SkyCheckDistance = 100f;
 
     /// <summary>飛んで今の候補へ向かって、これだけ近づかなければ、その候補へは届かないとみて次の候補へ。</summary>
     public static readonly TimeSpan LandTargetStuckAfter = TimeSpan.FromSeconds(6);
@@ -175,6 +192,155 @@ public sealed class Engagement
         return first.Concat(rest).Take(12).ToList();
     }
 
+    /// <summary>候補から相手まで地上を歩いて行けるか。</summary>
+    public enum GroundReach
+    {
+        /// <summary>分からない（問い合わせが返っていない・使えない）。</summary>
+        Unknown,
+
+        /// <summary>歩いて行ける（地上の経路が途中で切れない）。</summary>
+        Walkable,
+
+        /// <summary>歩いては行けない（経路が無い・途中で切れる＝崖・岩の上の相手など）。</summary>
+        CutOff,
+    }
+
+    /// <summary>候補の空と足もと。</summary>
+    public enum SkyKind
+    {
+        /// <summary>分からない（まだ確かめていない・当たり判定が読み込まれていない）。</summary>
+        Unknown,
+
+        /// <summary>上に物が無く、降りられる地面。</summary>
+        Clear,
+
+        /// <summary>水面（浅い水なら立てるが、深い水だと泳いで戦えない）。</summary>
+        Water,
+
+        /// <summary>上に物がある（岩のアーチ・木の枝・屋根）。真上から降りられない。</summary>
+        Overhead,
+
+        /// <summary>降りられない面。</summary>
+        Unlandable,
+    }
+
+    /// <summary>当たり判定の材質の「降りられない」（vnavmesh の SceneExtractor.ExtractMaterialFlags と同じ読み方）。</summary>
+    public const ulong UnlandableMaterial = 0x200000;
+
+    /// <summary>当たり判定の材質の「釣りができる面＝水面」（同上。0xB800 は潜れない水・0xBC00 は潜れる水で、どちらもこのビットがある）。</summary>
+    public const ulong FishableMaterial = 0x8000;
+
+    /// <summary>地上の経路の結果から、歩いて行けるか（経路の最後の区間が 3m を超えれば途中で切れている：<see cref="OwnPath.GapOf"/>）。</summary>
+    public static GroundReach Ground(Task<List<Vector3>>? task)
+    {
+        if (task is not { IsCompletedSuccessfully: true })
+            return GroundReach.Unknown;
+        var path = task.Result;
+        return path is { Count: > 0 } && OwnPath.GapOf(path) <= 3f ? GroundReach.Walkable : GroundReach.CutOff;
+    }
+
+    /// <summary>
+    /// 真上からのレイキャストで最初に当たった面から、候補の空と足もとを決める。最初に当たった面が候補の床より 2m 以上上なら、上に物がある
+    /// （西ザナラーンの例：テリトリアル・ラプトルの岩の上の候補は、上 Y 46〜48 に岩のアーチがあった）。
+    /// </summary>
+    public static SkyKind Sky(Vector3 candidate, (float TopY, ulong Material)? top)
+    {
+        if (top is not { } t)
+            return SkyKind.Unknown;
+        if (t.TopY > candidate.Y + 2f)
+            return SkyKind.Overhead;
+
+        // 最初に当たった面が候補の床より 2m 以上下なら、候補の面（岩などの置き物）の当たり判定がまだ無い・見えていないので分からない
+        // （その下の水面・地面の材質で決めない。地形だけを読んだ調べで、置き物の岩の上の候補が下の水面と取り違えられた）
+        if (t.TopY < candidate.Y - 2f)
+            return SkyKind.Unknown;
+        if ((t.Material & UnlandableMaterial) != 0)
+            return SkyKind.Unlandable;
+        if ((t.Material & FishableMaterial) != 0)
+            return SkyKind.Water;
+        return SkyKind.Clear;
+    }
+
+    /// <summary>
+    /// 候補を試す順の段（小さいほど先。-1 は外す）。歩いて行けて上が開けた地面を先に、水面・上に物がある所を後に、歩いて行けない所を最後に
+    /// （歩いて行けない所も、射程の長いジョブは降りた所から攻撃が届くことがあるので外さない）。降りられない面は外す。
+    /// </summary>
+    public static int Tier(GroundReach ground, SkyKind sky)
+    {
+        if (sky == SkyKind.Unlandable)
+            return -1;
+        var skyRank = sky switch { SkyKind.Clear => 0, SkyKind.Unknown => 1, SkyKind.Water => 2, _ => 3 };
+        return ground switch
+        {
+            GroundReach.Walkable => skyRank,
+            GroundReach.Unknown => 4 + (skyRank >= 2 ? 1 : 0),
+            _ => 6 + (skyRank >= 2 ? 1 : 0),
+        };
+    }
+
+    /// <summary>地上の経路を問い合わせ始める（候補を作ったとき）。行き先は相手のそばのつながっている床（ICE の立ち位置の吸着と同じ）。</summary>
+    private void StartLandingSurvey(INavControl nav, Vector3 foe, DateTime now)
+    {
+        var goal = nav.NearestPointReachable(foe, 3f, 5f) ?? foe;
+        this.landSurvey = this.landCandidates!
+            .Select(c => (c, nav.TryPathfindCancelable(c, goal, false, CancellationToken.None, out var task) ? task : null))
+            .ToList();
+        this.landSurveySince = now;
+        this.landGroundOrdered = this.landSurvey.All(x => x.Ground == null); // 問い合わせが使えなければ、並べ直さない（従来の順）
+        this.landSkyChecked = false;
+    }
+
+    /// <summary>
+    /// 地上の経路が返ってきたら（または待つ上限を過ぎたら）並べ直し、相手に近づいたら空と足もとを確かめてもう一度並べ直す。
+    /// 並べ直すのは、まだ試していない候補（今の番号から後）だけ。
+    /// </summary>
+    private void UpdateLandingSurvey(ICombatWorld world, Vector3 foe, DateTime now)
+    {
+        if (this.landSurvey == null || this.landCandidates == null)
+            return;
+
+        var reorder = false;
+        if (!this.landGroundOrdered && (this.landSurvey.All(x => x.Ground is not { IsCompleted: false }) || now - this.landSurveySince > LandGroundWait))
+        {
+            this.landGroundOrdered = true;
+            reorder = true;
+        }
+
+        var flat = Vector2.Distance(new Vector2(world.MyPosition.X, world.MyPosition.Z), new Vector2(foe.X, foe.Z));
+        var sky = new Dictionary<Vector3, SkyKind>();
+        if (!this.landSkyChecked && this.landGroundOrdered && flat <= SkyCheckDistance)
+        {
+            this.landSkyChecked = true;
+            foreach (var c in this.landCandidates.Skip(this.landIndex))
+                sky[c] = Sky(c, world.SkyAbove(c));
+            reorder = sky.Values.Any(v => v != SkyKind.Unknown) || reorder;
+        }
+
+        if (!reorder)
+            return;
+
+        var ground = this.landSurvey.ToDictionary(x => x.Pos, x => Ground(x.Ground));
+        var rest = this.landCandidates.Skip(this.landIndex)
+            .Select((c, i) => (Pos: c, Index: i, Ground: ground.GetValueOrDefault(c), Sky: sky.GetValueOrDefault(c)))
+            .Select(x => (x.Pos, x.Index, x.Ground, x.Sky, Tier: Tier(x.Ground, x.Sky)))
+            .ToList();
+        var ordered = rest.Where(x => x.Tier >= 0).OrderBy(x => x.Tier).ThenBy(x => x.Index).ToList();
+        this.landCandidates = this.landCandidates.Take(this.landIndex).Concat(ordered.Select(x => x.Pos)).ToList();
+        Core.DebugLog.Current?.Line("戦闘", $"降りる場所の候補を、地上の経路{(sky.Count > 0 ? "と空・足もと" : string.Empty)}で並べ直しました：" + string.Join(" ／ ",
+            rest.OrderBy(x => x.Tier < 0 ? int.MaxValue : x.Tier).ThenBy(x => x.Index).Select(x => $"({x.Pos.X:0},{x.Pos.Y:0},{x.Pos.Z:0}) {GroundText(x.Ground)}・{SkyText(x.Sky)}{(x.Tier < 0 ? "→外す" : string.Empty)}")));
+    }
+
+    private static string GroundText(GroundReach g) => g switch { GroundReach.Walkable => "歩いて行ける", GroundReach.CutOff => "歩いては行けない", _ => "経路不明" };
+
+    private static string SkyText(SkyKind s) => s switch
+    {
+        SkyKind.Clear => "地面",
+        SkyKind.Water => "水面",
+        SkyKind.Overhead => "上に物",
+        SkyKind.Unlandable => "降りられない面",
+        _ => "空は未確認",
+    };
+
     /// <summary>待たされていた時間（画面が開いていた等）を「HP が減らない時間」に数えない。</summary>
     public void Resume(ICombatWorld world) => this.stall.Resume(world.Now);
 
@@ -236,7 +402,10 @@ public sealed class Engagement
                 this.landTargetClosest = float.MaxValue;
                 this.landTargetClosestAt = now;
                 this.overVoidAtTargetSince = null;
+                this.StartLandingSurvey(nav, t.Position, now);
             }
+
+            this.UpdateLandingSurvey(world, t.Position, now);
 
             if (this.landCandidates.Count > 0)
             {
@@ -286,6 +455,10 @@ public sealed class Engagement
                            ? overLanding || (!haveCandidates && near && !nav.IsMoving() && this.lastApproach != DateTime.MinValue)
                            : near || onCandidate);
 
+        // 飛んでいて、候補の地上の経路を確かめている間は降りない（2.5秒まで。確かめてから、歩いて行ける候補に降りる）
+        if (world.Flying && haveCandidates && !this.landGroundOrdered)
+            wantLand = false;
+
         // 降りられなかった場所から動いている間は降りない。相手のそば（水平 3m）に着いたか、離れて（5m）止まったら降り直す
         if (this.landBlockedAt is { } blocked)
         {
@@ -294,6 +467,26 @@ public sealed class Engagement
                 this.landBlockedAt = null;
             else
                 wantLand = false;
+        }
+
+        // 深い水の上（乗ったまま水面にいて泳いでいる）では降りない。降りると泳いで攻撃できない。次の候補へ飛び立つ
+        // （vnavmesh は、行き先が上にあれば自分でジャンプして飛び立つ：FollowPath.cs。不具合の例：西ザナラーンの水場）
+        if (wantLand && world.Swimming)
+        {
+            wantLand = false;
+            if (this.landCandidates is { Count: > 0 } && this.landIndex < this.landCandidates.Count && now - this.landTargetClosestAt > TimeSpan.FromSeconds(1))
+            {
+                this.NextLandCandidate(now, "水の中です（泳いでいる。降りると攻撃できない）");
+                this.lastApproach = DateTime.MinValue;
+            }
+
+            status = $"{t.Name} の近くですが、水の中なので降りずに、別の降りる場所へ移ります";
+            if (this.landCandidates is { Count: > 0 } lcs && this.landIndex >= lcs.Count)
+            {
+                this.StopApproach(nav);
+                this.StallReason = "の近くに、水の中でない降りられる場所が見つかりません。";
+                return Result.Stalled;
+            }
         }
 
         if (wantLand)
@@ -381,6 +574,23 @@ public sealed class Engagement
         // ハードターゲットが外れていたら付け直す（Henched はハードターゲットだけを殴る）
         if (world.HardTargetId != t.Id)
             world.SetHardTarget(t);
+
+        // 降りた後に泳いでいる（深い水に入った）ときは戦えないので、乗れれば乗って、次の降りる場所へ移る
+        if (!world.Mounted && world.Swimming && world.CanMountNow)
+        {
+            this.approachClosestAt = now;
+            if (now - this.mountAt >= TimeSpan.FromSeconds(2))
+            {
+                if (this.landCandidates is { Count: > 0 } && this.landIndex < this.landCandidates.Count)
+                    this.NextLandCandidate(now, "降りた所が水の中でした（泳いでいる）");
+                this.mountAt = now;
+                this.StopApproach(nav);
+                world.Mount();
+            }
+
+            status = $"{t.Name} の近くですが、水の中では戦えないので、乗って別の場所へ移ります";
+            return Result.Running;
+        }
 
         if (inReach && !world.Mounted)
         {

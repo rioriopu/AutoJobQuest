@@ -145,8 +145,8 @@ public sealed class GameDataCache
         BookData Books,
         Dictionary<uint, List<uint>> QuestBooks);
 
-    /// <summary>何も持っていないとみなす所持数（全部作る場合の計算用）。</summary>
-    private sealed class EmptyInventory : IInventoryView
+    /// <summary>何も持っていないとみなす所持数（全部作る場合の計算用。デバッグの素材の一覧 DropHuntCatalog も使う）。</summary>
+    internal sealed class EmptyInventory : IInventoryView
     {
         public int CountNq(uint itemId) => 0;
 
