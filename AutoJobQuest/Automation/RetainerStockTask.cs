@@ -534,7 +534,9 @@ public sealed unsafe class RetainerStockTask : AutoTask
             var left = this.needed!.Counts.Where(kv => kv.Value > 0).ToList();
             if (left.Count > 0)
                 ctx.Log.Warn("リテイナー", $"引き出しきれなかった品があります：{string.Join("、", left.Select(kv => $"{CraftPlanner.ItemName(kv.Key.Item)}{(kv.Key.Hq ? " HQ" : string.Empty)}×{kv.Value}"))}"
-                                          + "（引き出した後の計画で、ほかの手段に回します）");
+                                          + (this.recorded != null
+                                              ? "（Allagan Tools の記録では持っているはずのリテイナーを開くと、無かった品です。記録が実物より古かったとみて、引き出した後の計画で、ほかの手段に回します）"
+                                              : "（開いたリテイナーから引き出せなかった品です）"));
             return this.StartClose(list);
         }
 
@@ -916,8 +918,13 @@ public sealed unsafe class RetainerStockTask : AutoTask
 
         ctx.Ownership.Clear();
         ctx.InOwnConversation = false;
+        // 引き出しきれなかった品が残ったとき：
+        //  ・全員を開いて実物を読んだ（Allagan Tools を使っていない）なら止める。開いたリテイナーにある品は必ず引き出しにいくので、残るのは引き出しの失敗
+        //  ・Allagan Tools の記録で数えたなら止めない。開いたリテイナーに無かった＝記録が実物より古かった（不具合の例：器識のマテリダ×1 で
+        //    止まった。記録ではあるリテイナーが持つことになっていたが、開くと無く、その後に Allagan Tools が保存した記録でも無かった）。
+        //    残りは記録に出してあり（TickList）、引き出した後に作り直す計画で、ほかの手段（マーケット・採集など）に回る
         var left = this.needed?.Counts.Where(kv => kv.Value > 0).ToList() ?? [];
-        if (left.Count > 0)
+        if (left.Count > 0 && this.recorded == null)
             return this.Fail($"リテイナーから引き出しきれませんでした：{string.Join("、", left.Select(kv => $"{CraftPlanner.ItemName(kv.Key.Item)}×{kv.Value}"))}");
         return TaskResult.Done;
     }
