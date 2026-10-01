@@ -50,6 +50,18 @@ public sealed class CombatTask : AutoTask
     private MoveToTask? moving;
     private DateTime spotArrivedAt = DateTime.MinValue;
 
+    /// <summary>出現点の周りの見回りの点の数（方向）。</summary>
+    public const int RoamDirections = 6;
+
+    /// <summary>見回りの点の、出現点からの距離（地図座標。1.0＝ワールドで 50m）。</summary>
+    public const float RoamRadiusMap = 1.2f;
+
+    // 見かけた目当ての敵の位置を記録した時刻（2秒に1回まで）
+    private DateTime sightedAt = DateTime.MinValue;
+
+    // 移動を作らずに着いた扱いにした時刻（続けて着いたままなら間をあける）
+    private DateTime lastInPlaceAt = DateTime.MinValue;
+
     // 狙っている敵。オブジェクトの参照はフレームをまたいで持たず、GameObjectId で毎回引き直して
     // 名前 ID・BaseId が同じかを確かめる（Dalamud の ObjectTable は枠ごとの入れ物を使い回し、
     // アドレスを書き換える＝ObjectTable.cs:189-225。持ち続けた参照は、敵が消えた後に同じ枠へ入った別の敵を指しうる）
@@ -118,6 +130,29 @@ public sealed class CombatTask : AutoTask
         foreach (var s in mapSpots)
             if (!this.spots.Any(x => Vector2.Distance(x, s) < 1.0f))
                 this.spots.Add(s);
+
+        // 出現点を足す（不具合の例：フリーズドラゴンは出現点が1か所だけで、2匹倒すと湧き直すまでその場で止まり続けた。
+        // 「敵がいなければ次の位置へ回る」を独自に作る。フィールドの敵の湧く場所はゲームのデータに無い）。
+        //  ・前に戦ったときに見かけた位置（MobSightings：このプラグインが自分で記録したもの）
+        //  ・元の出現点の周りの見回りの点（6方向・地図座標で 1.2＝ワールドで約 60m 先）
+        var mobs = needs.SelectMany(n => n.Mobs).Distinct().ToList();
+        foreach (var seen in MobSightings.Get(territory, mobs))
+        {
+            var m = MapCoords.ToMap(territory, seen.X, seen.Z);
+            if (m != Vector2.Zero && !this.spots.Any(x => Vector2.Distance(x, m) < 1.0f))
+                this.spots.Add(m);
+        }
+
+        foreach (var center in this.spots.Take(mapSpots.Count).ToList())
+        {
+            for (var k = 0; k < RoamDirections; k++)
+            {
+                var angle = 2f * MathF.PI * k / RoamDirections;
+                var p = center + (new Vector2(MathF.Cos(angle), MathF.Sin(angle)) * RoamRadiusMap);
+                if (!this.spots.Any(x => Vector2.Distance(x, p) < 1.0f))
+                    this.spots.Add(p);
+            }
+        }
     }
 
     public override string Name => $"戦闘: {TeleportTask.TerritoryName(this.territory)}";
@@ -141,10 +176,94 @@ public sealed class CombatTask : AutoTask
         return TaskResult.Running;
     }
 
+    // 倒されたときの立て直し：倒された回数・倒れているのを見たか・最後に「はい」を押した時刻・戻りのテレポ
+    private int deaths;
+    private bool deadSeen;
+    private DateTime returnPressedAt = DateTime.MinValue;
+    private AutoTask? comeBack;
+
+    /// <summary>倒されても立て直す回数（これを超えて倒されたら止める）。</summary>
+    public const int DeathLimit = 3;
+
+    /// <summary>倒されたときの帰還の確認の文（Addon 111「戦闘不能状態になりました。ホームポイントに戻りますか？ ホームポイント：…」：ゲームデータで確認）。</summary>
+    public const uint ReturnHomeConfirmAddon = 111;
+
+    /// <summary>確認の窓の文が、倒されたときの帰還の確認か（後ろのホームポイントの名前は変わるので、前の決まった部分で比べる）。</summary>
+    public static bool IsReturnHomeConfirm(string body)
+    {
+        if (!Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Addon>().TryGetRow(ReturnHomeConfirmAddon, out var row))
+            return false;
+        static string Flat(string t) => GameUi.Normalize(t).Replace("\n", string.Empty).Replace("\r", string.Empty);
+        var fixedPart = Flat(row.Text.ExtractText());
+        return fixedPart.Length > 0 && Flat(body).StartsWith(fixedPart, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// 倒されたら、帰還の確認に「はい」を押して起き上がり（ホームポイントへ戻る）、戦闘のエリアでなければテレポで戻ってやり直す。
+    /// <see cref="DeathLimit"/> 回を超えて倒されたら止める。立て直しの途中なら Running、止めるなら Failed、何も無ければ null。
+    /// 以前は倒されたら全体を止めていた。
+    /// </summary>
+    private unsafe TaskResult? HandleDeath(TaskContext ctx)
+    {
+        var now = DateTime.UtcNow;
+        if (Svc.Objects.LocalPlayer is { } me && me.IsDead)
+        {
+            if (!this.deadSeen)
+            {
+                this.deadSeen = true;
+                this.deaths++;
+                this.PauseOwnMovement(ctx);
+                this.engage.Forget(this.world);
+                if (this.deaths > DeathLimit)
+                    return this.Fail($"倒されました（{this.deaths} 回目）。自動動作を止めます");
+                ctx.Log.Warn("戦闘", $"倒されました（{this.deaths} 回目）。ホームポイントに戻って起き上がり、{TeleportTask.TerritoryName(this.territory)} へ戻ってやり直します");
+            }
+
+            if (GameUi.YesnoText(out var confirm) is { } body && confirm != null && IsReturnHomeConfirm(body) && now - this.returnPressedAt > TimeSpan.FromSeconds(2))
+            {
+                this.returnPressedAt = now;
+                if (GameUi.ClickYes(confirm))
+                    ctx.Log.Write("戦闘", "帰還の確認に「はい」を押しました（ホームポイントに戻ります）");
+            }
+
+            this.Status = "倒されました。ホームポイントに戻ります";
+            return TaskResult.Running;
+        }
+
+        if (!this.deadSeen)
+            return null;
+
+        // 起き上がった：エリアの移動中・動けない間は待ち、戦闘のエリアでなければテレポで戻る
+        if (GameUi.BetweenAreas || !GameUi.PlayerFree())
+        {
+            this.Status = "起き上がるのを待っています";
+            return TaskResult.Running;
+        }
+
+        if (Me.Territory != this.territory)
+        {
+            this.comeBack ??= new TeleportTask(this.territory);
+            var r = this.comeBack.Step(ctx);
+            this.Status = this.comeBack.Status;
+            if (r == TaskResult.Running)
+                return TaskResult.Running;
+            this.comeBack.Cleanup(ctx);
+            var failed = r == TaskResult.Failed ? this.comeBack.FailReason : null;
+            this.comeBack = null;
+            if (failed != null)
+                return this.Fail($"倒された後、{TeleportTask.TerritoryName(this.territory)} へ戻れませんでした（{failed}）");
+            return TaskResult.Running;
+        }
+
+        this.deadSeen = false;
+        ctx.Log.Write("戦闘", $"{TeleportTask.TerritoryName(this.territory)} へ戻りました。戦闘を続けます");
+        return null;
+    }
+
     protected override TaskResult Tick(TaskContext ctx)
     {
-        if (Svc.Objects.LocalPlayer is { } dead && dead.IsDead)
-            return this.Fail("倒されました。自動動作を止めます");
+        if (this.HandleDeath(ctx) is { } death)
+            return death;
 
         // 制限時間を過ぎたら、以後はもう狙わない。集めきれなかった品を記録し、戦闘中なら片づけてから終わる
         // （時間切れの瞬間はたいてい戦闘中。そのまま終わると RSR が止まり、次のテレポ・採集が戦闘中で詰まる）
@@ -242,6 +361,7 @@ public sealed class CombatTask : AutoTask
         }
 
         // 3) 指定のモンスターを探す
+        this.RecordSightings(wanted);
         var mob = FindMob(wanted, this.giveUp);
         if (mob != null)
         {
@@ -332,6 +452,17 @@ public sealed class CombatTask : AutoTask
             ctx.Navmesh.Stop();
     }
 
+    /// <summary>見えている目当ての敵の位置を記録する（2秒に1回まで。次から出現点の候補に足す）。</summary>
+    private void RecordSightings(HashSet<uint> wanted)
+    {
+        if (wanted.Count == 0 || DateTime.UtcNow - this.sightedAt < TimeSpan.FromSeconds(2))
+            return;
+        this.sightedAt = DateTime.UtcNow;
+        foreach (var o in Svc.Objects.OfType<IBattleNpc>().Where(o => o.BattleNpcKind == BattleNpcSubKind.Combatant && wanted.Contains(o.NameId) && IsAlive(o)))
+            MobSightings.Record(this.territory, o.NameId, o.Position);
+        MobSightings.Save();
+    }
+
     private TaskResult Patrol(TaskContext ctx, HashSet<uint> wanted)
     {
         // Henched はハードターゲットしか殴らないので、出現点を回る間は入れたままでよい
@@ -397,6 +528,21 @@ public sealed class CombatTask : AutoTask
             return TaskResult.Running;
         }
 
+        // もう着いている点なら、移動を作らずに着いた扱いにする（以前は移動を作っては即座に終わる、を毎フレーム繰り返した：記録で6千回）。
+        // 続けて着いたままなら、湧きを待つ間をあける（全部の点が近いときに空回りしない）
+        if (Vector2.Distance(new Vector2(Me.Position.X, Me.Position.Z), new Vector2(onFloor.Value.X, onFloor.Value.Z)) <= 8f)
+        {
+            if (DateTime.UtcNow - this.lastInPlaceAt < TimeSpan.FromSeconds(3))
+            {
+                this.Status = $"出現点 {this.spotIndex + 1}/{this.spots.Count} の近くで湧きを待っています";
+                return TaskResult.Running;
+            }
+
+            this.lastInPlaceAt = DateTime.UtcNow;
+            this.spotArrivedAt = DateTime.UtcNow;
+            return TaskResult.Running;
+        }
+
         this.moving = new MoveToTask(onFloor.Value, 8f, $"出現点 {spot.X:0.0},{spot.Y:0.0}", TimeSpan.FromMinutes(3));
         this.spotArrivedAt = DateTime.MinValue;
         return TaskResult.Running;
@@ -426,6 +572,9 @@ public sealed class CombatTask : AutoTask
 
     public override void Cleanup(TaskContext ctx)
     {
+        this.comeBack?.Cleanup(ctx);
+        this.comeBack = null;
+        MobSightings.Save(force: true);
         ctx.CombatInProgress = false;
         this.CancelMove(ctx);
         var approachDest = this.engage.ApproachIssued ? this.engage.ApproachDestination : null;

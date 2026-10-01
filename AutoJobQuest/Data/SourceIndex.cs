@@ -402,4 +402,17 @@ public static class MapCoords
         float Conv(float c, short offset) => (50f * (c - 1f - (2048f / scale))) - offset;
         return new Vector3(Conv(mapX, map.OffsetX), 0, Conv(mapY, map.OffsetY));
     }
+
+    /// <summary>ワールド座標（X・Z）を地図座標へ（<see cref="ToWorld"/> の逆。c = 0.02 × (value + offset) + 2048 / SizeFactor + 1）。</summary>
+    public static Vector2 ToMap(uint territory, float worldX, float worldZ)
+    {
+        var terr = Svc.Data.GetExcelSheet<TerritoryType>();
+        if (!terr.TryGetRow(territory, out var t) || !t.Map.IsValid)
+            return Vector2.Zero;
+
+        var map = t.Map.Value;
+        var scale = map.SizeFactor == 0 ? 100f : map.SizeFactor;
+        float Conv(float v, short offset) => (0.02f * (v + offset)) + (2048f / scale) + 1f;
+        return new Vector2(Conv(worldX, map.OffsetX), Conv(worldZ, map.OffsetY));
+    }
 }
