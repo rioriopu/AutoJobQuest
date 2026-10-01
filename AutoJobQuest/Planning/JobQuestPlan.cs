@@ -762,6 +762,41 @@ public static class PlanBuilder
     public static double GatherUpRemaining(ItemSources s, IReadOnlySet<uint> unlocked, Func<uint, int>? jobLevel, Func<uint, bool>? hasGearset, double hour)
         => Leveled(Reachable(s, unlocked), jobLevel, hasGearset).Select(g => UpRemaining(g.UpHours, hour)).DefaultIfEmpty(0).Max();
 
+    /// <summary>その時刻から、次に出るまで何時間か（ET の時。出ていれば 0。一度も出なければ null）。</summary>
+    public static double? HoursUntilUp(uint upHours, double hour)
+    {
+        if (UpRemaining(upHours, hour) > 0)
+            return 0;
+        var h0 = (int)Math.Floor(hour) % 24;
+        for (var k = 1; k <= 24; k++)
+        {
+            if ((upHours >> ((h0 + k) % 24) & 1) != 0)
+                return k - (hour - Math.Floor(hour));
+        }
+
+        return null;
+    }
+
+    /// <summary>出ている時刻の説明（「ET 8〜10時・20〜22時」。続く時をまとめる）。</summary>
+    public static string UpHoursText(uint upHours)
+    {
+        if ((upHours & GatherSpot.AllHours) == GatherSpot.AllHours)
+            return "ET いつでも";
+        var parts = new List<string>();
+        for (var h = 0; h < 24; h++)
+        {
+            // 前の時から続いている時は飛ばす（0時は、23時から続いていれば飛ばす）
+            if ((upHours >> h & 1) == 0 || (upHours >> ((h + 23) % 24) & 1) != 0)
+                continue;
+            var end = h;
+            while ((upHours >> ((end + 1) % 24) & 1) != 0 && (end + 1) % 24 != h)
+                end++;
+            parts.Add($"{h}〜{(end + 1) % 24}時");
+        }
+
+        return parts.Count == 0 ? "（出る時刻がありません）" : $"ET {string.Join("・", parts)}";
+    }
+
     /// <summary>次に出る時刻の説明（「ET 16:00 から」）。出る点が無ければ「出る点がありません」。</summary>
     private static string NextUpText(ItemSources s, IReadOnlySet<uint> unlocked, double hour)
     {

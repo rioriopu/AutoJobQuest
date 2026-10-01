@@ -126,6 +126,26 @@ public sealed unsafe class QuestTask : AutoTask
     private QuestionableStep? lv1Accept;
     private AutoTask? lv1Equip;
 
+    /// <summary>このクエスト（Quest シートの行）。</summary>
+    public uint QuestRowId => this.quest.RowId;
+
+    /// <summary>後回しにしてよいか（ほかに進められる職のジョブクエがあるとき。JobQuestFlow が決める）。</summary>
+    public bool CanDefer { get; init; }
+
+    /// <summary>
+    /// 採集の手順の品が時限の採集点でしか採れず、今は出ていないので、このクエストを後回しにした：次に採れるようになる時刻（UTC）。後回しにしていなければ null。
+    /// 不具合の例：採掘師と園芸師を選んで始めたら、採掘師 Lv70 の硬拳石（ET 8〜10時・20〜22時だけ出る採集点）の手順で、
+    /// Questionable が出ていない採集点の前で黙って待ち（画面は「手順 3-0 Gather」のまま）、止まったように見えた。待つ間に園芸師を進められた
+    /// </summary>
+    public DateTime? DeferredUntil { get; private set; }
+
+    /// <summary>時刻を待つのがこれより長ければ、ほかの職のジョブクエを先に進める（短ければ、ここで待つ）。</summary>
+    public static readonly TimeSpan DeferOver = TimeSpan.FromMinutes(5);
+
+    // 時限の採集点を待っている間の、状態の欄に足す説明・同じことを2度書かない控え
+    private string? timedWaitNote;
+    private string lastTimedNote = string.Empty;
+
     public QuestTask(JobQuest quest)
     {
         this.quest = quest;
@@ -298,6 +318,10 @@ public sealed unsafe class QuestTask : AutoTask
             return TaskResult.Running;
         if (this.HandleWeatherFish(ctx))
             return TaskResult.Running;
+
+        // 採集の手順の品が時限の採集点でしか採れず、今は出ていない：ほかの職のジョブクエがあれば、このクエストを後回しにする（後始末で Questionable を止める）
+        if (this.HandleTimedGather(ctx))
+            return TaskResult.Done;
         if (this.HandleMissingBait(ctx, out var baitFail))
             return baitFail != null ? this.Fail(baitFail) : TaskResult.Running;
 
@@ -415,7 +439,8 @@ public sealed unsafe class QuestTask : AutoTask
         var stepData = ctx.Questionable.GetCurrentStepData();
         if (stepData != null && stepData.QuestId == QuestionableIpc.ToQuestId(this.quest.RowId))
         {
-            this.Status = $"Questionable: 手順 {stepData.Sequence}-{stepData.Step} {stepData.InteractionType}";
+            this.Status = $"Questionable: 手順 {stepData.Sequence}-{stepData.Step} {stepData.InteractionType}"
+                          + (stepData.InteractionType == "Gather" && this.timedWaitNote is { } note ? $"（{note}）" : string.Empty);
             this.lastStepText = $"{stepData.Sequence}-{stepData.Step} {stepData.InteractionType}";
 
             // Questionable が推奨装備に着替える手順（園芸師のジョブクエ17本）。完了したら、その職のギアセットに着直す
@@ -1074,6 +1099,56 @@ public sealed unsafe class QuestTask : AutoTask
 
     /// <summary>検証の仕組み用：設定すると、止めた時点のエリアへ戻るテレポの代わりにこれが作る作業を使う。本番では null のまま。</summary>
     public static Func<uint, AutoTask>? TestReturnTask { get; set; }
+
+    /// <summary>
+    /// Questionable の今の手順が採集（Gather）で、その品が時限の採集点でしか採れず、今は出ていないとき（硬拳石：ET 8〜10時・20〜22時）。
+    /// Questionable は、出ていない採集点の前で、出るまで黙って待つ（Questionable の GatheringController：採集点がどれも触れなければ何もしない。
+    /// 出れば採り始める）。こちらは、待っている理由と次に採れる時刻を状態の欄と記録に出す。
+    /// 次に採れるまで <see cref="DeferOver"/> より長く、ほかの職のジョブクエを進められるなら（<see cref="CanDefer"/>）、このクエストを後回しにする（true）。
+    /// 品がそろっている・いつも出ている点がある・品の採集点が分からないときは何もしない。
+    /// </summary>
+    private bool HandleTimedGather(TaskContext ctx)
+    {
+        this.timedWaitNote = null;
+        var step = ctx.Questionable.GetCurrentStepData();
+        if (step == null || step.InteractionType != "Gather" || ctx.Questionable.IsRunning() != true
+            || step.QuestId != QuestionableIpc.ToQuestId(this.quest.RowId) || ctx.Data.Sources is not { } sources)
+            return false;
+        var gather = this.paths?.FirstOrDefault(s => s.Sequence == step.Sequence && s.Index == step.Step && s.Type == "Gather");
+        if (gather?.GatherItemId is not { } item || Inventory.CountNow(item) >= (gather.GatherCount ?? 1))
+            return false;
+        var spots = sources.Get(item).Gather;
+        if (spots.Count == 0 || spots.Any(g => g.UpHours == GatherSpot.AllHours))
+            return false;
+
+        var mask = spots.Aggregate(0u, (m, g) => m | g.UpHours);
+        var hour = EorzeaTime.Hour();
+        if (Planning.PlanBuilder.HoursUntilUp(mask, hour) is not { } until || until <= 0)
+            return false;
+
+        var wait = TimeSpan.FromSeconds(until * EorzeaTime.SecondsPerHour);
+        var name = CraftPlanner.ItemName(item);
+        var opens = EorzeaTime.Clock((hour + until) % 24);
+        var why = $"{name} は採集点が {Planning.PlanBuilder.UpHoursText(mask)} にしか出ません。いまは ET {EorzeaTime.Clock(hour)} で、次に採れるのは ET {opens}（約 {Math.Ceiling(wait.TotalMinutes):0} 分後）";
+        if (this.CanDefer && wait > DeferOver)
+        {
+            this.DeferredUntil = DateTime.UtcNow + wait;
+            ctx.Questionable.Stop(Plugin.InternalNameConst);
+            ctx.Log.Write("クエスト", $"{why}なので、それまで {this.quest} を後回しにして、ほかの職のジョブクエを先に進めます（採れる時刻が近づいたら戻ります）");
+            return true;
+        }
+
+        this.timedWaitNote = $"{name} の採集点が出る ET {opens} まで待っています。あと約 {Math.Ceiling(wait.TotalMinutes):0} 分";
+        var key = $"{item}:{opens}";
+        if (this.lastTimedNote != key)
+        {
+            this.lastTimedNote = key;
+            ctx.Log.Write("クエスト", $"{why}なので、Questionable が採集点の前で出るのを待ちます（出れば Questionable が採ります）"
+                                     + (this.CanDefer ? string.Empty : "。ほかに先に進められるジョブクエがありません"));
+        }
+
+        return false;
+    }
 
     /// <summary>
     /// Questionable の今の手順から後に、同じ段の釣りの手順があり、その魚が天気・時間帯の限られた魚なら、釣りの手順のエリアに着いたところで天気・時間を見る

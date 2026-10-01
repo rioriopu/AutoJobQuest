@@ -81,6 +81,12 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
     // 品ごとの、戦闘で行って見つからなくなったエリア（次の周回で別のエリアにする：CombatTask.MovedOn）
     private readonly Dictionary<uint, HashSet<uint>> combatTried = [];
 
+    // 時限の採集点を待つので後回しにしたクエストと、採れるようになる時刻（UTC。QuestTask.DeferredUntil）
+    private readonly Dictionary<uint, DateTime> deferredQuests = [];
+
+    /// <summary>後回しにしたクエストへ、採れるようになる時刻のこれだけ前に戻る（採集点まで移る時間）。</summary>
+    public static readonly TimeSpan DeferReturnLead = TimeSpan.FromMinutes(2);
+
     // 採集・戦闘などで集めきれず、マーケット購入への切り替えを利用者が「はい」と答えた品目
     // マーケットへの切り替えを了承された品と、了承した数の合計（区切りごとに聞き直す。了承した数を超えたら聞き直す）。
     // 比べるのは、この区切りでその品を買いに行った数の合計（以前はその周回の不足数と比べたので、作り直しのたびに聞かずに買った）
@@ -213,6 +219,8 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
             var done = this.child;
             this.child = null;
             var failed = r == TaskResult.Failed ? done.FailReason : null;
+            if (done is QuestTask { DeferredUntil: { } until } deferred)
+                this.deferredQuests[deferred.QuestRowId] = until;
             done.Cleanup(ctx);
             if (failed != null)
                 return this.Fail(failed);
@@ -1495,7 +1503,37 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         // 蒼天の Lv50 クエスト「槍の持ち主を訪ねて」等＝Lv53 の直接の前提が抜けていた。jqa qinfo で8職とも確認）。
         // 前提は同じ区分（クラス・ジョブ）のものだけ自動で進める。メインクエスト等が未完了なら理由を出して止める
         // （前提の結合条件＝PreviousQuestJoin の意味はソースで確かめられなかったので、全部そろえる側＝止まる側に倒す）
-        var next = plan.RemainingQuests[0];
+        // 時限の採集点を待つので後回しにしたクエスト（QuestTask.DeferredUntil。不具合の例：採掘師と園芸師を選んだら、
+        // 採掘師 Lv70 の硬拳石の採集点が出るのを黙って待ち、園芸師に移らなかった）。採れる時刻の少し前になったら戻る。
+        // それまでは、その職のクエスト（後のクエストは、このクエストが済まないと受けられない）を飛ばして、ほかの職のクエストを進める
+        foreach (var id in this.deferredQuests.Keys.ToList())
+        {
+            if (plan.RemainingQuests.All(q => q.RowId != id))
+                this.deferredQuests.Remove(id);
+            else if (DateTime.UtcNow >= this.deferredQuests[id] - DeferReturnLead)
+            {
+                this.deferredQuests.Remove(id);
+                ctx.Log.Write("クエスト", $"後回しにしていた {Unlocks.QuestName(id)} の採集点が、もうすぐ出るので戻ります");
+            }
+        }
+
+        var heldJobs = plan.RemainingQuests.Where(q => this.deferredQuests.ContainsKey(q.RowId)).Select(q => q.ClassJobId).ToHashSet();
+        var next = plan.RemainingQuests.FirstOrDefault(q => !heldJobs.Contains(q.ClassJobId));
+
+        // このクエストも時限の採集点で後回しにしてよいか：ほかの職にまだ進められるクエストがある、または後回しにしたクエストがある
+        // （両方とも採集点を待つなら、先に採れる方へ戻って待つため。戻った先〔下〕では後回しにしない＝行ったり来たりしない）
+        var canDefer = next != null
+                       && (plan.RemainingQuests.Any(q => q.ClassJobId != next.ClassJobId && !heldJobs.Contains(q.ClassJobId)) || this.deferredQuests.Count > 0);
+        if (next == null)
+        {
+            // 残りが全部、後回しの職のクエスト：いちばん早く採れるようになるクエストへ戻って、そこで待つ
+            var soonest = this.deferredQuests.MinBy(kv => kv.Value);
+            this.deferredQuests.Remove(soonest.Key);
+            next = plan.RemainingQuests.First(q => q.RowId == soonest.Key);
+            ctx.Log.Write("クエスト", $"ほかに先に進められるジョブクエが無いので、後回しにしていた {next} に戻り、採集点が出るのを待ちます"
+                                     + $"（約 {Math.Max(0, Math.Ceiling((soonest.Value - DateTime.UtcNow).TotalMinutes)):0} 分後）");
+        }
+
         var chain = Unlocks.ChainToRun(next.RowId, out var blocked);
         if (blocked != null)
             return this.Fail($"{Jobs.Name(next.ClassJobId)} {next} の前提を進められません：{blocked}");
@@ -1532,7 +1570,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
 
         // 1本ずつ進め、終わるたびに計画を立て直す（Questionable が Artisan の既製リストで
         // 手持ちの材料を使うことがあるので、次のクエストの納品物が残っているかを毎回確かめてから始める）
-        this.child = new QuestTask(next);
+        this.child = new QuestTask(next) { CanDefer = canDefer };
         return TaskResult.Running;
     }
 
