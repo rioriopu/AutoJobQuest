@@ -27,6 +27,28 @@ public sealed class MainWindow : Window
     private static readonly Vector4 Red = new(1f, 0.45f, 0.45f, 1f);
     private static readonly Vector4 Green = new(0.5f, 0.9f, 0.5f, 1f);
     private static readonly Vector4 Grey = new(0.7f, 0.7f, 0.7f, 1f);
+    private static readonly Vector4 Orange = new(1f, 0.6f, 0.15f, 1f);
+
+    // 職ごとの「ジョブクエを全部終えたか」（ゲームデータを読み終えるまでは null。2秒ごとに読み直す）
+    private bool[]? jobDone;
+    private DateTime jobDoneAt = DateTime.MinValue;
+
+    /// <summary>
+    /// 職ごとに、このプラグインが扱うジョブクエ（Lv1〜70）を全部終えたか（終えた職は「完了」と出し、選べないようにする）。
+    /// 一覧に1本も無い職は終えたとしない。ゲームデータを読み終えていない・ログインしていなければ null。
+    /// </summary>
+    private bool[]? JobsDone()
+    {
+        if (!Me.Available || this.Ctx.Data.Quests is not { } catalog)
+            return null;
+        if (this.jobDone != null && DateTime.UtcNow - this.jobDoneAt < TimeSpan.FromSeconds(2))
+            return this.jobDone;
+        this.jobDone = Jobs.QuestJobs
+            .Select(job => catalog.Quests.Where(q => q.ClassJobId == job).ToList() is { Count: > 0 } list && list.All(q => GameMemory.IsQuestComplete(q.RowId)))
+            .ToArray();
+        this.jobDoneAt = DateTime.UtcNow;
+        return this.jobDone;
+    }
 
     private readonly Configuration config;
     private readonly RunLog log;
@@ -231,7 +253,22 @@ public sealed class MainWindow : Window
     private void DrawJobSelection()
     {
         var sel = this.config.SelectedCrafters;
-        var all = sel.All(x => x);
+        var done = this.JobsDone();
+        bool Done(int i) => done != null && i < done.Length && done[i];
+
+        // 終えた職にチェックが残っていれば外す（選べないようにした職を、選んだまま始めないように）
+        if (!this.services.Runner.IsRunning && this.config.OwnerContentId != 0 && Enumerable.Range(0, sel.Length).Any(i => sel[i] && Done(i)))
+        {
+            for (var i = 0; i < sel.Length; i++)
+                if (Done(i))
+                    sel[i] = false;
+            this.config.Save();
+            this.plan = null;
+            this.OnSelectionChanged();
+        }
+
+        var open = Enumerable.Range(0, sel.Length).Where(i => !Done(i)).ToList();
+        var all = open.Count > 0 && open.All(i => sel[i]);
 
         // 選んだ職はキャラクターごとに保存する。ログインしていない間は保存先が無いので変えさせない
         using (ImRaii.Disabled(this.services.Runner.IsRunning || this.config.OwnerContentId == 0))
@@ -239,7 +276,7 @@ public sealed class MainWindow : Window
             if (ImGui.Checkbox("全てON", ref all))
             {
                 for (var i = 0; i < sel.Length; i++)
-                    sel[i] = all;
+                    sel[i] = all && !Done(i);
                 this.config.Save();
                 this.plan = null;
                 this.OnSelectionChanged();
@@ -260,12 +297,21 @@ public sealed class MainWindow : Window
                             label += v ? $"（残り{remaining}本）" : string.Empty;
                         }
 
-                        if (ImGui.Checkbox($"{label}##job{i}", ref v))
+                        using (ImRaii.Disabled(Done(i)))
                         {
-                            sel[i] = v;
-                            this.config.Save();
-                            this.plan = null;
-                            this.OnSelectionChanged();
+                            if (ImGui.Checkbox($"{label}##job{i}", ref v))
+                            {
+                                sel[i] = v;
+                                this.config.Save();
+                                this.plan = null;
+                                this.OnSelectionChanged();
+                            }
+                        }
+
+                        if (Done(i))
+                        {
+                            ImGui.SameLine();
+                            ImGui.TextColored(Orange, "完了");
                         }
                     }
                 }
