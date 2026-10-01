@@ -15,7 +15,11 @@ namespace AutoJobQuest.Automation;
 /// <param name="ItemId">アイテム。</param>
 /// <param name="TargetOwned">持っていたい総数（今の所持数＋不足数）。</param>
 /// <param name="Mobs">そのエリアで落とすモンスター（名前 ID）。</param>
-public sealed record CombatNeed(uint ItemId, int TargetOwned, List<uint> Mobs);
+public sealed record CombatNeed(uint ItemId, int TargetOwned, List<uint> Mobs)
+{
+    /// <summary>この品を落とす敵が、ほかにも行けるエリアにいるか（いれば、ここで見つからなくなったら別のエリアで続ける：<see cref="CombatTask.MoveOnAfter"/>）。</summary>
+    public bool OtherArea { get; init; }
+}
 
 /// <summary>
 /// 1つのエリアで、指定のモンスターを倒して素材を集める。
@@ -85,6 +89,25 @@ public sealed class CombatTask : AutoTask
 
     // 他のプレイヤーが近くにいて、見回りを止めて待ち始めた時刻（待っていなければ MinValue）
     private DateTime playersWaitSince = DateTime.MinValue;
+
+    // いま集めている素材（見回りは、この素材を落とす敵の群れだけを回る。FocusMobs）
+    private CombatNeed? focus;
+
+    /// <summary>
+    /// ほかにも行けるエリアがある品で、その敵（倒せる個体：生きていて、他人と戦っていない・FATE でない）をこれだけ見かけなければ、
+    /// このエリアではやめて別のエリアで続ける（例：アンフィプテレの粗皮は集めにくく数も多いので、アジス・ラーで
+    /// 探しても見つからなくなったら、ドラヴァニア雲海へテレポして倒しに行く）。倒し続けている間は数え直すので、見つかる間はここで続ける。
+    /// </summary>
+    public static readonly TimeSpan MoveOnAfter = TimeSpan.FromMinutes(3);
+
+    // 品ごとの、その敵（倒せる個体）を最後に見かけた時刻
+    private readonly Dictionary<uint, DateTime> needSeenAt = [];
+
+    /// <summary>このエリアでは見つからなくなったので、別のエリアで続ける品（集めきれなかった品の一部。呼び出し側が次の周回で別のエリアにする）。</summary>
+    public HashSet<uint> MovedOn { get; } = [];
+
+    /// <summary>このエリア。</summary>
+    public uint Territory => this.territory;
 
     // 見かけた目当ての敵の位置を記録した時刻（2秒に1回まで）
     private DateTime sightedAt = DateTime.MinValue;
@@ -303,7 +326,7 @@ public sealed class CombatTask : AutoTask
 
     private HashSet<uint> WantedMobs()
         => this.needs
-            .Where(n => Inventory.CountNow(n.ItemId) < n.TargetOwned)
+            .Where(n => Inventory.CountNow(n.ItemId) < n.TargetOwned && !this.MovedOn.Contains(n.ItemId))
             .SelectMany(n => n.Mobs)
             .Where(m => !this.droppedMobs.Contains(m))
             .ToHashSet();
@@ -314,6 +337,9 @@ public sealed class CombatTask : AutoTask
             return this.Fail("RotationSolverReborn が読み込まれていません");
         if (this.spots.Count == 0)
             return this.Fail("出現位置のデータがありません");
+
+        foreach (var n in this.needs)
+            this.needSeenAt[n.ItemId] = DateTime.UtcNow;
 
         // 回る順（一筆書き）を決め、今いる場所から一番近い点から回る
         this.BuildTour();
@@ -469,7 +495,10 @@ public sealed class CombatTask : AutoTask
             if (GameUi.InCombat)
                 ctx.Log.Warn("戦闘", "2分たっても戦闘状態が解けません。このまま次へ進みます");
 
-            if (!this.timedOut && this.needs.Any(n => Inventory.CountNow(n.ItemId) < n.TargetOwned))
+            var unmet = this.needs.Where(n => Inventory.CountNow(n.ItemId) < n.TargetOwned).ToList();
+            if (!this.timedOut && unmet.Count > 0 && unmet.All(n => this.MovedOn.Contains(n.ItemId)))
+                ctx.Log.Write("戦闘", $"{TeleportTask.TerritoryName(this.territory)}：{string.Join("、", unmet.Select(n => CraftPlanner.ItemName(n.ItemId)))} は、別のエリアで続けます");
+            else if (!this.timedOut && unmet.Count > 0)
                 ctx.Log.Warn("戦闘", $"{TeleportTask.TerritoryName(this.territory)}：落とす敵をどれも見かけないので、ここでの戦闘はやめます"
                                    + "（FATE でしか出ない・出現に条件がある・出現のデータが古い等。集めきれなかった品は次の手段にします）");
             else if (!this.timedOut)
@@ -498,7 +527,10 @@ public sealed class CombatTask : AutoTask
 
         // 2) いまの相手がまだ生きていれば、近づいて RSR に任せる
         if (aimed != null)
+        {
+            this.MarkSeen(aimed.NameId);
             return this.Engage(ctx, aimed);
+        }
 
         this.targetId = 0;
 
@@ -519,6 +551,7 @@ public sealed class CombatTask : AutoTask
         // 3) 指定のモンスターを探す
         this.RecordSightings(wanted);
         this.NoteSeen(wanted);
+        this.CheckMoveOn(ctx);
         var mob = FindMob(wanted, this.giveUp, this.playersWaitSince != DateTime.MinValue ? WaitingSearchRange : SearchRange);
         if (mob != null)
         {
@@ -528,7 +561,7 @@ public sealed class CombatTask : AutoTask
         }
 
         // 4) いなければ出現点を回る
-        return this.Patrol(ctx, wanted);
+        return this.Patrol(ctx, this.FocusMobs(ctx, wanted));
     }
 
     private TaskResult Engage(TaskContext ctx, IBattleNpc t)
@@ -642,9 +675,9 @@ public sealed class CombatTask : AutoTask
                 {
                     this.visitCounted = true;
                     this.CountVisit(ctx, this.spotIndex);
-                    wanted = this.WantedMobs();
+                    wanted.IntersectWith(this.WantedMobs());
                     if (wanted.Count == 0)
-                        return TaskResult.Running; // 次のフレームの始めで終わる（落とす敵をどれも見かけない）
+                        return TaskResult.Running; // 次のフレームの始めで終わる（落とす敵をどれも見かけない）か、次の素材へ移る
                 }
 
                 // 次の点も今いる所のそば（水平 20m 以内：同じ場所に重なる別の敵の点・利用者の狩り場・近い出現点）なら通り抜けない。
@@ -803,8 +836,12 @@ public sealed class CombatTask : AutoTask
         this.seenCheckAt = DateTime.UtcNow;
         // 回るのをやめた敵も見る（出現のデータが古いだけで、あとで現れたら、また狙う）
         var all = this.needs.Where(n => Inventory.CountNow(n.ItemId) < n.TargetOwned).SelectMany(n => n.Mobs).ToHashSet();
+        var meId = Svc.Objects.LocalPlayer?.GameObjectId ?? 0;
         foreach (var o in Svc.Objects.OfType<IBattleNpc>().Where(o => o.BattleNpcKind == BattleNpcSubKind.Combatant && all.Contains(o.NameId) && !IsFateMob(o)))
         {
+            // 倒せる個体（生きていて、他人と戦っていない）を見かけた時刻（別のエリアへ移るかの判断：CheckMoveOn）
+            if (IsAlive(o) && (!o.StatusFlags.HasFlag(StatusFlags.InCombat) || o.TargetObjectId == meId))
+                this.MarkSeen(o.NameId);
             this.seenMobs.Add(o.NameId);
             if (this.droppedMobs.Remove(o.NameId))
                 Core.DebugLog.Current?.Line("戦闘", $"回るのをやめていた {o.Name.TextValue} を見かけたので、また狙います");
@@ -841,6 +878,88 @@ public sealed class CombatTask : AutoTask
     /// </summary>
     public static (int Index, DateTime ArrivedAt) SpotAfterMove(int index, int count, bool failed, DateTime now)
         => failed ? ((index + 1) % count, DateTime.MinValue) : (index, now);
+
+    /// <summary>その敵を落とす品の「最後に見かけた時刻」を今にする。</summary>
+    private void MarkSeen(uint mob)
+    {
+        foreach (var n in this.needs)
+            if (n.Mobs.Contains(mob))
+                this.needSeenAt[n.ItemId] = DateTime.UtcNow;
+    }
+
+    /// <summary>
+    /// ほかにも行けるエリアがある品で、その敵（倒せる個体）を <see cref="MoveOnAfter"/> 見かけなければ、このエリアではやめて別のエリアで続ける（MovedOn）。
+    /// ほかに行けるエリアが無い品は、これまでどおり制限時間まで続ける。
+    /// </summary>
+    private void CheckMoveOn(TaskContext ctx)
+    {
+        foreach (var n in this.needs)
+        {
+            if (!n.OtherArea || this.MovedOn.Contains(n.ItemId) || Inventory.CountNow(n.ItemId) >= n.TargetOwned)
+                continue;
+            if (DateTime.UtcNow - this.needSeenAt.GetValueOrDefault(n.ItemId, DateTime.UtcNow) < MoveOnAfter)
+                continue;
+            this.MovedOn.Add(n.ItemId);
+            ctx.Log.Write("戦闘", $"{TeleportTask.TerritoryName(this.territory)}：{CraftPlanner.ItemName(n.ItemId)} を落とす敵を {MoveOnAfter.TotalMinutes:0} 分見かけないので、"
+                                 + $"ここではやめ、別のエリアで続けます（あと {n.TargetOwned - Inventory.CountNow(n.ItemId)} 個）");
+        }
+    }
+
+    /// <summary>
+    /// 見回りで回る敵：いま集めている素材を落とす敵だけ（例：アジス・ラーで、アンフィプテレの粗皮が集まってから
+    /// キマイラを倒しに向かう。キマイラのタテガミを取りに長距離の移動を繰り返さない。以前は全部の素材の敵の群れを一筆書きで回り続けたので、
+    /// 約 1300m 離れた南西のアンフィプテレと北東のキマイラの間を往復しえた）。
+    /// いまの素材がそろうか、その敵をどれも回らなくなったら、残りの素材のうち、今いる場所から一番近い群れのある素材へ移り、その素材の一番近い群れから回る。
+    /// 見えている敵（FindMob）は素材を問わず倒す（近くにいるので、移動にならない）。
+    /// </summary>
+    private HashSet<uint> FocusMobs(TaskContext ctx, HashSet<uint> wanted)
+    {
+        if (this.focus is { } f && Inventory.CountNow(f.ItemId) < f.TargetOwned && !this.MovedOn.Contains(f.ItemId) && f.Mobs.Any(wanted.Contains))
+            return f.Mobs.Where(wanted.Contains).ToHashSet();
+
+        var open = this.needs.Where(n => Inventory.CountNow(n.ItemId) < n.TargetOwned && !this.MovedOn.Contains(n.ItemId) && n.Mobs.Any(wanted.Contains)).ToList();
+        if (open.Count == 0)
+            return wanted;
+
+        var at = new Vector2(Me.Position.X, Me.Position.Z);
+        float Nearest(CombatNeed n, out int index)
+        {
+            index = -1;
+            var best = float.MaxValue;
+            for (var i = 0; i < this.spots.Count; i++)
+            {
+                if (!n.Mobs.Contains(this.spotMobs[i]) || !wanted.Contains(this.spotMobs[i]))
+                    continue;
+                var w = MapCoords.ToWorld(this.territory, this.spots[i].X, this.spots[i].Y);
+                var d = Vector2.Distance(at, new Vector2(w.X, w.Z));
+                if (d < best)
+                {
+                    best = d;
+                    index = i;
+                }
+            }
+
+            return best;
+        }
+
+        var next = open.MinBy(n => Nearest(n, out _))!;
+        var distance = Nearest(next, out var first);
+        if (this.needs.Count > 1)
+            ctx.Log.Write("戦闘", $"{CraftPlanner.ItemName(next.ItemId)} を{(this.focus == null ? "先に" : "次に")}集めます"
+                                 + (first >= 0 ? $"（今いる所から一番近い群れまで {distance:0}m）" : string.Empty)
+                                 + "。そろうまで、この素材を落とす敵の群れだけを回ります");
+
+        // 前の素材の群れへ向かっている移動は止め、新しい素材の一番近い群れから回る
+        this.focus = next;
+        if (first >= 0 && first != this.spotIndex)
+        {
+            this.CancelMove(ctx);
+            this.spotIndex = first;
+            this.spotArrivedAt = DateTime.MinValue;
+        }
+
+        return next.Mobs.Where(wanted.Contains).ToHashSet();
+    }
 
     /// <summary>
     /// 他のプレイヤー（自分・パーティ・アライアンスの人を除く）が近くにいれば、見回りの移動を止めて待つ（true）。止めるのは水平 50m 以内に来たとき、
@@ -1055,22 +1174,26 @@ public static class CombatPlanner
                && Svc.Data.GetExcelSheet<Aetheryte>().Any(a => a.IsAetheryte && a.Territory.RowId == territory && unlocked.Contains(a.RowId));
     }
 
-    /// <summary>その品を落とすモンスターが、行けるエリアに1か所でも出るか。</summary>
-    public static bool HasReachableSpawn(SourceIndex sources, uint itemId)
+    /// <summary>その品を落とすモンスターが、行けるエリアに1か所でも出るか（<paramref name="tried"/> のエリアは除く）。</summary>
+    public static bool HasReachableSpawn(SourceIndex sources, uint itemId, IReadOnlySet<uint>? tried = null)
     {
         var unlocked = Svc.Aetherytes.Select(a => a.AetheryteId).ToHashSet();
-        return sources.Get(itemId).DropMobs.Any(m => sources.SpawnsOf(m).Any(s => IsReachable(s.Territory, unlocked) && !HuntPrefs.IsSkipped(itemId, s.Territory, m)));
+        return sources.Get(itemId).DropMobs.Any(m => sources.SpawnsOf(m).Any(s => IsReachable(s.Territory, unlocked) && !HuntPrefs.IsSkipped(itemId, s.Territory, m)
+                                                                                   && tried?.Contains(s.Territory) != true));
     }
 
+    /// <param name="tried">品ごとの、もう行って見つからなくなったエリア（外す。見つからなくなったら別のエリアで続ける）。</param>
     public static List<(uint Territory, List<CombatNeed> Needs, List<(Vector2 Spot, uint Mob)> Spots)> Plan(
-        SourceIndex sources, IReadOnlyDictionary<uint, int> shortfalls, out List<uint> unreachable)
+        SourceIndex sources, IReadOnlyDictionary<uint, int> shortfalls, out List<uint> unreachable,
+        IReadOnlyDictionary<uint, HashSet<uint>>? tried = null)
     {
         var inv = Inventory.Snapshot();
         var unlocked = Svc.Aetherytes.Select(a => a.AetheryteId).ToHashSet();
         bool Reachable(uint terr) => IsReachable(terr, unlocked);
 
-        // 品目 → エリア → モンスター
+        // 品目 → エリア → モンスター・品目ごとの、ほかにも行けるエリアがあるか
         var options = new Dictionary<uint, Dictionary<uint, List<uint>>>();
+        var otherArea = new Dictionary<uint, bool>();
         foreach (var (item, _) in shortfalls)
         {
             var byTerr = new Dictionary<uint, List<uint>>();
@@ -1079,7 +1202,8 @@ public static class CombatPlanner
                 foreach (var spot in sources.SpawnsOf(mob))
                 {
                     // 利用者が「狙わない」にした敵は外す（デバッグタブのチェック。素材ごと。例：普段いない敵・その素材を落とさない敵・行かないエリア）
-                    if (!Reachable(spot.Territory) || HuntPrefs.IsSkipped(item, spot.Territory, mob))
+                    if (!Reachable(spot.Territory) || HuntPrefs.IsSkipped(item, spot.Territory, mob)
+                        || (tried != null && tried.TryGetValue(item, out var done) && done.Contains(spot.Territory)))
                         continue;
                     if (!byTerr.TryGetValue(spot.Territory, out var l))
                         byTerr[spot.Territory] = l = [];
@@ -1088,7 +1212,11 @@ public static class CombatPlanner
                 }
             }
 
-            options[item] = byTerr;
+            // 後回しのエリア（利用者が選ぶ。例：アンフィプテレの粗皮はアジス・ラーを先に、ドラヴァニア雲海は後で）は、
+            // ほかに行けるエリアが残っていない（見つからなくなって外した）ときだけ使う。ほかにも行けるエリアがあるかは、後回しも含めて数える
+            otherArea[item] = byTerr.Count > 1;
+            var first = byTerr.Where(kv => !HuntPrefs.IsLater(item, kv.Key)).ToDictionary(kv => kv.Key, kv => kv.Value);
+            options[item] = first.Count > 0 ? first : byTerr;
         }
 
         // 行けるエリアが1つも無い品目は戦闘では集められない
@@ -1111,7 +1239,7 @@ public static class CombatPlanner
             foreach (var item in remaining.Where(i => options[i].ContainsKey(best.Terr)).ToList())
             {
                 var mobs = options[item][best.Terr];
-                needs.Add(new CombatNeed(item, inv.CountAll(item) + shortfalls[item], mobs));
+                needs.Add(new CombatNeed(item, inv.CountAll(item) + shortfalls[item], mobs) { OtherArea = otherArea[item] });
                 foreach (var mob in mobs)
                     spots.AddRange(sources.SpawnsOf(mob).Where(s => s.Territory == best.Terr).Select(s => (new Vector2(s.MapX, s.MapY), mob)));
                 remaining.Remove(item);

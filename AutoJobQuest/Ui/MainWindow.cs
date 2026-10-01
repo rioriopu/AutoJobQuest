@@ -1150,6 +1150,15 @@ public sealed class MainWindow : Window
                     ImGui.SetTooltip(Me.Territory != area.Territory
                         ? $"{area.TerritoryName}にいるときに押せます"
                         : "敵が固まっている場所に立って押すと、この素材の敵は、データの出現点の代わりにここを回って探します（何か所でも足せます）");
+                // 後回し（例：アンフィプテレの粗皮はアジス・ラーで集め、見つからなくなったらドラヴァニア雲海へ）
+                ImGui.SameLine();
+                var later = HuntPrefs.IsLater(e.ItemId, area.Territory);
+                if (ImGui.Checkbox($"後回し##later{area.Territory}", ref later))
+                    HuntPrefs.SetLater(e.ItemId, area.Territory, later);
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("本番の素材集めで、このエリアは、ほかのエリアでこの素材の敵が見つからなくなったときだけ使います"
+                                     + $"（ほかのエリアで、倒せる敵を {CombatTask.MoveOnAfter.TotalMinutes:0} 分見かけなくなったら、次の周回でこちらへテレポします）");
+
                 if (huntSpots.Count > 0)
                 {
                     ImGui.SameLine();

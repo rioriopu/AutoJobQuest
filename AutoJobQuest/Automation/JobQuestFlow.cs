@@ -78,6 +78,9 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
     // 入手に失敗した手段（品目 → 手段）
     private readonly Dictionary<uint, HashSet<Route>> excluded = [];
 
+    // 品ごとの、戦闘で行って見つからなくなったエリア（次の周回で別のエリアにする：CombatTask.MovedOn）
+    private readonly Dictionary<uint, HashSet<uint>> combatTried = [];
+
     // 採集・戦闘などで集めきれず、マーケット購入への切り替えを利用者が「はい」と答えた品目
     // マーケットへの切り替えを了承された品と、了承した数の合計（区切りごとに聞き直す。了承した数を超えたら聞き直す）。
     // 比べるのは、この区切りでその品を買いに行った数の合計（以前はその周回の不足数と比べたので、作り直しのたびに聞かずに買った）
@@ -930,7 +933,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
                 return this.Fail($"戦闘で集める素材（{string.Join("、", combat.Select(kv => $"{CraftPlanner.ItemName(kv.Key)}×{kv.Value}"))}）がありますが、"
                                  + "RSR の外部ターゲット指定が有効、または読めません。指定外を狙わないと確認できるまで戦闘は始められません");
 
-            var combatPlan = CombatPlanner.Plan(ctx.Data.Sources!, combat, out var unreachable);
+            var combatPlan = CombatPlanner.Plan(ctx.Data.Sources!, combat, out var unreachable, this.combatTried);
             foreach (var id in unreachable)
             {
                 // RoutesFor で外しているので通常は来ない。来たら戦闘をあきらめて次の周回で別の手段にする
@@ -1123,7 +1126,23 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
                     break;
                 case CombatTask c:
                     foreach (var id in c.Unfinished)
+                    {
+                        // このエリアで見つからなくなってやめた品は、まだ行っていないエリアが残っていれば、次の周回でそちらで続ける（戦闘は外さない）
+                        if (c.MovedOn.Contains(id))
+                        {
+                            if (!this.combatTried.TryGetValue(id, out var tried))
+                                this.combatTried[id] = tried = [];
+                            tried.Add(c.Territory);
+                            if (CombatPlanner.HasReachableSpawn(ctx.Data.Sources!, id, tried))
+                            {
+                                ctx.Log.Write("素材", $"{CraftPlanner.ItemName(id)} は {TeleportTask.TerritoryName(c.Territory)} で見つからなくなったので、次の周回で別のエリアで集めます");
+                                continue;
+                            }
+                        }
+
                         this.Exclude(id, Route.Combat);
+                    }
+
                     break;
                 case GatherTask g:
                     // 採集と釣りのどちらで失敗したかは、作業の種類で決める（品目の性質で決めると、両方で取れる品で取り違える）。

@@ -13,6 +13,8 @@ namespace AutoJobQuest.Data;
 ///    出現のデータ（LuminaSupplemental の MobSpawn）には、FATE の取り巻きや普段いない敵も入っていて、ゲームデータだけでは見分けられない
 ///    （出現点が1か所の敵には、本当にいる敵〔フリーズドラゴン〕もいない敵もいる。FATE の場所からの距離も重なる）。
 ///    素材ごとに持つ（例：マイトリングはダイアマイトウェブを落とさない。同じ敵でも別の素材は落としうる）。
+///  ・後回しのエリア（素材×エリア）：ほかに行けるエリアで見つからなくなったときだけ行く
+///    （例：アンフィプテレの粗皮はアジス・ラーで集め、見つからなくなったらドラヴァニア雲海へ）。
 ///  ・狩り場（素材×エリア×ワールド座標）：その素材の敵は、データの出現点の代わりにここを回って探す
 ///    （例：北部森林のベーンマイトは決まった場所に固まっているので、そこへ飛んで探す）。
 /// 置き場所はこのプラグインの設定フォルダの hunt_prefs.json（2つのゲームで共有：5秒ごとに読み直し、変えるときは読み直してから書く）。
@@ -28,6 +30,9 @@ public static class HuntPrefs
 
         /// <summary>狩り場。</summary>
         public List<Spot> Spots { get; set; } = [];
+
+        /// <summary>後回しのエリア（「素材:エリア」）：ほかに行けるエリアで見つからなくなったときだけ行く。</summary>
+        public List<string> Later { get; set; } = [];
     }
 
     /// <summary>狩り場（ワールド座標）。</summary>
@@ -38,6 +43,7 @@ public static class HuntPrefs
 
     private static Store? cache;
     private static HashSet<string> cachedSkips = new(StringComparer.Ordinal); // 画面が毎フレーム引くので、引きやすい形でも持つ
+    private static HashSet<string> cachedLater = new(StringComparer.Ordinal);
     private static DateTime cachedAt = DateTime.MinValue;
 
     private static string? FilePath
@@ -82,6 +88,7 @@ public static class HuntPrefs
     {
         cache = store;
         cachedSkips = store.Skips.ToHashSet(StringComparer.Ordinal);
+        cachedLater = store.Later.ToHashSet(StringComparer.Ordinal);
         cachedAt = DateTime.UtcNow;
     }
 
@@ -90,6 +97,7 @@ public static class HuntPrefs
         try
         {
             store.Skips = store.Skips.Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
+            store.Later = store.Later.Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
             if (FilePath is { } p)
                 File.WriteAllText(p, JsonSerializer.Serialize(store, new JsonSerializerOptions { WriteIndented = true }));
         }
@@ -119,6 +127,23 @@ public static class HuntPrefs
                 store.Skips.Add(Key(itemId, territory, id));
         }
 
+        Write(store);
+    }
+
+    /// <summary>その素材を集めるときに、そのエリアは後回しか。</summary>
+    public static bool IsLater(uint itemId, uint territory)
+    {
+        Read(false);
+        return cachedLater.Contains($"{itemId}:{territory}");
+    }
+
+    /// <summary>後回しにする・しないを変えて保存する（読み直してから書く）。</summary>
+    public static void SetLater(uint itemId, uint territory, bool later)
+    {
+        var store = Read(true);
+        store.Later.Remove($"{itemId}:{territory}");
+        if (later)
+            store.Later.Add($"{itemId}:{territory}");
         Write(store);
     }
 
