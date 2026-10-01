@@ -14,7 +14,12 @@ namespace AutoJobQuest.Data;
 /// <param name="Timed">時間限定の採集点にしか無いか。</param>
 /// <param name="Mining">採掘（true）か園芸（false）か。</param>
 /// <param name="Hidden">隠し（HIDDEN）の品か（採集職の「眼力」で確実に出せる。無くても採集点を回るうちに運で出る）。</param>
-public sealed record GatherSpot(uint Territory, int GatheringLevel, bool Timed, bool Mining, bool Hidden = false);
+/// <param name="UpHours">出ている時（エオルゼア時間の 0〜23 時を1ビットずつ。いつも出ている点は <see cref="AllHours"/>）。</param>
+public sealed record GatherSpot(uint Territory, int GatheringLevel, bool Timed, bool Mining, bool Hidden = false, uint UpHours = GatherSpot.AllHours)
+{
+    /// <summary>いつも出ている（24 時間ぶんのビットがすべて立っている）。</summary>
+    public const uint AllHours = 0xFFFFFF;
+}
 
 /// <summary>その品を売るギルショップの1件（店の条件）。</summary>
 /// <param name="Quests">買うのに要るクエスト（店の GilShop.Quest と品の GilShopItem.QuestRequired。空なら条件なし）。</param>
@@ -224,9 +229,40 @@ public sealed class SourceIndex
         var gitems = Svc.Data.GetExcelSheet<GatheringItem>();
         var terrs = Svc.Data.GetExcelSheet<TerritoryType>();
 
-        bool Timed(uint point)
-            => transient.TryGetRow(point, out var t)
-               && (t.GatheringRarePopTimeTable.RowId != 0 || (t.EphemeralStartTime != 65535 && t.EphemeralStartTime != t.EphemeralEndTime));
+        // 出ている時（GBR の BitfieldUptime と同じ読み方：GatherBuddy.GameData の Node.Base.cs・BitfieldUptime.cs）。
+        // 時刻は HHMM（400＝4:00）。未知の採集場所は始まり〜終わり、伝説・時限は始まり＋長さ（200＝2時間。160 は 2時間として扱う）を最大3組
+        static uint Hours(ushort start, ushort end)
+        {
+            if (start == end || start > 2400 || end > 2400)
+                return GatherSpot.AllHours;
+            int s = start / 100, e = end / 100;
+            if (e < s)
+                e += 24;
+            var mask = 0u;
+            for (var i = s; i < e; i++)
+                mask |= 1u << (i % 24);
+            return mask;
+        }
+
+        uint UpHours(uint point)
+        {
+            if (!transient.TryGetRow(point, out var t))
+                return GatherSpot.AllHours;
+            if (t.GatheringRarePopTimeTable.RowId == 0)
+                return Hours(t.EphemeralStartTime, t.EphemeralEndTime);
+            var table = t.GatheringRarePopTimeTable.Value;
+            var mask = 0u;
+            for (var i = 0; i < 3; i++)
+            {
+                var duration = table.Duration[i];
+                if (duration == 0)
+                    continue;
+                var start = table.StartTime[i];
+                mask |= Hours(start, (ushort)((start + (duration == 160 ? 200 : duration)) % 2400));
+            }
+
+            return mask == 0 ? GatherSpot.AllHours : mask;
+        }
 
         bool RealField(uint terr)
             => terr > 1 && terrs.TryGetRow(terr, out var t) && t.TerritoryIntendedUse.RowId == 1;
@@ -266,7 +302,8 @@ public sealed class SourceIndex
             }
 
             var mining = type <= 1;
-            var timed = Timed(p.RowId);
+            var up = UpHours(p.RowId);
+            var timed = up != GatherSpot.AllHours;
             var gis = gb.Item.Select(x => x.RowId).Where(x => x != 0).Concat(extra.GetValueOrDefault(p.RowId) ?? []).Distinct();
             foreach (var gi in gis)
             {
@@ -277,7 +314,7 @@ public sealed class SourceIndex
                 if (item == 0 || item >= 1_000_000)
                     continue;
 
-                var spot = new GatherSpot(terr, gb.GatheringLevel, timed, mining, g.IsHidden);
+                var spot = new GatherSpot(terr, gb.GatheringLevel, timed, mining, g.IsHidden, up);
                 var s = this.Get(item);
                 if (!s.Gather.Contains(spot))
                     s.Gather.Add(spot);

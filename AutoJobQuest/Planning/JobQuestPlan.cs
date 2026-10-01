@@ -358,6 +358,7 @@ public static class PlanBuilder
 
         // 2) 末端素材の入手手段
         var unlockedAetherytes = AreaAccess.UnlockedNow();
+        var etHour = Automation.EorzeaTime.Hour();
         foreach (var (item, total) in plan.Craft.RawTotal.OrderBy(x => x.Key))
         {
             var shortfall = plan.Craft.RawShortfall.GetValueOrDefault(item);
@@ -385,9 +386,10 @@ public static class PlanBuilder
                 if (first == Route.Gather && HiddenGather(data.Sources!.Get(item), unlockedAetherytes, GatherAbilities.Usable, Jobs.Level, GearCheck.HasGearset) is { LuckUsable: false } hidden)
                     plan.Warnings.Add($"{CraftPlanner.ItemName(item)} ×{shortfall}：{hidden.Text}");
 
-                // 時限の採集点でしか採れない品は、時刻を待たずにマーケットで買う
-                if (first == Route.MarketBoard && data.Sources!.Get(item) is { Crystal: CrystalTier.None } timedSrc && TimedOnly(timedSrc))
-                    plan.Warnings.Add($"{CraftPlanner.ItemName(item)} ×{shortfall}：時限の採集点でしか採れないので、時刻を待たずにマーケットで買います（買えなければ採集します）");
+                // 時限の採集点でしか採れない品・元の収集品が時限の点でしか採れない霊砂：今採れるなら採る、採れなければマーケット
+                // （計画を立てた時点の見込み。素材集めを始める時に、もう一度見て決める）
+                if (TimeNote(data.Sources!, item, routes, unlockedAetherytes, etHour) is { } timeNote)
+                    plan.Warnings.Add($"{CraftPlanner.ItemName(item)} ×{shortfall}：{timeNote}");
             }
         }
 
@@ -681,9 +683,108 @@ public static class PlanBuilder
             routes.Remove(Route.Reduce);
 
         // 前提の解放（前提の未達で詰まらないよう、手段を使う前に確かめる。ゲームデータの調査で分かったもの）
-        foreach (var (route, _) in RouteBlockers(sources.Get(itemId), routes, QuestManager.IsQuestComplete, AreaAccess.UnlockedNow(), GatherAbilities.Usable, Jobs.Level, GearCheck.HasGearset))
+        var unlocked = AreaAccess.UnlockedNow();
+        foreach (var (route, _) in RouteBlockers(sources.Get(itemId), routes, QuestManager.IsQuestComplete, unlocked, GatherAbilities.Usable, Jobs.Level, GearCheck.HasGearset))
             routes.Remove(route);
+
+        // 時限の点でしか採れない品・元の収集品が時限の点でしか採れない霊砂は、今採れるなら採る、採れなければマーケット
+        // （天気の魚と同じく、ジョブクエをしている時に採れるなら採る）
+        ReorderByTime(sources, itemId, routes, unlocked, Automation.EorzeaTime.Hour());
         return routes;
+    }
+
+    /// <summary>
+    /// 出ている時間で手段の順番を変える（<see cref="AvailableRoutes"/> の続き。試験できるように時刻を外から渡す）。
+    ///  ・時限の点でしか採れない品（<see cref="ChooseRoutes"/> ではマーケットが先）：行けてレベルとギアセットのある点が今出ていて、
+    ///    残りが <see cref="MinUpHours"/> 以上なら、採集をマーケットより先にする。クリスタル類は変えない（以前からマーケットが先）
+    ///  ・精選（霊砂など）：元の収集品のどれも今採れない（出ていない・間に合わない）なら、マーケットを精選より先にする
+    /// </summary>
+    public static void ReorderByTime(SourceIndex sources, uint itemId, List<Route> routes, IReadOnlySet<uint> unlocked, double hour)
+    {
+        var s = sources.Get(itemId);
+        int Index(Route r) => routes.IndexOf(r);
+        if (s.Crystal == CrystalTier.None && TimedOnly(s) && Index(Route.Gather) > Index(Route.MarketBoard) && Index(Route.MarketBoard) >= 0
+            && GatherUpRemaining(s, unlocked, Jobs.Level, GearCheck.HasGearset, hour) >= MinUpHours)
+        {
+            routes.Remove(Route.Gather);
+            routes.Insert(Index(Route.MarketBoard), Route.Gather);
+        }
+
+        if (Index(Route.Reduce) >= 0 && Index(Route.MarketBoard) > Index(Route.Reduce)
+            && !Automation.ReduceTask.UsableSources(sources, itemId).Any(src => GatherUpRemaining(sources.Get(src), unlocked, Jobs.Level, GearCheck.HasGearset, hour) >= MinUpHours))
+        {
+            routes.Remove(Route.MarketBoard);
+            routes.Insert(Index(Route.Reduce), Route.MarketBoard);
+        }
+    }
+
+    /// <summary>計画の注意：時限の品・霊砂を今採るか買うか（<see cref="ReorderByTime"/> で決めた順番の説明）。当てはまらなければ null。</summary>
+    private static string? TimeNote(SourceIndex sources, uint itemId, List<Route> routes, IReadOnlySet<uint> unlocked, double hour)
+    {
+        var s = sources.Get(itemId);
+        var first = routes.Count > 0 ? routes[0] : Route.Unknown;
+        if (s.Crystal == CrystalTier.None && TimedOnly(s))
+        {
+            if (first == Route.Gather)
+                return $"時限の採集点が今出ているので採集します（ET {Automation.EorzeaTime.Clock((hour + GatherUpRemaining(s, unlocked, Jobs.Level, GearCheck.HasGearset, hour)) % 24)} まで。"
+                       + "間に合わなければマーケットで買います）";
+            if (first == Route.MarketBoard && routes.Contains(Route.Gather))
+                return $"時限の採集点でしか採れず、今は出ていない（間に合わない）ので、マーケットで買います（次は {NextUpText(s, unlocked, hour)}。"
+                       + "素材集めの時に出ていれば採集します）";
+        }
+
+        if (first == Route.MarketBoard && routes.Contains(Route.Reduce))
+            return "精選の元の収集品の採集点が、今はどれも出ていない（間に合わない）ので、マーケットで買います（素材集めの時に出ていれば精選します）";
+        return null;
+    }
+
+    /// <summary>
+    /// 出ていても残りがこれ（ET の時）未満なら、間に合わないとみなして採らない。テレポと移動で現実の 1〜2 分（ET 0.3〜0.7 時間）かかり、
+    /// 出ている時間は ET 2〜4 時間（現実の 6〜12 分）と短い。
+    /// </summary>
+    public const double MinUpHours = 1.0;
+
+    /// <summary>その時刻から、出ている時間があと何時間続くか（ET の時。出ていなければ 0、いつも出ていれば 24）。</summary>
+    public static double UpRemaining(uint upHours, double hour)
+    {
+        if (upHours == GatherSpot.AllHours)
+            return 24;
+        var h0 = (int)Math.Floor(hour) % 24;
+        if ((upHours >> h0 & 1) == 0)
+            return 0;
+        var k = 0;
+        while (k < 24 && (upHours >> ((h0 + k) % 24) & 1) != 0)
+            k++;
+        return k - (hour - Math.Floor(hour));
+    }
+
+    /// <summary>行けて、レベルが届き、ギアセットのある採集点のうち、今出ている点の残りの時間（ET の時。いちばん長いもの。無ければ 0）。</summary>
+    public static double GatherUpRemaining(ItemSources s, IReadOnlySet<uint> unlocked, Func<uint, int>? jobLevel, Func<uint, bool>? hasGearset, double hour)
+        => Leveled(Reachable(s, unlocked), jobLevel, hasGearset).Select(g => UpRemaining(g.UpHours, hour)).DefaultIfEmpty(0).Max();
+
+    /// <summary>次に出る時刻の説明（「ET 16:00 から」）。出る点が無ければ「出る点がありません」。</summary>
+    private static string NextUpText(ItemSources s, IReadOnlySet<uint> unlocked, double hour)
+    {
+        var spots = Leveled(Reachable(s, unlocked), Jobs.Level, GearCheck.HasGearset);
+        var h0 = (int)Math.Floor(hour) % 24;
+        for (var k = 1; k <= 24; k++)
+        {
+            var h = (h0 + k) % 24;
+            if (spots.Any(g => (g.UpHours >> h & 1) != 0))
+                return $"ET {h:00}:00 から";
+        }
+
+        return "出る点がありません";
+    }
+
+    /// <summary>
+    /// 出ている時間で手段が決まる品か（時限の点でしか採れない品、または元の収集品がすべて時限の点でしか採れない精選の品）。
+    /// これらがマーケットに回るのは仕様（採れなければマーケット）どおりなので、切り替えの確認を出さない。
+    /// </summary>
+    public static bool TimeLimited(SourceIndex sources, uint itemId)
+    {
+        var s = sources.Get(itemId);
+        return TimedOnly(s) || (s.CanReduce && s.ReducedFrom.All(src => TimedOnly(sources.Get(src))));
     }
 
     /// <summary>

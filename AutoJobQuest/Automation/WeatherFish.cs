@@ -111,6 +111,9 @@ public static class FishConditions
 /// <summary>エオルゼア時間（1 時間＝現実の 175 秒。ゲームのサーバーの時刻から出す）。</summary>
 public static class EorzeaTime
 {
+    /// <summary>エオルゼア時間の 1 時間の現実の秒数。</summary>
+    public const double SecondsPerHour = 175;
+
     /// <summary>検証の仕組み用：設定すると、今のエオルゼア時間（時。小数で分も表す）をこれで読む。</summary>
     public static Func<double>? TestHour { get; set; }
 
@@ -119,14 +122,18 @@ public static class EorzeaTime
     {
         if (TestHour is { } test)
             return test();
-        long unix;
-        try
+        // ゲームの外（検証の仕組み）や関数の場所が見つからないときは呼ばない（場所の無い関数を呼ぶと、例外ではなく落ちる）
+        long unix = 0;
+        if (GameMemory.Test == null && FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.Addresses.GetServerTime.Value != 0)
         {
-            unix = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.GetServerTime();
-        }
-        catch
-        {
-            unix = 0;
+            try
+            {
+                unix = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.GetServerTime();
+            }
+            catch
+            {
+                unix = 0;
+            }
         }
 
         if (unix <= 0)

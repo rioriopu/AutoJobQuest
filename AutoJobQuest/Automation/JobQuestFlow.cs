@@ -821,6 +821,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         var switched = raw
             .Where(r => r.Routes.Count > 0 && r.Routes[0] == Route.MarketBoard
                         && PlanBuilder.ChooseRoutes(sourcesIdx, r.Item).FirstOrDefault() != Route.MarketBoard
+                        && !PlanBuilder.TimeLimited(sourcesIdx, r.Item) // 出ている時間で決まる品は、確認を出さずにマーケット
                         && !MarketSwitch.Approved(this.marketSwitchApproved, this.marketSwitchUsed, r.Item, r.Need))
             .ToList();
         if (switched.Count > 0)
@@ -865,6 +866,31 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         var market = MarketOrder(marketMateria, raw.Where(r => r.Routes[0] == Route.MarketBoard)
             .Select(r => new MarketNeed([r.Item], r.Need, CraftPlanner.ItemName(r.Item), inv.CountAll(r.Item) + r.Need)));
 
+        // 0) 時限の点でしか採れない品で、今その点が出ているもの（手段の順番で採集が先になった品：PlanBuilder.ReorderByTime）。
+        //    出ている時間は短い（ET 2〜4 時間＝現実の 6〜12 分）ので、ほかの買い物より先に、1品ずつ採る（
+        //    採れるなら採る、採れなければマーケット）。段を始める時に、まだ出ていて間に合うかをもう一度見る。間に合わなければ採らない
+        //    （次の周回で、出ていなければマーケットで買う）。上限は出ている時間が終わるまで（＋1分）。集めきれなければ次の周回でマーケット
+        //    マーケットという代わりが無い（売買できない・出品が無くて外した）品は、ここに入れず、今までどおり時刻を待って採る
+        var timedNow = raw.Where(r => r.Routes[0] == Route.Gather && r.Routes.Contains(Route.MarketBoard) && PlanBuilder.TimedOnly(sourcesIdx.Get(r.Item))).ToList();
+        foreach (var t in timedNow)
+        {
+            var item = t.Item;
+            var targetOwned = inv.CountAll(t.Item) + t.Need;
+            steps.Add(c =>
+            {
+                var rem = PlanBuilder.GatherUpRemaining(sourcesIdx.Get(item), AreaAccess.UnlockedNow(), Jobs.Level, GearCheck.HasGearset, EorzeaTime.Hour());
+                if (rem < PlanBuilder.MinUpHours)
+                {
+                    c.Log.Write("素材", $"{CraftPlanner.ItemName(item)} の採集点が出ている時間に間に合わないので、今は採りません（次の周回で、出ていなければマーケットで買います）");
+                    return null;
+                }
+
+                var limit = TimeSpan.FromSeconds(Math.Min(rem, 24) * EorzeaTime.SecondsPerHour + 60);
+                c.Log.Write("素材", $"{CraftPlanner.ItemName(item)} の採集点が出ているので採ります（残り ET {rem:0.#} 時間＝約 {limit.TotalMinutes:0} 分。間に合わなければマーケットで買います）");
+                return this.Track(new GatherTask([new GatherNeed(item, targetOwned)], null, $"時限の {CraftPlanner.ItemName(item)}", limit) { TimeBound = true });
+            });
+        }
+
         // 切り替えを了承した品は、この周回で買いに行く数を足しておく（了承した数と比べる）
         foreach (var r in raw.Where(r => r.Routes[0] == Route.MarketBoard && PlanBuilder.ChooseRoutes(sourcesIdx, r.Item).FirstOrDefault() != Route.MarketBoard))
             this.marketSwitchUsed[r.Item] = this.marketSwitchUsed.GetValueOrDefault(r.Item) + r.Need;
@@ -878,7 +904,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
 
         // 3) マップごとに：戦闘 → 同じマップで採れる素材の採集
         var combat = raw.Where(r => r.Routes[0] == Route.Combat).ToDictionary(r => r.Item, r => r.Need);
-        var gather = raw.Where(r => r.Routes[0] == Route.Gather).ToList();
+        var gather = raw.Where(r => r.Routes[0] == Route.Gather && !timedNow.Contains(r)).ToList();
         var gatheredInMap = new HashSet<uint>();
 
         // 隠し（HIDDEN）の品は、ほかの素材を先に集め、最後の別の作業（6）にまとめる。
@@ -945,7 +971,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         // 4.5) 採集→精選（霊砂など。収集品を GBR に採らせて精選で得る）
         foreach (var r in raw.Where(r => r.Routes[0] == Route.Reduce))
         {
-            var reduceNeed = new ReduceNeed(r.Item, inv.CountAll(r.Item) + r.Need, ReduceTask.UsableSources(ctx.Data.Sources!, r.Item));
+            var reduceNeed = new ReduceNeed(r.Item, inv.CountAll(r.Item) + r.Need, ReduceTask.UsableSources(ctx.Data.Sources!, r.Item), r.Routes.Contains(Route.MarketBoard));
             steps.Add(_ => this.Track(new ReduceTask(reduceNeed)));
         }
 
@@ -1100,13 +1126,25 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
                         this.Exclude(id, Route.Combat);
                     break;
                 case GatherTask g:
-                    // 採集と釣りのどちらで失敗したかは、作業の種類で決める（品目の性質で決めると、両方で取れる品で取り違える）
+                    // 採集と釣りのどちらで失敗したかは、作業の種類で決める（品目の性質で決めると、両方で取れる品で取り違える）。
+                    // 時限の品を出ている時間の終わりで打ち切ったときは外さない（次の周回で時刻を見て決め直す）
                     foreach (var id in g.Unfinished)
-                        this.Exclude(id, g.Route);
+                    {
+                        if (g.TimeBound)
+                            ctx.Log.Write("素材", $"{CraftPlanner.ItemName(id)} は採集点の出ている時間のうちに集めきれませんでした。次の周回で、出ていなければマーケットで買います");
+                        else
+                            this.Exclude(id, g.Route);
+                    }
+
                     break;
                 case ReduceTask rt:
+                    // 元の収集品の採集点が今どれも出ていなかっただけなら外さない（同上）
                     foreach (var id in rt.Unfinished)
-                        this.Exclude(id, Route.Reduce);
+                    {
+                        if (!rt.OutOfTime)
+                            this.Exclude(id, Route.Reduce);
+                    }
+
                     break;
             }
         }

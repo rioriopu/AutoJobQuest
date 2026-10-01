@@ -140,6 +140,12 @@ public sealed class GatherTask : AutoTask
     /// </summary>
     public bool FastCycle { get; init; }
 
+    /// <summary>
+    /// 採集点の出ている時間の終わりで打ち切る作業（時限の品）。集めきれなくても採集の手段を外さない
+    /// （時間切れは「採れない」ではないので、次の周回で、出ていなければマーケット、マーケットも無ければ時刻を待って採る）。
+    /// </summary>
+    public bool TimeBound { get; init; }
+
     // 竿の釣り（エサを使う）
     private bool RodFishing => this.Route == Planning.Route.Fish && !this.Spearfish;
 

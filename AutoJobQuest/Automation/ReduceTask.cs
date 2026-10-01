@@ -15,7 +15,11 @@ namespace AutoJobQuest.Automation;
 /// <param name="ItemId">欲しい品（霊砂など）。</param>
 /// <param name="TargetOwned">持っていたい総数（今の所持数＋不足数）。</param>
 /// <param name="Sources">精選の元にする採集品（採れる見込みの高い順）。</param>
-public sealed record ReduceNeed(uint ItemId, int TargetOwned, List<uint> Sources);
+/// <param name="CanBuyInstead">
+/// マーケットで代わりに買えるか（手段にマーケットが残っている）。true なら、元の収集品の採集点が今どれも出ていないときは精選せず、
+/// 次の周回でマーケットに回す。false なら、今までどおり出るのを待って採る（ほかに手段が無いので）。
+/// </param>
+public sealed record ReduceNeed(uint ItemId, int TargetOwned, List<uint> Sources, bool CanBuyInstead = false);
 
 /// <summary>
 /// 収集品を GBR に採らせ、こちらで精選して、欲しい品（霊砂など）を集める。
@@ -72,6 +76,12 @@ public sealed unsafe class ReduceTask : AutoTask
 
     /// <summary>集めきれなかった品目（呼び出し側が次の手段を選ぶのに使う）。</summary>
     public List<uint> Unfinished { get; } = [];
+
+    /// <summary>
+    /// 元の収集品の採集点が今どれも出ていないので精選しなかった。この場合は精選の手段を外さない
+    /// （時間の問題で「精選できない」ではないので、次の周回で時刻を見て決め直す）。
+    /// </summary>
+    public bool OutOfTime { get; private set; }
 
     public ReduceTask(ReduceNeed need)
     {
@@ -189,15 +199,38 @@ public sealed unsafe class ReduceTask : AutoTask
             return TaskResult.Done;
         }
 
+        // 今その採集点が出ていて間に合う元の収集品を選ぶ（時限の品は採れるなら採る、採れなければマーケット。
+        // 霊砂の元の収集品は未知の採集場所（エリアごとに ET 4 時間ずつずれて出る）のものが多い）。どれも今は採れなければ、精選では
+        // 集めず、次の周回でマーケットに回す。以前は採集点のレベルの低い順の先頭を選び、出るまで待つことがあった
+        var hour = EorzeaTime.Hour();
+        var unlocked = AreaAccess.UnlockedNow();
+        var upNow = ctx.Data.Sources is { } idx
+            ? this.sources.Select(s => (Item: s, Rem: PlanBuilder.GatherUpRemaining(idx.Get(s), unlocked, Jobs.Level, GearCheck.HasGearset, hour)))
+                .Where(x => x.Rem >= PlanBuilder.MinUpHours).ToList()
+            : this.sources.Select(s => (Item: s, Rem: 24.0)).ToList();
+
+        // マーケットで代わりに買えないときは、今までどおり先頭の元の収集品を、出るのを待って採る（ほかに手段が無い）
+        if (upNow.Count == 0 && !this.need.CanBuyInstead)
+            upNow.Add((this.sources[0], 24.0));
+        if (upNow.Count == 0)
+        {
+            this.OutOfTime = true;
+            this.Unfinished.Add(this.need.ItemId);
+            ctx.Log.Warn("精選", $"精選の元にする収集品（{string.Join("・", this.sources.Select(CraftPlanner.ItemName))}）の採集点が、今はどれも出ていない（間に合わない）ので、"
+                               + $"精選では集めません（次の周回でマーケットで買います。{this.Owned}/{this.need.TargetOwned}）");
+            return TaskResult.Done;
+        }
+
         this.gatherCycles++;
-        this.gatheringSource = this.sources[0];
+        this.gatheringSource = upNow[0].Item;
+        var gatherLimit = upNow[0].Rem >= 24 ? TimeSpan.FromMinutes(60) : TimeSpan.FromSeconds(Math.Min(60 * 60, upNow[0].Rem * EorzeaTime.SecondsPerHour + 60));
         var remaining = this.need.TargetOwned - this.Owned;
         var count = Math.Max(1, (int)Math.Ceiling(remaining / 2.0)); // 1個から1〜4個出るので、半分ずつ採っては精選して確かめる
         var target = this.need.TargetOwned;
         var wanted = this.need.ItemId;
         this.gather = new GatherTask(
             [new GatherNeed(this.gatheringSource, 0, ExtraFromNow: count)], null,
-            $"精選用の {CraftPlanner.ItemName(this.gatheringSource)}", TimeSpan.FromMinutes(60), Route.Reduce)
+            $"精選用の {CraftPlanner.ItemName(this.gatheringSource)}", gatherLimit, Route.Reduce)
         {
             StopWhen = () => Inventory.CountNow(wanted) >= target,
             KeepCollectables = true,
