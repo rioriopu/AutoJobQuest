@@ -37,6 +37,9 @@ public sealed class Engagement
     /// <summary>乗ったまま近づいてよい距離（これより近いか、攻撃が届くなら降りる）。</summary>
     public const float DismountDistance = 20f;
 
+    /// <summary>歩いていて、相手がこれより遠ければ（水平）、マウントに乗って飛んで近づく。</summary>
+    public const float MountApproachDistance = 40f;
+
     /// <summary>飛んでいるときに着地する、相手からの水平の距離（相手の立つ地面の上で降りる。それ以上近づけないときは DismountDistance で降りる）。</summary>
     public const float FlyingLandDistance = 8f;
 
@@ -56,6 +59,7 @@ public sealed class Engagement
     private bool simpleApproach;
     private DateTime lastApproach = DateTime.MinValue;
     private DateTime dismountAt = DateTime.MinValue;
+    private DateTime mountAt = DateTime.MinValue;
 
     // 降りる操作の進み具合（不具合の例：高地ドラヴァニアで物の上にいて、「降りる」は受け付けられるのに着地も降りることも進まず、
     // 45秒送り続けて諦めた）：降り始めた時刻・最後に位置が動いた時刻と位置・降りられなかった位置・動いて降り直した回数
@@ -245,6 +249,24 @@ public sealed class Engagement
             return Result.Running;
         }
 
+        // 歩いていて相手が遠ければ（水平 40m 超）、乗って飛んで近づく（倒したらすぐ乗って次の群れへ飛び、いれば降りて倒す）。
+        // 乗れないとき（戦闘中・乗れないエリア）は歩く
+        if (!world.Mounted && flat > MountApproachDistance && world.CanMountNow)
+        {
+            if (now - this.mountAt >= TimeSpan.FromSeconds(2))
+            {
+                this.mountAt = now;
+                this.StopApproach(nav);
+                world.Mount();
+            }
+
+            status = $"{t.Name} は遠い（水平 {flat:0}m）ので、マウントに乗って近づきます";
+            return Result.Running;
+        }
+
+        // 乗っていて飛べるエリアなら、飛ぶ経路で近づく（地上で乗った直後でも、飛び立って向かう）
+        var flyPath = world.Flying || (world.Mounted && world.CanFlyHere);
+
         // 届かない。近づく（止まっていれば頼む。敵が大きく動いたら頼み直す。1秒に1回まで）。
         // 飛んでいれば飛んで近づく（地上の経路では高度が下がらず、上空に浮いたまま止まった）。水平 20m 以内に来たら上で降りる
         var moving = this.simpleApproach
@@ -256,12 +278,12 @@ public sealed class Engagement
             this.lastApproach = now;
             // 飛んでいれば、vnavmesh の地図で決めた降りる場所へ飛ぶ（無ければ相手の位置）
             var goal = landAt ?? t.Position;
-            if (this.path.Request(nav, world.MyPosition, goal, world.Flying))
+            if (this.path.Request(nav, world.MyPosition, goal, flyPath))
             {
                 this.simpleApproach = false;
                 this.ApproachDestination = t.Position;
             }
-            else if (nav.MoveCloseTo(goal, world.Flying, 2.5f))
+            else if (nav.MoveCloseTo(goal, flyPath, 2.5f))
             {
                 // 取り消せる探索の窓口が使えない。以前の SimpleMove で代える
                 this.simpleApproach = true;

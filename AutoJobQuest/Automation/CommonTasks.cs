@@ -46,6 +46,12 @@ public sealed class MoveToTask : AutoTask
     /// <summary>この時間動かなければ、動けなくなったとみなす。</summary>
     private static readonly TimeSpan StuckAfter = TimeSpan.FromSeconds(4);
 
+    /// <summary>乗る前に、戦闘中の状態が解けるのを待つ上限（倒した直後の残り）。</summary>
+    private static readonly TimeSpan CombatClearWait = TimeSpan.FromSeconds(8);
+
+    // 戦闘中の状態が解けるのを待ち始めた時刻
+    private DateTime? combatWaitSince;
+
     /// <summary>歩きの経路の最後の2点がこれより離れていたら、歩いては行けない（経路が途中で途切れている：OwnPath.LastGap）。</summary>
     private const float PartialGapLimit = 3f;
 
@@ -193,6 +199,18 @@ public sealed class MoveToTask : AutoTask
             // 遠いならマウントに乗り、飛べるなら飛ぶ（フィールドの移動は、近いとき以外は原則マウントに乗って飛ぶ）。乗れない場所では歩く。
             // 乗り終わるまで歩き出さない（歩くと詠唱が途切れる）。テレポで着いた直後は、頼むと「受け付け」と返るのに詠唱が始まらないことがある
             // （例：着いた0.27秒後に頼んで乗れず、歩いた）ので、使えるようになるのを待ってから頼み、1.5秒たっても詠唱が始まらなければ頼み直す（4回まで）
+            // 倒した直後は数秒「戦闘中」の状態が残り、その間に始めると乗れずに歩き出した（倒したらすぐ乗って次の群れへ飛ぶ）。
+            // 乗る距離なら、戦闘中の状態が解けるのを待ってから始める（上限 8秒。それでも解けなければ歩く）
+            if ((this.Distance > this.mountOver || this.forceMount) && !GameUi.Mounted && GameUi.InCombat && CanMountHere())
+            {
+                this.combatWaitSince ??= DateTime.UtcNow;
+                if (DateTime.UtcNow - this.combatWaitSince.Value < CombatClearWait)
+                {
+                    this.Status = "戦闘中の状態が解けるのを待ってから、マウントに乗ります";
+                    return TaskResult.Running;
+                }
+            }
+
             if ((this.Distance > this.mountOver || this.forceMount) && !GameUi.Mounted && !GameUi.InCombat && CanMountHere() && this.mountAttempts < MountAttemptLimit)
             {
                 var now = DateTime.UtcNow;
@@ -452,13 +470,13 @@ public sealed class MoveToTask : AutoTask
         }));
     }
 
-    private static bool CanMountHere()
+    internal static bool CanMountHere()
     {
         var terr = Svc.Data.GetExcelSheet<TerritoryType>();
         return terr.TryGetRow(Me.Territory, out var t) && t.Mount;
     }
 
-    private static unsafe bool CanFlyHere()
+    internal static unsafe bool CanFlyHere()
     {
         var ps = PlayerState.Instance();
         return ps != null && ps->CanFly;

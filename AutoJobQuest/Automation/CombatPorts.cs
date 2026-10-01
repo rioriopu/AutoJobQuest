@@ -72,6 +72,17 @@ public interface ICombatWorld
 
     /// <summary>「降りる」（一般アクション 23）を今ゲームが受け付けられるか（Questionable の LandExecutor と同じ：GetActionStatus が 0）。既定は true。</summary>
     bool DismountReady => true;
+
+    /// <summary>今マウントに乗れるか（乗っていない・戦闘中でない・乗れるエリア・一般アクション 9 が使える）。既定は false。</summary>
+    bool CanMountNow => false;
+
+    /// <summary>このエリアで飛べるか（風脈を開放済み）。既定は false。</summary>
+    bool CanFlyHere => false;
+
+    /// <summary>マウントに乗る（一般アクション 9：マウント・ルーレット）。既定は何もしない。</summary>
+    void Mount()
+    {
+    }
 }
 
 /// <summary>RSR の操作（本番は RotationSolverIpc）。</summary>
@@ -251,4 +262,10 @@ public sealed class GameCombatWorld : ICombatWorld
     public void Dismount() => GameUi.UseGeneralAction(23); // 降りる（GeneralAction 23：ゲームデータで確認）
 
     public bool DismountReady => GameUi.GeneralActionStatus(23) == 0;
+
+    public bool CanMountNow => !GameUi.Mounted && !GameUi.InCombat && MoveToTask.CanMountHere() && GameUi.GeneralActionStatus(9) == 0;
+
+    public bool CanFlyHere => MoveToTask.CanFlyHere();
+
+    public void Mount() => GameUi.UseGeneralAction(9); // マウント・ルーレット（GeneralAction 9：MoveToTask と同じ）
 }

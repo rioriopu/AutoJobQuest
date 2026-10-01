@@ -46,9 +46,10 @@ public sealed class CombatTask : AutoTask
     private readonly List<Vector2> spots;
     private readonly TimeSpan limit;
 
-    // 出現点ごとの敵（名前の番号。spots と同じ並び）と、この一巡で回った出現点
+    // 出現点ごとの敵（名前の番号。spots と同じ並び）・見回りの点か・回る順（一筆書き。決めたら変えない）
     private readonly List<uint> spotMobs = [];
-    private readonly HashSet<int> visitedSpots = [];
+    private readonly List<bool> spotRoam = [];
+    private List<int> tour = [];
 
     private int spotIndex;
     private MoveToTask? moving;
@@ -56,6 +57,9 @@ public sealed class CombatTask : AutoTask
 
     /// <summary>出現点の周りの見回りの点の数（方向）。</summary>
     public const int RoamDirections = 6;
+
+    /// <summary>同じ敵の出現点・見かけた位置を1つの群れにまとめる距離（地図座標。1.5＝ワールドで約 75m）。</summary>
+    public const float ClusterMerge = 1.5f;
 
     /// <summary>出現点の巡回で、マウントに乗る距離（これより遠ければ乗って飛ぶ）。</summary>
     public const float PatrolMountOver = 15f;
@@ -135,11 +139,12 @@ public sealed class CombatTask : AutoTask
         this.needs = needs;
         this.limit = limit;
 
-        // 同じ敵の近い出現点どうしは1つにまとめる（地図座標で 1.0 以内）。どの敵の出現点かを持たせる（集め終えた敵の出現点は回らない）
+        // 群れ（A・B・C に何匹かずつ固まっているなら、A で倒したらすぐ乗って B へ飛び、いれば降りて倒し、C へ、
+        // そして A へ戻って確かめる、を繰り返す）。同じ敵の地図の出現点と前に見かけた位置を、地図座標で 1.5（約 75m）以内なら1つの群れにまとめる。
+        // どの敵の群れかを持たせる（集め終えた敵の群れは回らない）
         this.spots = [];
         foreach (var (s, mob) in mapSpots)
-            this.AddSpot(s, mob);
-        var baseCount = this.spots.Count;
+            this.AddSpot(s, mob, ClusterMerge, roam: false);
 
         // 出現点を足す（不具合の例：フリーズドラゴンは出現点が1か所だけで、2匹倒すと湧き直すまでその場で止まり続けた。
         // 「敵がいなければ次の位置へ回る」を独自に作る。フィールドの敵の湧く場所はゲームのデータに無い）。
@@ -152,50 +157,83 @@ public sealed class CombatTask : AutoTask
             {
                 var m = MapCoords.ToMap(territory, seen.X, seen.Z);
                 if (m != Vector2.Zero)
-                    this.AddSpot(m, mob);
+                    this.AddSpot(m, mob, ClusterMerge, roam: false);
             }
         }
 
-        for (var i = 0; i < baseCount; i++)
+        // 群れが1つしかない敵だけ、その周りの見回りの点（6方向・約 60m 先）を足す（ほかに回る先が無く、1か所に立っていても湧く場所が広くて
+        // 見えない個体がいる：フリーズドラゴン）。群れが2つ以上あれば、群れの間を回る
+        foreach (var mob in mobs)
         {
-            var center = this.spots[i];
+            var own = Enumerable.Range(0, this.spots.Count).Where(i => this.spotMobs[i] == mob).ToList();
+            if (own.Count != 1)
+                continue;
+            var center = this.spots[own[0]];
             for (var k = 0; k < RoamDirections; k++)
             {
                 var angle = 2f * MathF.PI * k / RoamDirections;
-                this.AddSpot(center + (new Vector2(MathF.Cos(angle), MathF.Sin(angle)) * RoamRadiusMap), this.spotMobs[i]);
+                this.AddSpot(center + (new Vector2(MathF.Cos(angle), MathF.Sin(angle)) * RoamRadiusMap), mob, 1.0f, roam: true);
             }
         }
     }
 
-    /// <summary>出現点を足す（同じ敵の出現点が地図座標で 1.0 以内にあれば足さない）。</summary>
-    private void AddSpot(Vector2 p, uint mob)
+    /// <summary>出現点（群れ）を足す（同じ敵の点が地図座標で <paramref name="merge"/> 以内にあれば足さない）。</summary>
+    private void AddSpot(Vector2 p, uint mob, float merge, bool roam)
     {
         for (var i = 0; i < this.spots.Count; i++)
-            if (this.spotMobs[i] == mob && Vector2.Distance(this.spots[i], p) < 1.0f)
+            if (this.spotMobs[i] == mob && Vector2.Distance(this.spots[i], p) < merge)
                 return;
         this.spots.Add(p);
         this.spotMobs.Add(mob);
+        this.spotRoam.Add(roam);
+    }
+
+    /// <summary>回る順を決める：今いる場所から一番近い点を始めに、そこから一番近い未訪の点、と一筆書きにする（決めたら変えない）。</summary>
+    private void BuildTour()
+    {
+        var left = Enumerable.Range(0, this.spots.Count).ToList();
+        var order = new List<int>();
+        var at = new Vector2(Me.Position.X, Me.Position.Z);
+        while (left.Count > 0)
+        {
+            var from = at;
+            var next = left.MinBy(i =>
+            {
+                var w = MapCoords.ToWorld(this.territory, this.spots[i].X, this.spots[i].Y);
+                return Vector2.Distance(new Vector2(w.X, w.Z), from);
+            });
+            order.Add(next);
+            left.Remove(next);
+            var nw = MapCoords.ToWorld(this.territory, this.spots[next].X, this.spots[next].Y);
+            at = new Vector2(nw.X, nw.Z);
+        }
+
+        this.tour = order;
     }
 
     /// <summary>
-    /// 次に向かう出現点：まだ集め終えていない敵の出現点のうち、この一巡でまだ回っていない、今いる場所から一番近い点。全部回ったら一巡をやり直す
+    /// 次に向かう出現点（群れ）：回る順（一筆書き）で今の点の次の、まだ集め終えていない敵の点。最後まで行ったら最初へ戻る（A→B→C→A…）。
     /// （不具合の例：アジス・ラーで長い距離を行ったり来たりした。以前は始めた場所からの距離だけで並べた順に回っていたので、
     /// エーテライトから同じくらいの距離にある南西〔メラシディアン・アンフィプテレ〕と北東〔アラガン・キマイラ〕の点が交互に並び、約1000m を往復していた）
     /// </summary>
     private int NextSpot(HashSet<uint> wanted)
     {
-        var relevant = Enumerable.Range(0, this.spots.Count).Where(i => wanted.Contains(this.spotMobs[i])).ToList();
-        if (relevant.Count == 0)
-            relevant = Enumerable.Range(0, this.spots.Count).ToList();
-        var open = relevant.Where(i => !this.visitedSpots.Contains(i)).ToList();
-        if (open.Count == 0)
+        if (this.tour.Count != this.spots.Count)
+            this.BuildTour();
+        var at = this.tour.IndexOf(this.spotIndex);
+        for (var k = 1; k <= this.tour.Count; k++)
         {
-            this.visitedSpots.Clear();
-            open = relevant.Count > 1 ? relevant.Where(i => i != this.spotIndex).ToList() : relevant;
+            var i = this.tour[(Math.Max(0, at) + k) % this.tour.Count];
+            if (wanted.Contains(this.spotMobs[i]))
+                return i;
         }
 
-        return open.MinBy(i => this.DistanceToSpot(this.spots[i]));
+        return this.spotIndex;
     }
+
+    /// <summary>まだ集め終えていない敵の群れ（見回りの点を除く）の数。1つ以下なら、ほかに回る先が無い。</summary>
+    private int WantedClusters(HashSet<uint> wanted)
+        => Enumerable.Range(0, this.spots.Count).Count(i => !this.spotRoam[i] && wanted.Contains(this.spotMobs[i]));
 
     public override string Name => $"戦闘: {TeleportTask.TerritoryName(this.territory)}";
 
@@ -212,8 +250,14 @@ public sealed class CombatTask : AutoTask
         if (this.spots.Count == 0)
             return this.Fail("出現位置のデータがありません");
 
-        // 今いる場所から一番近い出現点から回る
-        this.spotIndex = this.NextSpot(this.WantedMobs());
+        // 回る順（一筆書き）を決め、今いる場所から一番近い点から回る
+        this.BuildTour();
+        var wantedAtStart = this.WantedMobs();
+        this.spotIndex = this.tour.FirstOrDefault(i => wantedAtStart.Contains(this.spotMobs[i]), this.tour[0]);
+        var roams = this.spotRoam.Count(r => r);
+        ctx.Log.Write("戦闘", $"{TeleportTask.TerritoryName(this.territory)}：群れ {this.spots.Count - roams} か所"
+                             + (roams > 0 ? $"（ほかに見回りの点 {roams} か所）" : string.Empty)
+                             + $"を、{string.Join("→", this.tour.Select(i => $"{this.spots[i].X:0.0},{this.spots[i].Y:0.0}"))} の順に回ります");
         ctx.CombatInProgress = true;
         return TaskResult.Running;
     }
@@ -522,22 +566,20 @@ public sealed class CombatTask : AutoTask
 
             // 着けなかった出現点は「着いた」にしない（以前は着いた印も付けたので、次のフレームで
             // もう1つ進み、出現点を1つ飛ばしていた。出現点が2つだと、遠い方へ一度も行かずに着けない方を繰り返した）
-            var failedSpot = this.spotIndex;
             (this.spotIndex, this.spotArrivedAt) = SpotAfterMove(this.spotIndex, this.spots.Count, r == TaskResult.Failed, DateTime.UtcNow);
             if (r == TaskResult.Failed)
             {
-                // 着けなかった点は、この一巡では回った扱いにして、今いる場所から一番近い次の点へ
-                this.visitedSpots.Add(failedSpot);
+                // 着けなかった点は飛ばして、回る順の次の点へ（SpotAfterMove の「次の番号」は回る順と違うので使わない）
                 this.spotIndex = this.NextSpot(wanted);
             }
 
             return TaskResult.Running;
         }
 
-        // 出現点に着いた。目当ての死体か、他人と戦っている個体が近くにいれば、湧き直し・決着が近いので待つ（上限 20 秒）。
-        // 1体も見えなければ、待たずに次の出現点へ（湧きの時刻はサーバー側で決められないので、見えるものから決める。
-        // 以前は見えるものに関係なく 20 秒待っていた）
-        if (this.spotArrivedAt != DateTime.MinValue)
+        // 出現点に着いた。目当ての敵がいなければ、待たずにすぐ次の群れへ乗って飛ぶ。
+        // ほかに回る群れが無いとき（群れが1つ以下）だけ、目当ての死体か、他人と戦っている個体が近くにいれば、湧き直し・決着が近いので待つ
+        // （上限 20 秒。湧きの時刻はサーバー側で決められないので、見えるものから決める）
+        if (this.spotArrivedAt != DateTime.MinValue && this.WantedClusters(wanted) <= 1)
         {
             var (dead, engaged) = NearbyWanted(wanted);
             if (SpawnWait.Wait(DateTime.UtcNow - this.spotArrivedAt, dead, engaged))
@@ -548,10 +590,7 @@ public sealed class CombatTask : AutoTask
         }
 
         if (this.spotArrivedAt != DateTime.MinValue)
-        {
-            this.visitedSpots.Add(this.spotIndex);
             this.spotIndex = this.NextSpot(wanted);
-        }
 
         // 地図（ナビメッシュ）の準備ができるまで待つ（以前は準備前だと床が見つからず、出現点を全部
         // 「床が無い」として毎フレーム飛ばし続けた。読み込みを頼むのは移動の作業の中だけで、そこまで届かなかった）
@@ -582,7 +621,6 @@ public sealed class CombatTask : AutoTask
         if (onFloor == null)
         {
             // 床が見つからない出現点は飛ばす。続けて全部の出現点で見つからなければ、回り続けずに止める
-            this.visitedSpots.Add(this.spotIndex);
             this.spotIndex = this.NextSpot(wanted);
             this.spotArrivedAt = DateTime.MinValue;
             this.floorMisses++;
@@ -664,12 +702,6 @@ public sealed class CombatTask : AutoTask
 
         if (this.Unfinished.Count == 0)
             this.CollectUnfinished();
-    }
-
-    private float DistanceToSpot(Vector2 spot)
-    {
-        var w = MapCoords.ToWorld(this.territory, spot.X, spot.Y);
-        return Vector2.Distance(new Vector2(w.X, w.Z), new Vector2(Me.Position.X, Me.Position.Z));
     }
 
     internal static bool IsAlive(IBattleNpc npc)
