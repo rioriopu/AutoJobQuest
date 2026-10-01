@@ -541,6 +541,16 @@ public sealed unsafe class MarketBoardTask : AutoTask
     // 検索と検索の最小の間隔（要求を出しすぎない抑え。進む条件ではない）
     private static readonly TimeSpan MinSearchInterval = TimeSpan.FromSeconds(1);
 
+    // 買った後、次の検索までの間隔（不具合の例：剛柔のマテリアを買った0.17秒後に次の品を検索し、MB が「しばらくお待ちください」で
+    // 結果を出さず、10秒待って「検索結果に出てきません」で止まった。購入もサーバーへの要求なので、続けて送ると断られる）
+    private static readonly TimeSpan AfterPurchaseInterval = TimeSpan.FromSeconds(3);
+
+    // 検索結果が出ないときに検索し直した回数（品ごと）
+    private int searchRetries;
+
+    /// <summary>検索結果が出ないとき、検索し直す回数の上限。</summary>
+    private const int SearchRetryLimit = 3;
+
     // こちらが話しかけて MB を開いたか（止めたときに、自分が開いた画面だけを閉じるため）
     private bool openedByMe;
     // 話しかける前に降りる（GameUi.DismountBeforeInteract）
@@ -802,6 +812,7 @@ public sealed unsafe class MarketBoardTask : AutoTask
         this.reuseResults = false;
         this.searching = itemId;
         this.attempts = 0;
+        this.searchRetries = 0;
         this.Go(Phase.Search, $"{CraftPlanner.ItemName(itemId)} を検索します");
     }
 
@@ -886,8 +897,19 @@ public sealed unsafe class MarketBoardTask : AutoTask
             }
         }
 
+        // 結果が出ない：MB が「しばらくお待ちください」で断っていることがある。4秒待って出なければ、間をあけて検索し直す（3回まで）。
+        // それでも出なければ、出品が無いとみなす
+        if (this.TimedOut(TimeSpan.FromSeconds(4)) && this.searchRetries < SearchRetryLimit)
+        {
+            this.searchRetries++;
+            this.searchNotBefore = DateTime.UtcNow + TimeSpan.FromSeconds(2 + this.searchRetries);
+            ctx.Log.Debug("マーケット", $"{CraftPlanner.ItemName(this.searching)} の検索結果が出ないので、間をあけて検索し直します（{this.searchRetries} 回目）");
+            this.Go(Phase.Search, "検索結果が出ないので、間をあけて検索し直します");
+            return TaskResult.Running;
+        }
+
         if (this.TimedOut(TimeSpan.FromSeconds(10)))
-            return this.SkipCandidate(ctx, "検索結果に出てきません");
+            return this.SkipCandidate(ctx, $"検索結果に出てきません（{this.searchRetries + 1} 回検索しました）");
         return TaskResult.Running;
     }
 
@@ -1203,6 +1225,7 @@ public sealed unsafe class MarketBoardTask : AutoTask
             this.boughtForCurrent += count - this.countBefore;
             this.boughtListings.Add(this.buyingListingId);
             ctx.Log.Write("マーケット", $"{CraftPlanner.ItemName(this.buyingItem)} ×{count - this.countBefore} を {paid:N0} ギルで買いました（この実行の合計 {SpentThisRun:N0} ギル）");
+            this.searchNotBefore = DateTime.UtcNow + AfterPurchaseInterval;
 
             if (this.RemainingNeed() > 0)
             {

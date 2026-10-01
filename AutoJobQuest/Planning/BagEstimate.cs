@@ -28,9 +28,19 @@ public static class BagEstimate
     /// <param name="stackSize">品のスタック数。</param>
     /// <param name="isCrystal">クリスタル欄に入る品か（数えない）。</param>
     /// <param name="ingredients">レシピ1回分の材料。</param>
+    /// <param name="owned">
+    /// 鞄にいまある数（null なら数えない＝以前の控えめな見積もり）。製作で鞄の品を使い、数が減ってスタックが空けば、その枠を空いたとして数える
+    /// （不具合の例：錬金術師で、開始時は見積もり 113 枠・空き 127 枠だったが、リテイナーから素材と中間素材を引き出すと空きが 84 枠に減り、
+    /// 見積もりは 98 枠までしか減らず、続きから始められなくなった。引き出した品は製作で使うと空くのに、使う前の分として数え続けていた）。
+    /// </param>
     public static int Slots(CraftPlan craft, int rewardSlots, bool needsBooks, Func<uint, int> stackSize, Func<uint, bool> isCrystal,
-        Func<uint, IEnumerable<(uint Item, int Amount)>> ingredients)
+        Func<uint, IEnumerable<(uint Item, int Amount)>> ingredients, Func<uint, int>? owned = null)
     {
+        // 鞄にある品のうち、製作で使った後の数と、使い切って空いた枠
+        var stock = new Dictionary<uint, int>();
+        var freed = 0;
+        int SlotsOf(uint item, int n) => n <= 0 ? 0 : (n + Math.Max(1, stackSize(item)) - 1) / Math.Max(1, stackSize(item));
+
         // 新しく持つ品（集める素材の不足分と、作った品）。手持ちの在庫は、もとから鞄の枠を使っている（空き枠の数に入っている）
         var held = new Dictionary<uint, int>();
         var split = new HashSet<uint>(craft.Crafts.Where(c => c.WantHq).Select(c => c.ItemId));
@@ -56,19 +66,32 @@ public static class BagEstimate
         {
             foreach (var (item, amount) in ingredients(c.RecipeId))
             {
-                // 新しく持った分から使う（手持ちの在庫から使う分は、枠が空くかもしれないが多めに見て数えない）
+                // 新しく持った分から使い、足りない分は鞄にある分から使う（鞄の分は、スタックが空けばその枠を空いたとして数える）
+                var use = amount * c.Crafts;
                 if (held.TryGetValue(item, out var have))
-                    held[item] = Math.Max(0, have - (amount * c.Crafts));
+                {
+                    var fromNew = Math.Min(have, use);
+                    held[item] = have - fromNew;
+                    use -= fromNew;
+                }
+
+                if (use > 0 && owned != null && !isCrystal(item))
+                {
+                    var before = stock.TryGetValue(item, out var cur) ? cur : Math.Max(0, owned(item));
+                    var after = Math.Max(0, before - use);
+                    freed += SlotsOf(item, before) - SlotsOf(item, after);
+                    stock[item] = after;
+                }
             }
 
             held[c.ItemId] = held.GetValueOrDefault(c.ItemId) + (c.Crafts * Math.Max(1, c.Yield));
-            peak = Math.Max(peak, Count());
+            peak = Math.Max(peak, Count() - freed);
         }
 
         return peak + rewardSlots + (needsBooks ? BooksAllowance : 0);
     }
 
-    /// <summary>ゲームデータのレシピで数える版。</summary>
+    /// <summary>ゲームデータのレシピで数える版（鞄にある品を使い切って空く枠は数えない：控えめな見積もり）。</summary>
     public static int Slots(CraftPlan craft, int rewardSlots, bool needsBooks)
         => Slots(craft, rewardSlots, needsBooks, StackSize, Inventory.IsCrystalItem, RecipeIngredients);
 
@@ -99,7 +122,11 @@ public static class BagEstimate
 
     /// <summary>計画の鞄の見積もり（製作の途中の最大＋報酬＋秘伝書の分）。</summary>
     public static int ForPlan(JobQuestPlan plan)
-        => Slots(plan.Craft, RewardSlots(plan.RemainingQuests), plan.Craft.LockedBySecretBook.Count > 0);
+    {
+        // 鞄にある品を製作で使い切って空く枠も数える（いまの鞄の数は Inventory から。引き出した後に、続きから始められなくなったため：Slots の owned の説明）
+        var bag = Inventory.Snapshot();
+        return Slots(plan.Craft, RewardSlots(plan.RemainingQuests), plan.Craft.LockedBySecretBook.Count > 0, StackSize, Inventory.IsCrystalItem, RecipeIngredients, bag.CountAll);
+    }
 
     /// <summary>
     /// 鞄の空きの不足（枠）。使える空き＝空き − 残しておく空き。足りていれば 0（足りなければ開始できない）。
