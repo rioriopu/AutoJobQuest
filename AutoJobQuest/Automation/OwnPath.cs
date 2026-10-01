@@ -87,6 +87,9 @@ public sealed class OwnPath
     /// </summary>
     public float LastGap { get; private set; }
 
+    /// <summary>最後に渡した経路の長さ（今の位置から経路の点を順にたどった長さ）。</summary>
+    public float RouteLength { get; private set; }
+
     /// <summary>
     /// 探索を頼む（前の探索は取り消す・捨てる）。取り消せる探索の窓口が使えなければ false（呼び出し側が SimpleMove で代える）。
     /// 前に渡した経路は止めない（新しい経路を渡すまで歩き続ける。止めるのは <see cref="Stop"/>）。
@@ -155,6 +158,15 @@ public sealed class OwnPath
             if (!nav.MoveAlong(route, this.fly))
                 return State.Failed;
 
+            var length = 0f;
+            var at = now;
+            foreach (var p in route)
+            {
+                length += Vector3.Distance(at, p);
+                at = p;
+            }
+
+            this.RouteLength = length;
             this.followingEnd = route[^1];
             return State.Following;
         }

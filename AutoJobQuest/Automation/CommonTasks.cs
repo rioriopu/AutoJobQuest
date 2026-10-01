@@ -46,6 +46,46 @@ public sealed class MoveToTask : AutoTask
     /// <summary>この時間動かなければ、動けなくなったとみなす。</summary>
     private static readonly TimeSpan StuckAfter = TimeSpan.FromSeconds(4);
 
+    // スプリントを確かめた経路の終点（同じ経路で何度も確かめない）
+    private Vector3? sprintCheckedFor;
+
+    /// <summary>スプリント（一般アクション 4：ゲームデータで確認）・その効果（50）・街の中で使うと付くジョグ（4209）。</summary>
+    private const uint SprintAction = 4;
+    private const uint SprintStatus = 50;
+    private const uint JogStatus = 4209;
+
+    /// <summary>スプリントを使えなくする効果（Questionable の HasCharacterStatusPreventingMountOrSprint と同じ：変身・透明・運搬・不確定性存在・エンドウォーカー）。</summary>
+    private static readonly uint[] SprintBlockers = [565, 416, 404, 4376, 2729, 2730];
+
+    /// <summary>街など（TerritoryIntendedUse。Questionable と同じ。0＝街：リムサ・ウルダハ・グリダニア・イシュガルド・クガネ・トライヨラ等をゲームデータで確認）。</summary>
+    private static readonly uint[] TownUses = [0, 7, 13, 14, 15, 19, 23, 29];
+
+    /// <summary>
+    /// 歩いて経路をたどり始めたとき、スプリントを使う（街の中の移動で自動的にスプリントを使う）。
+    /// 決まりは Questionable の MovementController.TriggerSprintIfNeeded と同じ：乗っていない・飛んでいない・使えなくする効果が無い、
+    /// 経路の長さが街などでは 30m（既にジョグが付いていれば使わない）、それ以外では 100m を超え、スプリントが使える（GetActionStatus が 0）とき。
+    /// 経路ごとに1回だけ確かめる。
+    /// </summary>
+    private void SprintIfWorth(TaskContext ctx, Vector3 routeEnd)
+    {
+        if (this.sprintCheckedFor is { } done && Vector3.Distance(done, routeEnd) < 0.5f)
+            return;
+        this.sprintCheckedFor = routeEnd;
+        if (this.fly || GameUi.Mounted || GameUi.TestBackend != null)
+            return;
+        if (SprintBlockers.Any(GameMemory.HasStatus) || GameMemory.HasStatus(SprintStatus))
+            return;
+
+        var town = Svc.Data.GetExcelSheet<TerritoryType>().TryGetRow(Me.Territory, out var terr) && TownUses.Contains(terr.TerritoryIntendedUse.RowId);
+        if (town && GameMemory.HasStatus(JogStatus))
+            return;
+        var worth = town ? 30f : 100f;
+        if (this.path.RouteLength <= worth || GameUi.GeneralActionStatus(SprintAction) != 0)
+            return;
+        if (GameUi.UseGeneralAction(SprintAction))
+            Core.DebugLog.Current?.Line("移動", $"{this.label} へ歩くので、スプリントを使いました（経路 {this.path.RouteLength:0}m・{(town ? "街の中" : "街の外")}）");
+    }
+
     /// <summary>乗る前に、戦闘中の状態が解けるのを待つ上限（倒した直後の残り）。</summary>
     private static readonly TimeSpan CombatClearWait = TimeSpan.FromSeconds(8);
 
@@ -372,7 +412,10 @@ public sealed class MoveToTask : AutoTask
                     }
 
                     if (this.path.FollowingEnd is { } following)
+                    {
                         this.RegisterMovement(ctx, following);
+                        this.SprintIfWorth(ctx, following);
+                    }
                     this.Status = $"{this.label} へ移動中（残り {this.Distance:0}m）";
                     return TaskResult.Running;
                 case OwnPath.State.Stale:
