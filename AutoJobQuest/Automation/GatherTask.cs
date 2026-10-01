@@ -45,6 +45,10 @@ public sealed class GatherTask : AutoTask
     private readonly Dictionary<uint, uint> targets = [];
     private bool enabledByMe;
 
+    // そろった後に釣りの構えを解くのを待ち始めた時刻・最後に「中断」を送った時刻
+    private DateTime? doneSince;
+    private DateTime quitSentAt = DateTime.MinValue;
+
     // GBR を動かしてすぐ止まったときの動かし直し：動かした時刻・そのときの所持数・動かし直した回数・次に動かしてよい時刻
     private DateTime enabledAt = DateTime.MinValue;
     private Dictionary<uint, int> countsAtEnable = [];
@@ -227,6 +231,28 @@ public sealed class GatherTask : AutoTask
         var remaining = this.targets.Where(t => GbrCount(t.Key) < t.Value).ToList();
         if (remaining.Count == 0)
         {
+            // 竿の釣りは、構えを解いてから終える（不具合の例：ポンポンポンが2匹そろうと、GBR は AutoHook を OFF にして構えを解く作業を並べるが、
+            // こちらがすぐ GBR を止めたので取り消され、構えのまま秘伝書の交換のテレポへ進めなかった。画面では「AutoHook が勝手に OFF になった」ように見えた）。
+            // 5秒は GBR が解くのを待ち、まだ構えていれば、こちらが「中断」（Action 299）を1秒おきに送る（あわせて15秒まで）
+            if (this.RodFishing && Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.Gathering])
+            {
+                this.doneSince ??= DateTime.UtcNow;
+                var waited = DateTime.UtcNow - this.doneSince.Value;
+                if (waited < TimeSpan.FromSeconds(15))
+                {
+                    if (waited >= TimeSpan.FromSeconds(5) && DateTime.UtcNow - this.quitSentAt >= TimeSpan.FromSeconds(1))
+                    {
+                        this.quitSentAt = DateTime.UtcNow;
+                        GameUi.UseAction(QuestTask.FishingQuitAction);
+                    }
+
+                    this.Status = $"{this.label}: そろったので、釣りの構えを解いています";
+                    return TaskResult.Running;
+                }
+
+                ctx.Log.Warn("採集", $"{this.label}: 15秒たっても釣りの構えが解けません（このまま次へ進みます）");
+            }
+
             ctx.Log.Write("採集", $"{this.label}: そろいました");
             return TaskResult.Done;
         }
