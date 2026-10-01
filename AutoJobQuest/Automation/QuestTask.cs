@@ -257,6 +257,9 @@ public sealed unsafe class QuestTask : AutoTask
         // Questionable の購入の手順で出た購入の確認に、こちらで OK を押す（QuestPurchaseConfirm）
         this.HandlePurchaseConfirm(ctx);
 
+        // Questionable が止まっている間（こちらが代わりに手順を行う間）に出た HQ 品を渡す確認・手順の会話の選択肢に答える
+        this.HandleQuestDialogs(ctx);
+
         // Questionable の釣りの手順の前に、手順の指定の餌を付けておく（FishBaitPrep）
         this.HandleFishBait(ctx);
 
@@ -781,6 +784,125 @@ public sealed unsafe class QuestTask : AutoTask
             this.lastPurchaseNote = note;
             ctx.Log.Debug("クエスト", $"購入の確認に OK を押しません（{verdict}）：{body.Replace("\n", " ")}"
                                      + $"（読んだ品 {parsed?.Item ?? "なし"}×{parsed?.Count}・{parsed?.Price} ギル／手順の品 {string.Join("、", expected.Select(e => $"{e.Item1}×{e.ItemCount}"))}）");
+        }
+    }
+
+    // HQ 品を渡す確認の文面（ゲームデータ Addon#102434「ハイクオリティ品がトレードされようとしています。本当によろしいですか？」。
+    // Questionable の YesNoChoiceHandler と同じ行）
+    private const uint HqTradeConfirmAddon = 102434;
+
+    // 会話の窓に答える（HandleQuestDialogs）：最初に見た窓・答えた窓・記録した窓
+    private nint dialogSeen;
+    private nint dialogAnswered;
+
+    /// <summary>
+    /// Questionable が止まっている間（こちらが代わりに手順を行う間）に出た窓に、Questionable と同じ答え方で答える（不具合の例：
+    /// 錬金術師 Lv1 の報告をこちらで行い、HQ の蒸留水を渡す確認のまま止まった）。Questionable はこれらの窓を Questionable が動いている間だけ扱い
+    /// （YesNoChoiceHandler・DialogueChoiceHandler の ShouldHandleUiInteractions）、YesAlready はクエストの間こちらが止めているので、
+    /// こちらで答えないと誰も答えない。
+    ///  ・HQ 品を渡す確認（Addon#102434）：OK（コールバック 0。「ハイクオリティ品を渡す」にチェックを入れるまで OK ボタンは押せないので、
+    ///    Questionable と同じくコールバックで答える）
+    ///  ・今の段の手順の会話の選択肢（経路の DialogueChoices）：「はい／いいえ」は本文が問いに合えば指定どおり。一覧（SelectString・SelectIconString・
+    ///    映像中の CutSceneSelectString）は、問いが合い、答えに合う項目があればその番号（Questionable の DialogueChoiceHandler と同じ読み方）。
+    /// 窓が見えた最初のフレームは見送り、次のフレームでも開いていて Questionable が止まっていれば答える（Questionable が動いていれば任せる）。
+    /// </summary>
+    private void HandleQuestDialogs(TaskContext ctx)
+    {
+        var yesnoBody = GameUi.YesnoText(out var yesno);
+        FFXIVClientStructs.FFXIV.Component.GUI.AtkUnitBase* menu = null;
+        string? menuPrompt = null;
+        List<string>? menuEntries = null;
+        if (yesno == null)
+        {
+            if (GameUi.IsReady("SelectString", out var ss))
+            {
+                menu = ss;
+                menuPrompt = GameUi.AtkValueText(ss, 2);
+                menuEntries = GameUi.MenuEntries(out _);
+            }
+            else if (GameUi.IsReady("SelectIconString", out var si))
+            {
+                menu = si;
+                menuPrompt = GameUi.AtkValueText(si, 3);
+                menuEntries = GameUi.MenuEntries(out _);
+            }
+            else if (GameUi.TestBackend == null && GameUi.IsReady("CutSceneSelectString", out var cs))
+            {
+                menu = cs;
+                menuPrompt = GameUi.AtkValueText(cs, 2);
+                menuEntries = [];
+                for (var i = 5; i < cs->AtkValuesCount; i++)
+                    menuEntries.Add(GameUi.AtkValueText(cs, i) ?? string.Empty);
+            }
+        }
+
+        var ptr = yesno != null ? (nint)yesno : (nint)menu;
+        if (ptr == 0)
+        {
+            this.dialogSeen = 0;
+            this.dialogAnswered = 0;
+            return;
+        }
+
+        if (ptr == this.dialogAnswered)
+            return;
+        if (ptr != this.dialogSeen)
+        {
+            this.dialogSeen = ptr;
+            return;
+        }
+
+        if (ctx.Questionable.IsRunning() == true)
+            return;
+
+        if (yesno != null)
+        {
+            if (QuestDialogue.Matches(yesnoBody, QuestDialogue.ResolveAddon(HqTradeConfirmAddon)))
+            {
+                GameUi.Fire(yesno, true, 0);
+                this.dialogAnswered = ptr;
+                ctx.Log.Write("クエスト", "HQ 品を渡す確認に OK と答えました（Questionable が止まっている間の納品。Questionable と同じ答え方）");
+                return;
+            }
+        }
+
+        var seq = GameMemory.QuestSequence(this.quest.RowId);
+        var choices = (QuestionablePaths.Steps(this.quest.ShortId) ?? [])
+            .Where(s => s.Sequence == seq && s.Choices != null)
+            .SelectMany(s => s.Choices!)
+            .ToList();
+        if (choices.Count == 0)
+            return;
+
+        if (yesno != null)
+        {
+            foreach (var c in choices.Where(c => c.Type == "YesNo" && c.Prompt != null))
+            {
+                if (!QuestDialogue.Matches(yesnoBody, QuestDialogue.Resolve(this.quest.ShortId, c.Prompt!)))
+                    continue;
+                GameUi.Fire(yesno, true, c.Yes ? 0 : 1);
+                this.dialogAnswered = ptr;
+                ctx.Log.Write("クエスト", $"手順の会話の選択肢に「{(c.Yes ? "はい" : "いいえ")}」と答えました：{yesnoBody?.Replace("\n", " ")}（Questionable が止まっている間。経路の指定どおり）");
+                return;
+            }
+
+            return;
+        }
+
+        if (menuEntries == null || menuEntries.Count == 0)
+            return;
+        foreach (var c in choices.Where(c => c.Type == "List" && c.Answer != null))
+        {
+            if (c.Prompt != null && !QuestDialogue.Matches(menuPrompt, QuestDialogue.Resolve(this.quest.ShortId, c.Prompt)))
+                continue;
+            var answer = QuestDialogue.Resolve(this.quest.ShortId, c.Answer!);
+            var index = menuEntries.FindIndex(e => QuestDialogue.Matches(e, answer));
+            if (index < 0)
+                continue;
+            GameUi.Fire(menu, true, index);
+            this.dialogAnswered = ptr;
+            ctx.Log.Write("クエスト", $"手順の会話の選択肢で「{menuEntries[index]}」を選びました：{menuPrompt?.Replace("\n", " ")}（Questionable が止まっている間。経路の指定どおり）");
+            return;
         }
     }
 

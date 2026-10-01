@@ -446,6 +446,24 @@ public static unsafe class GameUi
         return list;
     }
 
+    /// <summary>窓の AtkValues の <paramref name="index"/> 番の文字（文字でない・読めなければ null。検証の仕組みの偽物の窓は中身が無いので null）。</summary>
+    public static string? AtkValueText(AtkUnitBase* addon, int index)
+    {
+        if (TestBackend != null || addon == null || index < 0 || index >= addon->AtkValuesCount)
+            return null;
+        try
+        {
+            var v = addon->AtkValues[index];
+            if ((v.Type & AtkValueType.TypeMask) is not (AtkValueType.String or AtkValueType.ConstString) || v.String.Value == null)
+                return null;
+            return Dalamud.Memory.MemoryHelper.ReadSeStringNullTerminated((nint)v.String.Value).TextValue;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     /// <summary>空白（半角・全角）を除いて比べるための正規化。</summary>
     public static string Normalize(string s) => s.Replace(" ", string.Empty).Replace("　", string.Empty).Trim();
 

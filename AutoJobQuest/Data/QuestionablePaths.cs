@@ -32,8 +32,20 @@ public sealed record QuestionableCraftStep(int Sequence, uint? ItemId, int ItemC
 /// （経路のプリセット・Questionable 内蔵のプリセット・プリセットの自動生成のいずれも：全件ほどいて確かめた）。</param>
 /// <param name="GatherItemId">採集・釣りの手順（Gather・Fish）で採る品（ItemsToGather の最初の品）。無ければ null。</param>
 /// <param name="GatherCount">その品の数（ItemsToGather の ItemCount）。無ければ null。</param>
+/// <param name="Choices">手順の会話の選択肢（DialogueChoices）。無ければ null。</param>
 public sealed record QuestionableStep(int Sequence, int Index, string Type, uint? DataId, uint Territory, System.Numerics.Vector3? Position, uint? ItemId, string? Comment = null, int? ItemCount = null, uint? BaitId = null,
-    uint? GatherItemId = null, int? GatherCount = null);
+    uint? GatherItemId = null, int? GatherCount = null, IReadOnlyList<QuestionableChoice>? Choices = null);
+
+/// <summary>
+/// Questionable の経路の手順の会話の選択肢1件（DialogueChoices）。Prompt・Answer は、そのクエストの会話の表（quest/〈番号/100〉/〈クエストの Id〉）の鍵。
+/// 製作・採集のジョブクエの58件は、すべて鍵が文字列で表の名前の指定が無く、「はい／いいえ」29件はすべて「はい」、一覧29件はすべて答えの鍵がある
+/// （bundle.zip を全件読み、58件すべてを日本語の本文に引き当てて確かめた）。
+/// </summary>
+/// <param name="Type">YesNo（はい／いいえ）か List（一覧から選ぶ）。</param>
+/// <param name="Prompt">問いの鍵。無ければ null。</param>
+/// <param name="Answer">一覧で選ぶ答えの鍵。無ければ null。</param>
+/// <param name="Yes">「はい／いいえ」で「はい」を選ぶか。</param>
+public sealed record QuestionableChoice(string Type, string? Prompt, string? Answer, bool Yes);
 
 /// <summary>
 /// Questionable の経路データ（pluginConfigs\Questionable\PathData\bundle.zip）から、ジョブクエの「Craft」手順を読む
@@ -221,7 +233,23 @@ public static class QuestionablePaths
             }
         }
 
-        return new QuestionableStep(sequence, index, type, data, terr, pos, item, comment, count, bait, gatherItem, gatherCount);
+        // 会話の選択肢（鍵が文字列のものだけ。行番号や表の名前の指定があるものは、ジョブクエには無いので読まない）
+        List<QuestionableChoice>? choices = null;
+        if (st.TryGetProperty("DialogueChoices", out var dc) && dc.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var c in dc.EnumerateArray())
+            {
+                if (c.ValueKind != JsonValueKind.Object || c.TryGetProperty("ExcelSheet", out _))
+                    continue;
+                var ctype = c.TryGetProperty("Type", out var ct) && ct.ValueKind == JsonValueKind.String ? ct.GetString() ?? string.Empty : string.Empty;
+                var prompt = c.TryGetProperty("Prompt", out var cp) && cp.ValueKind == JsonValueKind.String ? cp.GetString() : null;
+                var answer = c.TryGetProperty("Answer", out var ca) && ca.ValueKind == JsonValueKind.String ? ca.GetString() : null;
+                var yes = c.TryGetProperty("Yes", out var cy) && cy.ValueKind == JsonValueKind.True;
+                (choices ??= []).Add(new QuestionableChoice(ctype, prompt, answer, yes));
+            }
+        }
+
+        return new QuestionableStep(sequence, index, type, data, terr, pos, item, comment, count, bait, gatherItem, gatherCount, choices);
     }
 
     /// <summary>
