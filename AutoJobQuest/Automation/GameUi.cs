@@ -528,6 +528,37 @@ public static unsafe class GameUi
 
     /// <summary>一般アクション（GeneralAction）を使う。</summary>
 
+    /// <summary>
+    /// 話しかける前に降りる（高度を下げて着地し、マウントを降りてから話しかける。漁師 Lv58 のモグック・Lv68 のワワラゴで、
+    /// 上空に浮いたまま話しかけられなかった）。一般アクション 23「降りる」を1秒おきに送る（飛んでいれば着地、地上なら降りる：Questionable の LandExecutor・Unmount と同じ操作）。
+    /// 降りている途中なら true（呼び出し側は待つ）。乗っていない、または15秒たっても降りられなければ false（そのまま話しかける）。
+    /// </summary>
+    public static bool DismountBeforeInteract(ref DateTime? since, ref DateTime sentAt)
+    {
+        if (!Mounted)
+        {
+            since = null;
+            return false;
+        }
+
+        var now = DateTime.UtcNow;
+        since ??= now;
+        if (now - since.Value >= TimeSpan.FromSeconds(15))
+        {
+            if (now - since.Value < TimeSpan.FromSeconds(15.1))
+                Core.DebugLog.Current?.Line("操作", "15秒たってもマウントから降りられないので、そのまま話しかけます");
+            return false;
+        }
+
+        if (now - sentAt >= TimeSpan.FromSeconds(1))
+        {
+            sentAt = now;
+            UseGeneralAction(23);
+        }
+
+        return true;
+    }
+
     public static bool UseGeneralAction(uint id)
     {
         var ok = ActionManager.Instance()->UseAction(ActionType.GeneralAction, id);

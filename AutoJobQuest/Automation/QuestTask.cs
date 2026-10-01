@@ -1353,7 +1353,21 @@ public sealed unsafe class QuestTask : AutoTask
     /// <summary>釣りの構え（採集の状態）のままなら、構えを解く（1秒おき。解けたかは状態で見る）。</summary>
     private void KeepFishingStopped()
     {
-        if (!Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.Gathering] || DateTime.UtcNow - this.quitSentAt < TimeSpan.FromSeconds(1))
+        // 刺突漁では「中断」で中止の確認（Addon 12683）が出る。こちらが中断を送った後に出たものだけ「はい」を押し、確認が出ている間は中断を送らない
+        // （不具合の例：漁師 Lv68 で大方士がそろった後、確認が出ている間にも1秒おきに中断を送り、確認が閉じては開くのを2秒おきにくり返した）
+        var now = DateTime.UtcNow;
+        if (GameUi.YesnoText(out var confirm) is { } body && confirm != null && IsSpearfishQuitConfirm(body))
+        {
+            if (now - this.quitSentAt < TimeSpan.FromSeconds(5) && now - this.quitConfirmedAt > TimeSpan.FromSeconds(1) && GameUi.ClickYes(confirm))
+            {
+                this.quitConfirmedAt = now;
+                Core.DebugLog.Current?.Line("操作", "刺突漁の中止の確認に「はい」を押しました（こちらが中断を送った後の確認）");
+            }
+
+            return;
+        }
+
+        if (!Svc.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.Gathering] || now - this.quitSentAt < TimeSpan.FromSeconds(1))
             return;
         this.quitSentAt = DateTime.UtcNow;
         if (TestUseAction is { } test)
@@ -1361,6 +1375,16 @@ public sealed unsafe class QuestTask : AutoTask
         else
             GameUi.UseAction(FishingQuitAction);
     }
+
+    /// <summary>刺突漁の中止の確認の文（Addon 12683「刺突漁を中止しますか？ ※実行中のこの漁場は消えてしまいます。」：ゲームデータで確認）。</summary>
+    public const uint SpearfishQuitConfirmAddon = 12683;
+
+    private DateTime quitConfirmedAt = DateTime.MinValue;
+
+    /// <summary>確認の窓の文が、刺突漁の中止の確認か（空白を除いて比べる）。</summary>
+    public static bool IsSpearfishQuitConfirm(string body)
+        => Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Addon>().TryGetRow(SpearfishQuitConfirmAddon, out var row)
+           && GameUi.Normalize(body) == GameUi.Normalize(row.Text.ExtractText());
 
     /// <summary>一時的に無効にした AutoHook を元に戻す。</summary>
     private void RestoreAutoFishing(TaskContext ctx)
@@ -1784,6 +1808,10 @@ public sealed unsafe class QuestTask : AutoTask
     }
 
     /// <summary>報告だけを自前で行う（NPC の前まで移動して話しかける。会話と納品は TextAdvance）。</summary>
+    // 報告先に話しかける前に降りる（GameUi.DismountBeforeInteract）
+    private DateTime? turnInDismountSince;
+    private DateTime turnInDismountSentAt = DateTime.MinValue;
+
     private TaskResult ManualTurnIn(TaskContext ctx)
     {
         var questRow = Svc.Data.GetExcelSheet<Quest>().GetRow(this.quest.RowId);
@@ -1859,6 +1887,12 @@ public sealed unsafe class QuestTask : AutoTask
             if (this.PhaseElapsed > TimeSpan.FromSeconds(30))
                 return this.Fail("報告先の NPC が見つかりません");
             this.Status = "報告先の NPC を探しています";
+            return TaskResult.Running;
+        }
+
+        if (GameUi.DismountBeforeInteract(ref this.turnInDismountSince, ref this.turnInDismountSentAt))
+        {
+            this.Status = "報告先に話しかける前に、マウントから降りています";
             return TaskResult.Running;
         }
 

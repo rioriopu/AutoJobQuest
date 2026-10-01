@@ -543,6 +543,10 @@ public sealed unsafe class MarketBoardTask : AutoTask
 
     // こちらが話しかけて MB を開いたか（止めたときに、自分が開いた画面だけを閉じるため）
     private bool openedByMe;
+    // 話しかける前に降りる（GameUi.DismountBeforeInteract）
+    private DateTime? dismountSince;
+    private DateTime dismountSentAt = DateTime.MinValue;
+
     private DateTime interactAt = DateTime.MinValue;
 
     // 画面を閉じる操作の間隔（毎フレーム閉じる命令を送らない）
@@ -739,6 +743,12 @@ public sealed unsafe class MarketBoardTask : AutoTask
             this.Status = "近くにマーケットボードが見つかりません";
             if (this.TimedOut(TimeSpan.FromSeconds(10)))
                 return this.Fail("マーケットボードの前に着いたのに、話しかけられる MB が見つかりません");
+            return TaskResult.Running;
+        }
+
+        if (GameUi.DismountBeforeInteract(ref this.dismountSince, ref this.dismountSentAt))
+        {
+            this.Status = "マーケットボードに話しかける前に、マウントから降りています";
             return TaskResult.Running;
         }
 

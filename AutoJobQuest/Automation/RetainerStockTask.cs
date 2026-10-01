@@ -98,6 +98,10 @@ public sealed unsafe class RetainerStockTask : AutoTask
     private AutoTask? travel;
     private bool visitedInn;
     private DateTime innArrivedAt = DateTime.MinValue;
+    // 呼び鈴に話しかける前に降りる（GameUi.DismountBeforeInteract）
+    private DateTime? bellDismountSince;
+    private DateTime bellDismountSentAt = DateTime.MinValue;
+
     private int bellTries;
     private DateTime lastBellTry = DateTime.MinValue;
     private DateTime? busySince;
@@ -383,6 +387,12 @@ public sealed unsafe class RetainerStockTask : AutoTask
         if (bell == null || !NearBell(Me.Position, bell.Position))
         {
             this.Next(Phase.FindBell);
+            return TaskResult.Running;
+        }
+
+        if (GameUi.DismountBeforeInteract(ref this.bellDismountSince, ref this.bellDismountSentAt))
+        {
+            this.Status = "呼び鈴に話しかける前に、マウントから降りています";
             return TaskResult.Running;
         }
 

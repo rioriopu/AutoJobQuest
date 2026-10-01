@@ -719,6 +719,11 @@ public sealed unsafe class NpcStepTask : AutoTask
     private string? selectedMenu;
     private DateTime firstInteractAt = DateTime.MinValue;
 
+    // 話しかける前に降りる（飛んでいれば1回目で着地、2回目で降りる）：降り始めた時刻・最後に降りる操作を送った時刻・移動を作り直した回数
+    private DateTime? dismountSince;
+    private DateTime dismountSentAt = DateTime.MinValue;
+    private int retravels;
+
     public NpcStepTask(QuestionableStep step, uint questRowId)
     {
         this.step = step;
@@ -757,7 +762,7 @@ public sealed unsafe class NpcStepTask : AutoTask
         // カウンター越しでは終点への到達を待たず試す。拒否された場合は経路を続け、壁越しで止まり続けない。
         var nearby = Svc.Objects.Where(o => o.ObjectKind == ObjectKind.EventNpc && o.BaseId == this.step.DataId && o.IsTargetable)
             .OrderBy(o => Vector3.Distance(o.Position, Me.Position)).FirstOrDefault();
-        if (!this.arrived && Me.Territory == this.step.Territory && GameUi.PlayerFree()
+        if (!this.arrived && Me.Territory == this.step.Territory && GameUi.PlayerFree() && !GameUi.Mounted
             && nearby != null && Vector3.Distance(nearby.Position, Me.Position) <= 5f
             && DateTime.UtcNow - this.interactedAt >= TimeSpan.FromSeconds(2))
         {
@@ -790,6 +795,15 @@ public sealed unsafe class NpcStepTask : AutoTask
             if (failed != null)
                 return this.Fail(failed);
             this.arrived = true;
+        }
+
+        // 乗ったまま（飛んだまま）なら降りてから話しかける（高度を下げて着地し、マウントを降りる。
+        // 漁師 Lv68 のワワラゴで、相手の上空に浮いたまま話しかけられず、漁師 Lv58 のモグックでも同じことがあった）。
+        // 一般アクション 23「降りる」を1秒おきに送る（飛んでいれば着地、地上なら降りる。Questionable の LandExecutor・Unmount と同じ操作）。15秒で降りられなければ、そのまま話しかける
+        if (GameUi.DismountBeforeInteract(ref this.dismountSince, ref this.dismountSentAt))
+        {
+            this.Status = $"{NpcName(this.step.DataId)} に話しかける前に、マウントから降りています";
+            return TaskResult.Running;
         }
 
         if (QuestMenuChoice.Handle(ctx, this.questRowId, this.firstInteractAt, ref this.selectedMenu, out var menuFailure))
@@ -852,9 +866,15 @@ public sealed unsafe class NpcStepTask : AutoTask
             return TaskResult.Running;
         }
 
-        if (Vector3.Distance(npc.Position, Me.Position) > 5f)
+        // 遠ければ近づき直す。判定は移動（GoToTask：水平3m以内・高低差8m未満で着いた扱い）と合わせる（以前は3次元で5mを見ていたので、
+        // 相手の上空に浮いていると「遠い」→ 移動は「着いた」で即座に終わる、を毎フレームくり返した〔記録で1万6千回〕）
+        var flat = Vector2.Distance(new Vector2(npc.Position.X, npc.Position.Z), new Vector2(Me.Position.X, Me.Position.Z));
+        if (flat > 4f || MathF.Abs(npc.Position.Y - Me.Position.Y) >= 8f)
         {
+            if (++this.retravels > 5)
+                return this.Fail($"{NpcName(this.step.DataId)} に近づけません（水平 {flat:0.0}m・高低差 {MathF.Abs(npc.Position.Y - Me.Position.Y):0.0}m）。手で近づいてから再開してください");
             this.arrived = false;
+            this.dismountSince = null;
             this.travel = new GoToTask(Me.Territory, npc.Position, 3f, NpcName(this.step.DataId));
             return TaskResult.Running;
         }
