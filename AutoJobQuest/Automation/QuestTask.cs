@@ -277,6 +277,10 @@ public sealed unsafe class QuestTask : AutoTask
             return this.RunRelocate(ctx);
         }
 
+        // 手順を終えたまま段が変わらない Questionable を止めた：乗っていれば降りてから頼み直す（StepDoneStall）
+        if (this.stallDismountSince != null)
+            return this.RunStallRecovery(ctx);
+
         // 釣りの手順の魚がもうそろっているのに、Questionable がその手前にいるなら、残り（報告）をこちらで行う（QuestTakeOver.AfterFishReady）
         if (this.HandleFishReady(ctx))
             return TaskResult.Running;
@@ -587,6 +591,8 @@ public sealed unsafe class QuestTask : AutoTask
             this.notRunningFrames = 0;
             if (running == true && stepData != null && stepData.QuestId == QuestionableIpc.ToQuestId(this.quest.RowId) && this.WatchStuckElsewhere(ctx, stepData))
                 return TaskResult.Running;
+            if (running == true && this.WatchStepDoneStall(ctx, stepData) is { } stall)
+                return stall;
         }
 
         return TaskResult.Running;
@@ -1087,6 +1093,78 @@ public sealed unsafe class QuestTask : AutoTask
     private DateTime? stillSince;
     private string stillStep = string.Empty;
     private int relocations;
+
+    // 手順を終えたまま段が変わらない形の見張り（StepDoneStall）：数え始めた時刻・そのときの段・立て直した回数・降り始めた時刻・最後に降りる操作を送った時刻
+    private DateTime? stallSince;
+    private byte stallSeq;
+    private int stallRecoveries;
+    private DateTime? stallDismountSince;
+    private DateTime stallDismountSentAt = DateTime.MinValue;
+
+    /// <summary>検証の仕組み用：設定すると、降りる操作（一般アクション 23）の代わりにこれを呼ぶ。本番では null のまま。</summary>
+    public static Func<bool>? TestDismount { get; set; }
+
+    /// <summary>
+    /// Questionable が動いていて、手順が無い（終えた）のに、ゲームの段が変わらず、動ける状態が続いたら（StepDoneStall）、Questionable を止めて
+    /// 降りてから頼み直す。止めたら Running、上限なら Failed、当てはまらなければ null。会話・カットシーン・エリア移動の間は数えない。
+    /// </summary>
+    private TaskResult? WatchStepDoneStall(TaskContext ctx, QuestionableIpc.StepData? stepData)
+    {
+        var seq = GameMemory.QuestSequence(this.quest.RowId);
+        if (stepData != null || GameMemory.QuestAccepted(this.quest.RowId) != true || !GameUi.PlayerFree() || GameUi.BetweenAreas
+            || this.stallSince == null || seq != this.stallSeq)
+        {
+            this.stallSince = stepData == null && GameMemory.QuestAccepted(this.quest.RowId) == true && GameUi.PlayerFree() && !GameUi.BetweenAreas
+                ? DateTime.UtcNow
+                : null;
+            this.stallSeq = seq;
+            return null;
+        }
+
+        switch (StepDoneStall.Decide(DateTime.UtcNow - this.stallSince.Value, this.stallRecoveries))
+        {
+            case StepDoneStall.Verdict.Recover:
+                this.stallRecoveries++;
+                this.stallSince = null;
+                ctx.Questionable.Stop(Plugin.InternalNameConst);
+                this.stallDismountSince = DateTime.UtcNow;
+                ctx.Log.Warn("クエスト", $"Questionable が段 {seq} の手順を終えたことにしたまま、段が {StepDoneStall.Still.TotalSeconds:0} 秒変わりません"
+                                        + "（飛んだまま話しかけてゲームに断られたのを、Questionable が成功と取り違えた形）。"
+                                        + $"Questionable を止め、{(GameUi.Mounted ? "降りてから" : string.Empty)}頼み直します（{this.stallRecoveries} 回目）");
+                this.NextPhase("手順を終えたまま止まった Questionable を立て直します");
+                return TaskResult.Running;
+            case StepDoneStall.Verdict.GiveUp:
+                return this.Fail($"Questionable が段 {seq} の手順を終えたことにしたまま段が変わらず、{StepDoneStall.MaxRecoveries} 回頼み直しても続きます。"
+                                 + "Questionable の画面の「ステップ」で手順を確かめ、手で進めてから再開してください（続きから進みます）");
+            default:
+                return null;
+        }
+    }
+
+    /// <summary>止めた後、乗っていれば降りる（1秒おきに降りる操作。飛んでいれば1回目で着地する）。降りたら（15秒で降りられなくても）頼み直す。</summary>
+    private TaskResult RunStallRecovery(TaskContext ctx)
+    {
+        if (GameUi.Mounted && DateTime.UtcNow - this.stallDismountSince!.Value < TimeSpan.FromSeconds(15))
+        {
+            if (DateTime.UtcNow - this.stallDismountSentAt >= TimeSpan.FromSeconds(1))
+            {
+                this.stallDismountSentAt = DateTime.UtcNow;
+                if (TestDismount is { } test)
+                    test();
+                else
+                    GameUi.UseGeneralAction(23); // 降りる（GeneralAction 23。Questionable の Unmount と同じ）
+            }
+
+            this.Status = "マウントから降りています" + OwnWorkNote;
+            return TaskResult.Running;
+        }
+
+        if (GameUi.Mounted)
+            ctx.Log.Warn("クエスト", "15秒たってもマウントから降りられませんでした。そのまま Questionable に頼み直します");
+        this.stallDismountSince = null;
+        this.started = false; // Questionable に頼み直す（段の頭＝話しかける手順からやり直す）
+        return TaskResult.Running;
+    }
     private bool relocateLimitNoted;
     private DateTime quitSentAt = DateTime.MinValue;
 

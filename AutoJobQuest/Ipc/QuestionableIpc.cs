@@ -66,11 +66,27 @@ public sealed class QuestionableIpc : IpcGate
     public string? GetCurrentQuestId()
         => this.TryInvoke("GetCurrentQuestId", () => this.Func<string>("Questionable.GetCurrentQuestId").InvokeFunc(), out var v) ? v : null;
 
+    /// <summary>
+    /// <see cref="GetCurrentStepData"/> の結果を使い回す時間。Questionable は問い合わせのたびに dalamud.log へ1行（GetStepData()）書き、
+    /// こちらは1フレームに何度も問い合わせていたので、dalamud.log が約100MBで満杯になり記録が止まった（末尾20万行の72%）。
+    /// 止める・頼むときは使い回しを捨てる。検証の仕組みでは 0（毎回問い合わせる）。
+    /// </summary>
+    public static TimeSpan StepDataReuse { get; set; } = TimeSpan.FromMilliseconds(250);
+
+    private StepData? stepCache;
+    private DateTime stepCachedAt = DateTime.MinValue;
+
     public StepData? GetCurrentStepData()
-        => this.TryInvoke("GetCurrentStepData", () => this.Func<StepData>("Questionable.GetCurrentStepData").InvokeFunc(), out var v) ? v : null;
+    {
+        if (StepDataReuse > TimeSpan.Zero && DateTime.UtcNow - this.stepCachedAt < StepDataReuse)
+            return this.stepCache;
+        this.stepCache = this.TryInvoke("GetCurrentStepData", () => this.Func<StepData>("Questionable.GetCurrentStepData").InvokeFunc(), out var v) ? v : null;
+        this.stepCachedAt = DateTime.UtcNow;
+        return this.stepCache;
+    }
 
     public bool StartSingleQuest(uint questRowId)
-        => this.TraceThen($"StartSingleQuest(\"{ToQuestId(questRowId)}\")（Quest 行 {questRowId}）") && this.TryInvoke("StartSingleQuest",
+        => this.ForgetStep() && this.TraceThen($"StartSingleQuest(\"{ToQuestId(questRowId)}\")（Quest 行 {questRowId}）") && this.TryInvoke("StartSingleQuest",
                () => this.Func<string, bool>("Questionable.StartSingleQuest").InvokeFunc(ToQuestId(questRowId)), out var ok)
            && ok;
 
@@ -116,5 +132,12 @@ public sealed class QuestionableIpc : IpcGate
 
     /// <summary>Questionable を止める。自分が始めた進行のときだけ呼ぶこと。</summary>
     public bool Stop(string label)
-        => this.TraceThen($"Stop(\"{label}\")") && this.TryInvoke("Stop", () => this.Func<string, bool>("Questionable.Stop").InvokeFunc(label), out _);
+        => this.ForgetStep() && this.TraceThen($"Stop(\"{label}\")") && this.TryInvoke("Stop", () => this.Func<string, bool>("Questionable.Stop").InvokeFunc(label), out _);
+
+    /// <summary>手順の使い回しを捨てる（止める・頼むと手順が変わるため）。式の中で使えるよう常に true。</summary>
+    private bool ForgetStep()
+    {
+        this.stepCachedAt = DateTime.MinValue;
+        return true;
+    }
 }

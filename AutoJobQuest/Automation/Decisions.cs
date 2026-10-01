@@ -1571,3 +1571,43 @@ public static class QuestOwnPurchase
         return buy == null ? null : new Order(bait, Math.Max(1, buy.ItemCount ?? 1), buy.DataId);
     }
 }
+
+/// <summary>
+/// Questionable が「手順を終えた」として段の切り替わりを待っているのに、ゲームの段が変わらないまま動ける状態が続くときの判断
+/// （不具合の例：漁師 Lv58「釣り道楽、雲海を目指す」の段 3 で、モグックに話しかけないまま止まった。Questionable の画面は「ステップ 255/1・Step completed」）。
+///
+/// 原因（記録と Questionable のソースで確かめた）：経路の手順 3-0 は「飛んで行って話しかける」（Fly）。Questionable は飛んだまま（目標の約2m上）話しかけ、
+/// ゲームに断られた（「飛行中のため、その操作はできません」）。Questionable は話しかけの成否を行動の詠唱で見るが、話しかけで行動の番号が進まないと
+/// 「直前の詠唱が成功した」とみなす作り（InteractionProgressContext.Create の checkSequence=false）なので、直前の騎乗の詠唱を成功と取り違えて手順を終えた。
+/// 段の最後の手順なので、Questionable は来ない段の切り替わりを待ち続ける（手順は 255＝終えた。問い合わせの手順は null になる）。
+///
+/// 対応：手順が null（終えた）のまま、ゲームの段が変わらず、動ける状態で <see cref="Still"/> 続いたら、Questionable を止め、乗っていれば降りてから頼み直す
+/// （頼み直すと段の頭＝話しかける手順からやり直す。降りていれば地上から話しかける）。同じクエストで <see cref="MaxRecoveries"/> 回まで。
+/// </summary>
+public static class StepDoneStall
+{
+    public enum Verdict
+    {
+        /// <summary>見ている（まだ短い・当てはまらない）。</summary>
+        Watch,
+
+        /// <summary>止めて、降りて、頼み直す。</summary>
+        Recover,
+
+        /// <summary>上限まで立て直しても続く：理由を出して止める。</summary>
+        GiveUp,
+    }
+
+    /// <summary>手順が終えたまま段が変わらない状態を待つ時間（段の切り替わりは通常1〜2秒。会話・カットシーンの間は数えない）。検証の仕組みでは短くする。</summary>
+    public static TimeSpan Still { get; set; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>1つのクエストで立て直す回数の上限。</summary>
+    public const int MaxRecoveries = 3;
+
+    public static Verdict Decide(TimeSpan stalledFor, int recoveries)
+    {
+        if (stalledFor < Still)
+            return Verdict.Watch;
+        return recoveries >= MaxRecoveries ? Verdict.GiveUp : Verdict.Recover;
+    }
+}
