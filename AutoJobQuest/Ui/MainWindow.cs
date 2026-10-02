@@ -1230,28 +1230,47 @@ public sealed class MainWindow : Window
         ImGui.Separator();
         this.DrawDropHunt();
         ImGui.Separator();
+
+        // 詳しい記録をファイルに残すか（既定は OFF。全体の設定に保存し、その場で効く）
+        var fileLogging = this.services.Debug.Enabled;
+        if (ImGui.Checkbox("詳しい記録（ログ）をファイルに残す", ref fileLogging))
+            this.services.SetFileLogging(fileLogging);
+        ImGui.TextColored(Grey, "既定は OFF。不具合を調べるときに ON にすると、操作・画面の中身・チャット・止まったときの状況を記録のフォルダに書き出します"
+                                + "（ファイルが大きくなります）。次に起動したときも同じ設定で始まります");
+
         if (ImGui.Button("クリップボードへ写す"))
             ImGui.SetClipboardText(string.Join("\n", this.log.Snapshot()));
         ImGui.SameLine();
         if (ImGui.Button("消す"))
             this.log.Clear();
         ImGui.SameLine();
-        if (ImGui.Button("今の状態を書き出す"))
-            this.lastWritten = this.services.WriteSnapshotNow();
+        using (ImRaii.Disabled(!this.services.Debug.Enabled))
+        {
+            if (ImGui.Button("今の状態を書き出す"))
+                this.lastWritten = this.services.WriteSnapshotNow();
+        }
+
         ImGui.SameLine();
         if (ImGui.Button("記録のフォルダを開く"))
         {
-            try
+            if (!System.IO.Directory.Exists(this.services.Debug.Directory))
             {
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("explorer.exe", $"\"{this.services.Debug.Directory}\"") { UseShellExecute = true });
+                this.log.Warn("記録", "記録のフォルダはまだありません（ファイルに残す設定を ON にすると作ります）");
             }
-            catch (Exception ex)
+            else
             {
-                this.log.Warn("記録", $"フォルダを開けませんでした: {ex.Message}");
+                try
+                {
+                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("explorer.exe", $"\"{this.services.Debug.Directory}\"") { UseShellExecute = true });
+                }
+                catch (Exception ex)
+                {
+                    this.log.Warn("記録", $"フォルダを開けませんでした: {ex.Message}");
+                }
             }
         }
 
-        ImGui.TextColored(Grey, $"記録の置き場所：{this.services.Debug.Directory}");
+        ImGui.TextColored(Grey, $"記録の置き場所：{this.services.Debug.Directory}{(this.services.Debug.Enabled ? string.Empty : "（いまはファイルに残していません）")}");
         if (this.services.Debug.RunFile is { } run)
             ImGui.TextColored(Grey, $"この実行の記録：{System.IO.Path.GetFileName(run)}");
         if (this.services.Debug.LastFailureReport is { } fail)
@@ -1259,11 +1278,14 @@ public sealed class MainWindow : Window
         if (this.lastWritten != null)
             ImGui.TextColored(Grey, $"書き出しました：{System.IO.Path.GetFileName(this.lastWritten)}");
 
-        var always = this.config.AlwaysRecordAddons;
-        if (ImGui.Checkbox("実行していないときも、ショップ・マーケット等の画面を記録する", ref always))
+        using (ImRaii.Disabled(!this.services.Debug.Enabled))
         {
-            this.config.AlwaysRecordAddons = always;
-            this.config.Save();
+            var always = this.config.AlwaysRecordAddons;
+            if (ImGui.Checkbox("実行していないときも、ショップ・マーケット等の画面を記録する", ref always))
+            {
+                this.config.AlwaysRecordAddons = always;
+                this.config.Save();
+            }
         }
 
         using var child = ImRaii.Child("##log", new Vector2(0, 0), true);

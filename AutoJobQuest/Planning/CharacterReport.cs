@@ -294,8 +294,9 @@ public static class CharacterReport
 
         Add("記録（ログ）", lines =>
         {
-            var dir = DebugLog.Current?.Directory ?? "（記録を始めていません）";
-            lines.Add(new ReportLine(Severity.Ok, $"置き場所：{dir}"));
+            lines.Add(new ReportLine(Severity.Ok, DebugLog.Current is { } d
+                ? $"ファイルに残しています。置き場所：{d.Directory}"
+                : "ファイルに残していません（既定。デバッグタブで ON にできます）"));
         });
 
         return sections;

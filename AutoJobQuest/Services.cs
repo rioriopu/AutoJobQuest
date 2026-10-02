@@ -24,8 +24,11 @@ public sealed class Services : IDisposable
 
     public List<Window> ExtraWindows { get; } = [];
 
-    /// <summary>不具合を調べるための記録（ファイル）。</summary>
+    /// <summary>不具合を調べるための記録（ファイル）。既定は OFF（<see cref="SetFileLogging"/>）。</summary>
     public DebugLog Debug { get; }
+
+    /// <summary>全体で1つの設定（記録の置き場所・ファイルに残すか）。</summary>
+    private readonly GlobalConfiguration global;
 
     private readonly Automation.AddonRecorder addonRecorder;
     private readonly Automation.ChatRecorder chatRecorder;
@@ -47,11 +50,12 @@ public sealed class Services : IDisposable
     /// <summary>ログインしているキャラクターが替わった（設定の中身を入れ替えた後）。画面の控えを消すのに使う。</summary>
     public event Action? CharacterChanged;
 
-    public Services(Configuration config, RunLog log, string? logDirectory)
+    public Services(Configuration config, RunLog log, GlobalConfiguration global)
     {
         this.Config = config;
         this.Log = log;
-        this.Debug = new DebugLog(logDirectory);
+        this.global = global;
+        this.Debug = new DebugLog(global.LogDirectory, global.FileLogging);
         this.GbrReflection = new GbrReflection();
 
         this.Ctx = new TaskContext
@@ -78,10 +82,11 @@ public sealed class Services : IDisposable
         this.ExtraWindows.Add(new ConfirmWindow(this.Ctx.Confirm, this.Runner));
 
         // 実行の記録：始まったら実行ファイルを開いて状態を写す。失敗したら状態の写しと直前の記録を書き出す
+        // （ファイルに残す設定が OFF なら何も書かず、状態の写しも作らない）
         this.Runner.Started = task =>
         {
-            this.Debug.BeginRun(task.Name);
-            this.Debug.Block("実行", "開始時の状態", StateSnapshot.Capture(this.Ctx, this.Runner));
+            if (this.Debug.BeginRun(task.Name) != null)
+                this.Debug.Block("実行", "開始時の状態", StateSnapshot.Capture(this.Ctx, this.Runner));
         };
         // 終わったときの事実（結果の分類）。後始末の後に集める
         this.Runner.Facts = () =>
@@ -119,7 +124,7 @@ public sealed class Services : IDisposable
         };
         this.Runner.Finished = (result, failed) =>
         {
-            if (failed)
+            if (failed && this.Debug.Enabled)
             {
                 var path = this.Debug.WriteFailureReport(result, StateSnapshot.Capture(this.Ctx, this.Runner));
                 Svc.Chat.Print($"[AutoJobQuest] 止まったときの状況を書き出しました: {path}");
@@ -130,10 +135,11 @@ public sealed class Services : IDisposable
             }
         };
 
-        this.addonRecorder = new Automation.AddonRecorder(() => this.Runner.IsRunning || this.Config.AlwaysRecordAddons);
+        // 画面・チャットの記録は、ファイルに残す設定が ON のときだけ（OFF なら画面の中身も読まない）
+        this.addonRecorder = new Automation.AddonRecorder(() => this.Debug.Enabled && (this.Runner.IsRunning || this.Config.AlwaysRecordAddons));
 
         // 実行の間のチャットとゲームの記録も残す（デバッグのため詳しい記録を残す）
-        this.chatRecorder = new Automation.ChatRecorder(() => this.Runner.IsRunning || this.Config.AlwaysRecordAddons);
+        this.chatRecorder = new Automation.ChatRecorder(() => this.Debug.Enabled && (this.Runner.IsRunning || this.Config.AlwaysRecordAddons));
     }
 
     /// <summary>
@@ -416,7 +422,7 @@ public sealed class Services : IDisposable
         }
 
         // 実行中は30秒ごとに状態を1行残す（止まったまま動かない不具合の手がかり）
-        if (this.Runner.IsRunning && DateTime.UtcNow >= this.nextHeartbeat)
+        if (this.Debug.Enabled && this.Runner.IsRunning && DateTime.UtcNow >= this.nextHeartbeat)
         {
             this.nextHeartbeat = DateTime.UtcNow.AddSeconds(30);
             this.Debug.Line("状態", StateSnapshot.Compact(this.Runner));
@@ -430,9 +436,20 @@ public sealed class Services : IDisposable
         this.Runner.RequestStop($"例外: {ex.GetType().Name}", byUser: false);
     }
 
-    /// <summary>今の状態をファイルに書き出す（画面のボタンから）。</summary>
-    public string WriteSnapshotNow()
-        => this.Debug.WriteSnapshot(StateSnapshot.Capture(this.Ctx, this.Runner));
+    /// <summary>今の状態をファイルに書き出す（画面のボタンから）。ファイルに残す設定が OFF なら何もせず null。</summary>
+    public string? WriteSnapshotNow()
+        => this.Debug.Enabled ? this.Debug.WriteSnapshot(StateSnapshot.Capture(this.Ctx, this.Runner)) : null;
+
+    /// <summary>
+    /// 詳しい記録をファイルに残すかを切り替える（デバッグタブから）。全体の設定に保存し、その場で効かせる。
+    /// </summary>
+    public void SetFileLogging(bool on)
+    {
+        this.global.FileLogging = on;
+        Svc.PluginInterface.SavePluginConfig(this.global);
+        this.Debug.SetEnabled(on);
+        this.Log.Write("記録", on ? $"詳しい記録をファイルに残します（{this.Debug.Directory}）" : "詳しい記録をファイルに残すのをやめました");
+    }
 
     public void Dispose()
     {

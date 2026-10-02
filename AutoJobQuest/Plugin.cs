@@ -60,7 +60,7 @@ public sealed class Plugin : IDalamudPlugin
         this.config.Initialize(System.IO.Path.Combine(Svc.PluginInterface.ConfigDirectory.FullName, "characters"));
 
         this.log = new RunLog();
-        this.services = new Services(this.config, this.log, this.global.LogDirectory);
+        this.services = new Services(this.config, this.log, this.global);
         this.window = new MainWindow(this.config, this.log, this.services);
 
         this.windows.AddWindow(this.window);

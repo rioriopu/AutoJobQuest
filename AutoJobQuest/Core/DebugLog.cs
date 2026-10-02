@@ -22,6 +22,11 @@ namespace AutoJobQuest.Core;
 ///
 /// 書き込みは別スレッドでまとめて行う（ゲームのフレームを止めないため）。
 /// 他のクラスからも書けるよう、読み込み中は <see cref="Current"/> で取れる。
+///
+/// 【既定は OFF】ファイルに残すのは、設定（全体の設定の FileLogging。デバッグタブで切り替える）が ON のときだけ。
+/// OFF の間はファイルを一切書かず、記録のフォルダも作らない。<see cref="Current"/> も null を返すので、
+/// 呼び出し側の「DebugLog.Current?.Block(…, 画面の中身)」は引数（画面の中身を読む処理）ごと飛ぶ。
+/// 切り替えはその場で効く（<see cref="SetEnabled"/>）。
 /// </summary>
 public sealed class DebugLog : IDisposable
 {
@@ -35,13 +40,21 @@ public sealed class DebugLog : IDisposable
     private readonly Thread writer;
     private readonly object runGate = new();
     private readonly Queue<string> recent = new();
+    private readonly string? preferredDirectory;
     private string? runFile;
+    private volatile bool enabled;
+    private bool directoryReady;
 
-    /// <summary>読み込み中のインスタンス（無ければ null）。</summary>
-    public static DebugLog? Current { get; private set; }
+    private static DebugLog? instance;
 
-    /// <summary>実際に書いているフォルダ。</summary>
-    public string Directory { get; }
+    /// <summary>読み込み中で、ファイルに残す設定が ON のインスタンス（OFF なら null）。</summary>
+    public static DebugLog? Current => instance is { enabled: true } d ? d : null;
+
+    /// <summary>ファイルに残しているか（設定が ON か）。</summary>
+    public bool Enabled => this.enabled;
+
+    /// <summary>記録を書くフォルダ（OFF のまま一度も ON にしていなければ、書く予定の場所。まだ作っていない）。</summary>
+    public string Directory { get; private set; }
 
     /// <summary>いまの実行の記録ファイル（実行していなければ null）。</summary>
     public string? RunFile
@@ -56,13 +69,42 @@ public sealed class DebugLog : IDisposable
     /// <summary>最後に書いた失敗の報告ファイル。</summary>
     public string? LastFailureReport { get; private set; }
 
-    public DebugLog(string? preferredDirectory)
+    public DebugLog(string? preferredDirectory, bool enabled)
     {
-        this.Directory = ResolveDirectory(preferredDirectory);
+        this.preferredDirectory = preferredDirectory;
+        this.Directory = DirectoryCandidates(preferredDirectory, System.IO.Directory.Exists(DevelopmentRoot), Svc.PluginInterface.ConfigDirectory.FullName)[0];
         this.writer = new Thread(this.WriteLoop) { IsBackground = true, Name = "AutoJobQuest.DebugLog" };
         this.writer.Start();
-        Current = this;
-        this.Line("記録", $"記録を始めました（{this.Directory}）");
+        instance = this;
+        this.SetEnabled(enabled);
+    }
+
+    /// <summary>
+    /// ファイルに残すかを切り替える（その場で効く）。初めて ON にしたときに記録のフォルダを決めて作る。
+    /// OFF にすると、直前の記録の控え（失敗の報告に添えるもの）も捨てる。
+    /// </summary>
+    public void SetEnabled(bool on)
+    {
+        if (on == this.enabled)
+            return;
+
+        if (on)
+        {
+            if (!this.directoryReady)
+            {
+                this.Directory = ResolveDirectory(this.preferredDirectory);
+                this.directoryReady = true;
+            }
+
+            this.enabled = true;
+            this.Line("記録", $"記録を始めました（{this.Directory}）");
+            return;
+        }
+
+        this.Line("記録", "記録を止めます（ファイルに残す設定を OFF にしました）");
+        this.enabled = false;
+        lock (this.runGate)
+            this.recent.Clear();
     }
 
     /// <summary>
@@ -123,6 +165,9 @@ public sealed class DebugLog : IDisposable
     /// <summary>1行書く（全体と、実行中なら実行の記録の両方へ）。</summary>
     public void Line(string category, string message)
     {
+        if (!this.enabled)
+            return;
+
         // 頭に「[実行#操作]」を付ける（同じ操作の記録を追えるように。動いていなければ付けない）
         var text = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {RunIds.Tag}[{category}] {message}";
         lock (this.runGate)
@@ -138,6 +183,9 @@ public sealed class DebugLog : IDisposable
     /// <summary>複数行のまとまり（画面の中身・状態の写しなど）を書く。</summary>
     public void Block(string category, string title, string body)
     {
+        if (!this.enabled)
+            return;
+
         var sb = new StringBuilder();
         sb.Append($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [{category}] ── {title} ──").AppendLine();
         foreach (var line in body.Split('\n'))
@@ -151,7 +199,7 @@ public sealed class DebugLog : IDisposable
 
     private void Enqueue(string text)
     {
-        if (this.queue.IsAddingCompleted)
+        if (!this.enabled || this.queue.IsAddingCompleted)
             return;
         this.queue.Add((this.DailyFile, text));
         string? run;
@@ -161,9 +209,16 @@ public sealed class DebugLog : IDisposable
             this.queue.Add((run, text));
     }
 
-    /// <summary>実行の記録を始める。</summary>
-    public string BeginRun(string name)
+    /// <summary>実行の記録を始める。ファイルに残す設定が OFF なら何もせず null。</summary>
+    public string? BeginRun(string name)
     {
+        if (!this.enabled)
+        {
+            lock (this.runGate)
+                this.runFile = null;
+            return null;
+        }
+
         var path = Path.Combine(this.Directory, $"実行_{DateTime.Now:yyyyMMdd_HHmmss}{this.suffix}.log");
         lock (this.runGate)
             this.runFile = path;
@@ -179,9 +234,12 @@ public sealed class DebugLog : IDisposable
             this.runFile = null;
     }
 
-    /// <summary>失敗したときの報告（状態の写し＋直前の記録）を書き出す。</summary>
-    public string WriteFailureReport(string reason, string snapshot)
+    /// <summary>失敗したときの報告（状態の写し＋直前の記録）を書き出す。ファイルに残す設定が OFF なら何もせず null。</summary>
+    public string? WriteFailureReport(string reason, string snapshot)
     {
+        if (!this.enabled)
+            return null;
+
         var path = Path.Combine(this.Directory, $"失敗_{DateTime.Now:yyyyMMdd_HHmmss}{this.suffix}.md");
         var sb = new StringBuilder();
         sb.AppendLine($"# 止まった理由（{DateTime.Now:yyyy-MM-dd HH:mm:ss}）").AppendLine();
@@ -206,9 +264,12 @@ public sealed class DebugLog : IDisposable
         return path;
     }
 
-    /// <summary>状態の写しをファイルに書き出す。</summary>
-    public string WriteSnapshot(string snapshot)
+    /// <summary>状態の写しをファイルに書き出す。ファイルに残す設定が OFF なら何もせず null。</summary>
+    public string? WriteSnapshot(string snapshot)
     {
+        if (!this.enabled)
+            return null;
+
         var path = Path.Combine(this.Directory, $"状態_{DateTime.Now:yyyyMMdd_HHmmss}{this.suffix}.md");
         this.queue.Add((path, $"# 状態の写し（{DateTime.Now:yyyy-MM-dd HH:mm:ss}）\n\n```\n{snapshot}\n```\n"));
         this.Line("記録", $"状態を書き出しました: {path}");
@@ -254,7 +315,7 @@ public sealed class DebugLog : IDisposable
         this.Line("記録", "記録を終えます（プラグインの読み込み解除）");
         this.queue.CompleteAdding();
         this.writer.Join(TimeSpan.FromSeconds(2));
-        if (Current == this)
-            Current = null;
+        if (instance == this)
+            instance = null;
     }
 }
