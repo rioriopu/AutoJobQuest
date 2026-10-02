@@ -10,7 +10,7 @@
     <RootNamespace>AutoJobQuest</RootNamespace>
     <AssemblyName>AutoJobQuest</AssemblyName>
     <Description>製作系・採集系のジョブクエ（Lv1〜70）の素材集め・製作・マテリア装着・クエスト進行を自動で行う</Description>
-    <Authors>rioriopu</Authors>
+    <Authors>Estell</Authors>
   </PropertyGroup>
 
   <ItemGroup>
@@ -36,13 +36,16 @@
     ビルドしたら dev プラグインの置き場へコピーする。
     DalamudPackager が manifest を作った後に走らせる（AfterTargets="Build" だと manifest が無い）。
     依存 DLL（LuminaSupplemental とその依存。ECommons は使っていない）も一緒に置く。
+
+    Release のターゲットの後だけに付ける。AfterTargets に Debug 側も並べると、
+    Release では条件で飛ばされる Debug 側の番で先に走り、manifest を作り直す前の古いものを写してしまう。
   -->
   <PropertyGroup>
     <DeployDir Condition="'$(Configuration)' == 'Release'">C:\自作プラグイン\AutoJobQuest\</DeployDir>
   </PropertyGroup>
 
   <Target Name="DeployToPluginFolder"
-          AfterTargets="DefaultDalamudPackagerRelease;DefaultDalamudPackagerDebug"
+          AfterTargets="DefaultDalamudPackagerRelease"
           Condition="'$(DeployDir)' != ''">
     <ItemGroup>
       <DeployFiles Include="$(OutputPath)*.dll;$(OutputPath)*.json" />

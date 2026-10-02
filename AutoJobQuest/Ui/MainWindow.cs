@@ -1066,7 +1066,7 @@ public sealed class MainWindow : Window
         ImGui.SameLine();
         ImGui.Checkbox("狙わない敵も表示", ref this.dropHuntShowSkipped);
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("チェックを外した敵・エリアは、ふだんは一覧に出しません。ここをオンにすると出るので、戻せます。"
+            ImGui.SetTooltip("チェックを外した敵・エリアは、ふだんは一覧に出しません（いなかったエリアを一覧から消せます）。ここをオンにすると出るので、戻せます。"
                              + "クエスト専用として自動で外した敵も、ここをオンにすると出ます");
 
         // クエスト専用として自動で外した敵（EventOnlySpawns）。ゲームのデータでは普段の敵と見分けきれないことがあるので、利用者が戻せるようにする
@@ -1125,7 +1125,7 @@ public sealed class MainWindow : Window
                         ? "このエリアの入口のエーテライトが未解放です（または野外のエリアではありません）"
                         : running ? "動いている間は始められません"
                         : m == null ? "このエリアの敵が全部「狙わない」になっています"
-                        : huntSpots.Count > 0 ? $"設定の狩り場を回ります：{string.Join(" ／ ", huntSpots.Select(s => $"X {s.X:0.0} Y {s.Y:0.0} Z {s.Z:0.0}"))}"
+                        : huntSpots.Count > 0 ? $"設定した狩り場を回ります：{string.Join(" ／ ", huntSpots.Select(s => $"X {s.X:0.0} Y {s.Y:0.0} Z {s.Z:0.0}"))}"
                         : $"出現点 {m.Spots.Count} か所：{string.Join(" ", m.Spots.Take(6).Select(s => $"{s.Spot.X:0.0},{s.Spot.Y:0.0}"))}");
 
                 // 敵ごとの「狙う」（チェックを外すと、デバッグでも本番の素材集めの戦闘でも狙わない）

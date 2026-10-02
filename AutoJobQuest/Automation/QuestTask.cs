@@ -1206,7 +1206,7 @@ public sealed unsafe class QuestTask : AutoTask
                 this.weatherBuy = TestMarketTask?.Invoke(order) ?? new MarketBoardTask([order], ctx.MarketWatcher);
                 ctx.Log.Write("クエスト", $"{name} は{want}のときしか釣れません。いまの{zone}の{now}なので、Questionable を止めて、"
                                        + $"足りない {need} 匹（NQ。持っている NQ {nq}／要る {count}）をマーケットボードで買います"
-                                       + "（天気・時間が合わないときは待たずに買う）");
+                                       + "（天気・時間が合わないときは、待たずに買います）");
                 this.NextPhase($"天気・時間が合わないので {name} をマーケットボードで買います");
                 return true;
             case WeatherFishBuy.Verdict.InWeather:
