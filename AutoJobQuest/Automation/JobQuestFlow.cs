@@ -1214,6 +1214,24 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
                 steps.Add(_ => new RunQuestTask(id, Unlocks.QuestName(id)));
         }
 
+        // 交換する秘伝書の店の解放クエスト（「一流の道具」等。自動で進める）。未完了なら、交換の前に前提ごと Questionable で進める。
+        // 計画は、自動で進められるときだけ、このジョブクエを止めずに残している（PrereqContext.BookUnlockRunnable）
+        var shopQuests = this.booksToBuy.Where(o => !ExchangeBooksTask.IsLearned(o.TomeId))
+            .SelectMany(o => o.RequiredQuests ?? [])
+            .Where(q => q != 0 && !FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(q))
+            .Distinct()
+            .ToList();
+        var queued = new HashSet<uint>();
+        foreach (var sq in shopQuests)
+        {
+            var chain = Unlocks.ChainToRun(sq, out var shopBlocked);
+            if (shopBlocked != null)
+                return this.Fail($"秘伝書を交換する店を開くクエスト「{Unlocks.QuestName(sq)}」を進められません：{shopBlocked}");
+            ctx.Log.Write("秘伝書", $"秘伝書を交換する店を開くため、「{string.Join("」→「", chain.Select(Unlocks.QuestName))}」を Questionable で進めます");
+            foreach (var id in chain.Where(queued.Add))
+                steps.Add(_ => new RunQuestTask(id, Unlocks.QuestName(id)));
+        }
+
         if (this.collectablesNeeded > Inventory.CountCollectables(b.CollectableItemId, b.MinCollectability))
         {
             steps.Add(_ => new GoToInnTask());

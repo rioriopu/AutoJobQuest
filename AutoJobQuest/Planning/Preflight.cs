@@ -344,6 +344,16 @@ public static class Preflight
                     $"次のクエストは、Questionable の手順で Artisan の既製リストが必ず動きます（在庫に関係なく、手持ちの材料で追加製作します。"
                     + $"材料が無ければ Questionable が NPC から買い足します。こちらからは止められません）：{string.Join("、", premadeAlways)}"));
 
+            // 秘伝書の交換の店の解放クエストを、こちらで自動で進める（「一流の道具」）
+            var shopUnlocks = plan.RemainingQuests
+                .Select(q => PrereqContext.FindBookShopBlocker(ctx.Data, q.RowId, FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete, PlanBuilder.IsBookUnlocked))
+                .Where(b => b != null)
+                .Select(b => b!.Value.Quest)
+                .Distinct()
+                .ToList();
+            foreach (var sq in shopUnlocks)
+                list.Add(new PreflightItem(Severity.Ok, $"秘伝書を交換する店を開くクエスト「{Unlocks.QuestName(sq)}」が未完了なので、秘伝書の段で Questionable で進めます"));
+
             // 前提のクエストが自動で進められない（メインクエスト等が未完了）ジョブクエ。
             // 開始は止めずに、進められるところまで進め、受けられないジョブクエの手前で止まる（素材も集めない）。
             // 想定した動きなので「動作保証外」の注意にはしない（開始の確認に「進められるところまで」として出す：JobQuestFlow.StopPlanText）

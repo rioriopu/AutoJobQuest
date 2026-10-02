@@ -130,7 +130,11 @@ public sealed record PrereqContext(
             QuestManager.IsQuestComplete,
             terr => AreaAccess.Reachable(terr, unlocked),
             j => Jobs.Level(j),
-            q => FindBookShopBlocker(data, q, QuestManager.IsQuestComplete, PlanBuilder.IsBookUnlocked),
+            // 秘伝書の交換の店の解放クエストが、こちらで自動で進められるなら止めない（秘伝書の段で、交換の前に進める）
+            q => FindBookShopBlocker(data, q, QuestManager.IsQuestComplete, PlanBuilder.IsBookUnlocked) is { } book
+                 && !BookUnlockRunnable(book.Quest, QuestManager.IsQuestComplete)
+                ? book
+                : null,
             q => QuestGateOf(data.Sources, q, QuestManager.IsQuestComplete, terr => AreaAccess.Reachable(terr, unlocked), GatherAbilities.Usable));
     }
 
@@ -153,6 +157,17 @@ public sealed record PrereqContext(
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// 秘伝書の交換の店の解放クエスト（「一流の道具」：サブクエスト・モードゥナ・Lv50 クラフター/ギャザラー・前提なし）を、こちらで自動で進められるか
+    /// （自動で進める。刺突漁の解放クエストと同じ扱い）。前提の連鎖に止まる理由が無く（メインクエスト等の未完了が無い）、
+    /// 連鎖のどのクエストにも受けられる職（レベルが足りてギアセットがある職：Unlocks.PickJobFor）があれば進められる。
+    /// </summary>
+    public static bool BookUnlockRunnable(uint quest, System.Func<uint, bool> isComplete)
+    {
+        var chain = Unlocks.ChainCore(quest, isComplete, out var blocked, out _);
+        return blocked == null && chain.Count > 0 && chain.All(id => Unlocks.PickJobFor(id) != null);
     }
 
     /// <summary>
