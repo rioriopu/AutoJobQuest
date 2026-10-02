@@ -118,12 +118,67 @@ public sealed unsafe class ReduceTask : AutoTask
     /// 使える（ゲームデータ：収集品採集はクエスト「職人の新たなお仕事」で解放。未完了だと GBR は収集品を見た時点で
     /// 採集をやめる＝GBR の AutoGather.cs。以前は確かめず、精選の周回がむだになりえた）。使えるか確かめられないときは外さない。
     /// </summary>
-    public static List<uint> UsableSources(SourceIndex sources, uint itemId)
+    /// <param name="assumeCollect">
+    /// 「収集品採集」をこれから解放する（<see cref="CollectUnlockChain"/> を進める）として見るか。機能の解放の段で、精選の解放を試すかを決めるときに使う。
+    /// </param>
+    public static List<uint> UsableSources(SourceIndex sources, uint itemId, bool assumeCollect = false)
         => sources.Get(itemId).ReducedFrom
             .Where(src => sources.Get(src).Gather.Any(g =>
                 Jobs.Level(g.Mining ? Jobs.Gatherers[0] : Jobs.Gatherers[1]) >= g.GatheringLevel
-                && GatherAbilities.Usable(g.Mining ? GatherAbilities.MinerCollect : GatherAbilities.BotanistCollect) != false))
+                // GBR はギアセットで着替えて採るので、ギアセットの無い採集職では採れない
+                && GearCheck.HasGearset(g.Mining ? Jobs.Gatherers[0] : Jobs.Gatherers[1])
+                && (assumeCollect || GatherAbilities.Usable(g.Mining ? GatherAbilities.MinerCollect : GatherAbilities.BotanistCollect) != false)))
             .ToList();
+
+    /// <summary>
+    /// 精選の解放クエスト（「生命、精選、もうひとつの答え」）を自動で進められるか（解放済みなら true）。前提が止まらず、連鎖のどのクエストにも
+    /// 受けられる職（レベルとギアセット）がある。「職人の新たなお仕事」を前倒しするかを決めるときに見る
+    /// （以前は精選の解放クエストを受けられる職が無いのに、「職人の新たなお仕事」だけ進めることがあった）。
+    /// </summary>
+    public static bool ReductionRunnable()
+    {
+        if (IsUnlocked())
+            return true;
+        var quest = Unlocks.UnlockQuest(Unlocks.Reduction);
+        if (quest == 0)
+            return false;
+        var chain = Unlocks.ChainToRun(quest, out var blocked);
+        return blocked == null && chain.All(id => Unlocks.PickJobFor(id) != null);
+    }
+
+    /// <summary>
+    /// 機能の解放の段より前の計画で、「収集品採集」をこれから解放する（「職人の新たなお仕事」を前倒しする）として精選の元を数えるか。
+    /// 解放の段（JobQuestFlow.StartUnlock）と同じ見込みにそろえる（以前は計画で精選を外し、開始の確認に霊砂を
+    /// 「マーケットで買う」と出したのに、実際はクエストを進めてから精選していた）。解放の段の後・この実行で精選をあきらめた後は false。
+    /// </summary>
+    public static bool CollectAssumable()
+        => !Unlocks.UnlockStagePassed && !Unlocks.GaveUp.Contains(Unlocks.Reduction) && ReductionRunnable() && CollectUnlockChain() is { Count: > 0 };
+
+    /// <summary>
+    /// 精選の元の収集品を採る「収集品採集」を解放するクエスト（ゲームデータ：アクションの解放条件 Action.UnlockLink。採掘師・園芸師とも
+    /// 「職人の新たなお仕事」67631・Lv50・クラフター/ギャザラー）のうち未完了のものを、前提ごと進める順に並べたもの。
+    /// 済んでいれば空、自動で進められない（前提のメインクエスト等が未完了・受けられる職が無い）なら null。
+    /// 受けられる順に「職人の新たなお仕事」（Lv50）→「生命、精選、もうひとつの答え」（Lv56）で受ける。
+    /// 以前は「収集品採集」が使えないと精選の元を採れないとみなして、精選の解放そのものを試さず、霊砂をマーケットで買っていた。
+    /// </summary>
+    public static List<uint>? CollectUnlockChain()
+    {
+        var chain = new List<uint>();
+        var quests = new[] { GatherAbilities.MinerCollect, GatherAbilities.BotanistCollect }
+            .Select(GatherAbilities.UnlockQuest)
+            .Where(q => q != 0 && !FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(q))
+            .Distinct();
+        foreach (var q in quests)
+        {
+            var list = Unlocks.ChainToRun(q, out var blocked);
+            if (blocked != null || list.Any(id => Unlocks.PickJobFor(id) == null))
+                return null;
+            foreach (var id in list.Where(id => !chain.Contains(id)))
+                chain.Add(id);
+        }
+
+        return chain;
+    }
 
     protected override TaskResult OnStart(TaskContext ctx)
     {

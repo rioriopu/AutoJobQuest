@@ -273,6 +273,12 @@ public static class GatherAbilities
         }
     }
 
+    /// <summary>その能力を解放するクエスト（Action.UnlockLink がクエストの番号なら、その番号。違えば 0）。</summary>
+    public static uint UnlockQuest(uint action)
+        => Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Action>().TryGetRow(action, out var a) && a.UnlockLink.RowId is > 0x10000 and < 0x20000
+            ? a.UnlockLink.RowId
+            : 0;
+
     /// <summary>能力の名前（「山師の眼力」など。ゲームデータから読む）。</summary>
     public static string Name(uint action)
         => Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Action>().TryGetRow(action, out var a) ? $"「{a.Name.ExtractText()}」" : $"アクション {action}";

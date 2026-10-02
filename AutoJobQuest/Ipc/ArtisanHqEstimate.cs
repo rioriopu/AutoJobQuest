@@ -27,8 +27,11 @@ namespace AutoJobQuest.Ipc;
 /// </summary>
 public static class ArtisanHqEstimate
 {
-    /// <summary>この見込みを下回ったら注意を出す。</summary>
-    public const double WarnBelow = 90;
+    /// <summary>
+    /// HQ 指定の品の見込みがこれに届かなければ始めない（Artisan のスタンダードで製作した場合に 100% にならないなら、
+    /// 製作前に止める。以前は 90% 未満で注意を出すだけだった）。比べるときは表示と同じく小数1桁に丸める。
+    /// </summary>
+    public const double StopBelow = 100;
 
     /// <summary>1レシピを通す回数の上限（100回ずつ。見込みが注意の境目から十分離れていれば早めに打ち切る）。</summary>
     public const int MaxRuns = 400;
@@ -52,6 +55,10 @@ public static class ArtisanHqEstimate
         private int ticks;
         public List<Result> Results { get; } = [];
         public string? Error { get; private set; }
+
+        /// <summary>計算中に装備・Artisan の設定・読み込み状態が変わったので結果を捨てた（計算できなかったのとは別：点検し直す）。</summary>
+        public bool Stale { get; private set; }
+
         public bool Complete { get; private set; }
         public bool Cancelled { get; private set; }
         public string Status => $"HQ の参考値を計算中：{this.Results.Count}/{this.recipes.Count} 品";
@@ -91,9 +98,9 @@ public static class ArtisanHqEstimate
                 if (this.artisanInstance != null && ++this.ticks % 30 == 0)
                 {
                     if (!ReferenceEquals(this.artisanInstance, RsrStateReader.FindPluginInstance("Artisan")))
-                        throw new InvalidOperationException("Artisan の読み込み状態が変わりました。点検し直してください");
+                        throw new StaleException("Artisan の読み込み状態が変わりました。点検し直してください");
                     if (this.artisanConfig != ConfigSignature(this.artisanInstance, this.recipes.Select(x => x.RecipeId)))
-                        throw new InvalidOperationException("計算中にArtisanの設定が変わりました。点検し直してください");
+                        throw new StaleException("計算中にArtisanの設定が変わりました。点検し直してください");
                 }
                 // 時間はフレームの占有上限だけに使う。完了は列挙の終了で判断する。
                 var clock = System.Diagnostics.Stopwatch.StartNew();
@@ -106,7 +113,7 @@ public static class ArtisanHqEstimate
                         this.steps.Dispose();
                         this.steps = null;
                         if (!this.IsCurrent())
-                            throw new InvalidOperationException("計算中に装備・Artisan の設定または読み込み状態が変わりました。点検し直してください");
+                            throw new StaleException("計算中に装備・Artisan の設定または読み込み状態が変わりました。点検し直してください");
                         return;
                     }
                     if (this.steps.Current is { } result)
@@ -116,6 +123,7 @@ public static class ArtisanHqEstimate
             catch (Exception e)
             {
                 this.Error = Unwrap(e).Message;
+                this.Stale = Unwrap(e) is StaleException;
                 this.Results.Clear();
                 this.Complete = true;
                 this.steps?.Dispose();
@@ -179,9 +187,13 @@ public static class ArtisanHqEstimate
             + ConfigSignature(plugin, recipes.Select(x => x.RecipeId)) + "|" + string.Join("|", parts);
     }
 
-    /// <summary>見込みの判断（試せるように分けた部分）：100回ずつ回して、境目から10%以上離れたら打ち切る。</summary>
+    /// <summary>
+    /// 見込みの判断（試せるように分けた部分）：100回ずつ回して、100% に届かないとはっきり分かったら（平均 99% 以下）打ち切る。
+    /// 100% に見えるうちは上限まで回す（以前は 90% を境目にし、100回とも 100% なら打ち切っていたので、本当は 99% の品も「100%」と出うる：
+    /// 1% の回で届かない品が100回とも届く確率は約37%）。平均 99% 以下なら、残りが全部 100% でも丸めて 100 に届かない。
+    /// </summary>
     public static bool Enough(int runs, double mean)
-        => runs >= MaxRuns || (runs >= 100 && Math.Abs(mean - WarnBelow) >= 10);
+        => runs >= MaxRuns || (runs >= 100 && mean <= StopBelow - 1);
 
     /// <summary>
     /// Artisan の DLL に、使う型・関数・欄がその形で実在するか（検証の仕組みから、導入版の DLL を読み込んで確かめる。無ければ null、違えば理由）。
@@ -221,6 +233,9 @@ public static class ArtisanHqEstimate
         var (solver, name) = api.CreateSolver(recipe.RowId, craft);
         return solver == null ? [] : api.RunPreparedSteps(recipe.RowId, recipe.ItemResult.RowId, craft, solver, name);
     }
+
+    /// <summary>計算中に条件が変わったことを表す（Job.Stale）。</summary>
+    private sealed class StaleException(string message) : InvalidOperationException(message);
 
     private static Exception Unwrap(Exception e) => e is TargetInvocationException { InnerException: { } inner } ? inner : e;
 

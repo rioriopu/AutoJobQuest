@@ -31,6 +31,9 @@ public sealed record PreflightItem(Severity Severity, string Text);
 /// </summary>
 public static class Preflight
 {
+    /// <summary>HQ 指定の品の見込みがこれに届かなければ始めない（100% にならなければ製作前に止める）。</summary>
+    public const double StopHqBelow = Ipc.ArtisanHqEstimate.StopBelow;
+
     /// <summary>画面に常に出す前提の文言。</summary>
     public const string Premise = "使いたい素材・完成品はリテイナーに一旦預けて下さい。後ほど引出します。";
 
@@ -87,7 +90,10 @@ public static class Preflight
         var list = new List<PreflightItem>();
         // HQ の見込みは参考値なので、計算できなくても始めるのは止めない（以前は Error にして開始できなくなった）。
         // 注意として出し、確認窓で利用者に決めてもらう
-        if (hq?.Error is { } calculationError)
+        // ただし計算中に装備・Artisan の設定が変わった（結果を捨てた）ときは、100% の判定を飛ばして始めないよう止める
+        if (hq is { Stale: true, Error: { } staleError })
+            list.Add(new PreflightItem(Severity.Error, $"HQ の見込みの計算中に、装備か Artisan の設定が変わりました（{staleError}）。もう一度開始してください"));
+        else if (hq?.Error is { } calculationError)
             list.Add(new PreflightItem(Severity.Warn, $"HQ の参考値を計算できませんでした（{calculationError}）。見込みを出さずに進めます"));
 
         // 1) プラグイン
@@ -418,14 +424,29 @@ public static class Preflight
         // 5.98) ジャーナルの受注数は、開始条件（受注枠−2 本以下）で見る（上の「開始条件」）
 
         // 6) Artisan の簡易製作（設定ファイルを読むだけ）
+        // HQ 指定の品があれば止める（HQ の見込みが 100% でなければ製作前に止める。簡易製作では HQ にならない。
+        // 以前は注意だけで、HQ の見込みの判定そのものも飛ばしていた）。受注後に作る品も含めて見る（HqTargets）
         var quick = ReadArtisanBool("QuickSynthMode");
-        if (quick == true && (plan?.Craft.Crafts.Any(x => x.WantHq) ?? false))
-            list.Add(new PreflightItem(Severity.Warn, "Artisan の「Use Quick Synthesis where possible」が ON です。HQ 指定の納品物が NQ になります"));
+        if (quick == true && plan != null && HqTargets(plan).Count > 0)
+            list.Add(new PreflightItem(Severity.Error, "Artisan の「Use Quick Synthesis where possible」が ON です。HQ 指定の品が簡易製作で NQ になるので始めません。"
+                                                       + "Artisan の設定で OFF にしてから開始してください"));
 
         // 6.5) HQ 指定の品が HQ になる見込み（Artisan 自身の計算を借りて、いまのギアセットの能力値で計算する：ArtisanHqEstimate）。
         // CP が足りないと Lv53 以上の品は HQ になりにくく、HQ にならなかった回数の上限で止まる（材料を使ってから）。始める前に知らせる
         if (plan != null && quick != true && ctx.Artisan.IsLoaded)
             list.AddRange(HqOutlook(ctx, plan, hq));
+
+        // 6.7) 精選の解放（受けられる順に「職人の新たなお仕事」（Lv50）→「生命、精選、もうひとつの答え」（Lv56））
+        if (plan != null && plan.Shortfalls.Any(x => x.Route == Route.Reduce) && Automation.ReduceTask.ReductionRunnable())
+        {
+            var before = Automation.ReduceTask.CollectUnlockChain() ?? [];
+            var unlock = Unlocks.IsUnlocked(Unlocks.Reduction) ? [] : new List<uint> { Unlocks.UnlockQuest(Unlocks.Reduction) };
+            var quests = before.Concat(unlock).Where(q => q != 0).Distinct().ToList();
+            if (quests.Count > 0)
+                list.Add(new PreflightItem(Severity.Ok,
+                    $"霊砂などを精選で集めるため、開始後の機能の解放の段で「{string.Join("」→「", quests.Select(Unlocks.QuestName))}」を Questionable で進めます"
+                    + "（進められなければ精選をあきらめ、マーケットで買います）"));
+        }
 
         // 7) 秘伝書
         if (plan != null && plan.Craft.LockedBySecretBook.Count > 0)
@@ -559,7 +580,7 @@ public static class Preflight
     }
 
     /// <summary>
-    /// HQ 指定の品の見込み。見込みが ArtisanHqEstimate.WarnBelow を下回る品を、能力値つきで注意に出す。
+    /// HQ 指定の品の見込み。見込みが ArtisanHqEstimate.StopBelow（100%）に届かない品があれば止める（LowHq・HqOutlook）。
     /// 準備は主スレッド、計算はフレームごとに進める。条件変更・例外は結果を破棄して停止する。
     /// </summary>
     public static Ipc.ArtisanHqEstimate.Job BeginHq(JobQuestPlan? plan)
@@ -575,7 +596,8 @@ public static class Preflight
             .Where(c => c.WantHq && (c.HqTarget <= 0 || Inventory.CountNow(c.ItemId, hqOnly: true) < c.HqTarget))
             .Select(c => (c.RecipeId, c.ItemId, c.ClassJobId)).ToList();
         var recipes = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Recipe>();
-        foreach (var qc in plan.RemainingQuests.SelectMany(q => q.QuestCrafts))
+        // 受注後の品は、まだ何も渡していないクエストのものだけ（計画と同じ見方：JobQuestPlan.Build。渡し済みの段で再開したときに止めない）
+        foreach (var qc in plan.RemainingQuests.Where(q => !plan.ItemStages.ContainsKey(q.RowId)).SelectMany(q => q.QuestCrafts))
         {
             if (!qc.Hq || Inventory.CountNow(qc.ItemId, hqOnly: true) >= qc.Count || list.Any(t => t.RecipeId == qc.RecipeId))
                 continue;
@@ -619,19 +641,40 @@ public static class Preflight
         foreach (var r in results.Where(r => r.Percent != null))
             ctx.Log.Write("事前点検", $"HQ の見込み：{CraftPlanner.ItemName(r.ItemId)} {r.Percent:0.#}%（{r.Stats}・{r.Solver}・{r.Runs}回）");
 
-        var low = results.Where(r => r.Percent is { } p && p < Ipc.ArtisanHqEstimate.WarnBelow).OrderBy(r => r.Percent).ToList();
+        // HQ 指定の品の見込みが 100% に届かなければ、始めない（素材を買う前・作る前に止める）。
+        // Artisan のスタンダードで製作した場合に 100% にならなければ、製作前に止める。
+        // 以前は 90% 未満で注意を出すだけで始め、HQ にならなければ材料を使った後に止まっていた（HQ の失敗の上限）。
+        // 見込みは表示と同じく小数1桁に丸めて比べる（表示が「100%」なのに止まる、を避ける）
+        // ・リテイナーを使う設定なら、事前点検は引き出す前の手持ちで見ているので、注意にとどめ、引き出した後にもう一度計算して止める
+        //   （JobQuestFlow.RecheckHq。以前はリテイナーに HQ の完成品を預けていると、作る必要が無いのに止めていた）
+        // ・Artisan の食事・薬を使う設定なら、見込みは食事・薬なしの値なので止めない（注意にとどめる）
+        var low = LowHq(results);
         if (low.Count > 0)
-            yield return new PreflightItem(Severity.Warn,
-                $"HQ 指定の品のうち、いまのギアセットの能力値では HQ になりにくいものがあります（見込み {Ipc.ArtisanHqEstimate.WarnBelow:0}% 未満）："
-                + string.Join("、", low.Select(r => $"{CraftPlanner.ItemName(r.ItemId)} {r.Percent:0}%（{r.Stats}）"))
-                + (ctx.Config.HqRetryRounds <= 0
-                    ? "。HQ にならなければ、その場で止まります（素材を失わないため。作り直す回数は設定タブで変えられます）"
-                    : $"。HQ にならないと {ctx.Config.HqRetryRounds} 回まで作り直し、それでも HQ にならないと止まります")
-                + "。CP を上げる装備・マテリアを検討してください"
-                + "（Artisan の計算を借り、状態と成否を乱数で振って求めた見込み。レベルはレシピの職レベルまで上がったとして計算）");
+        {
+            var consumables = ctx.Config.UseArtisanConsumables;
+            var retainer = ctx.Config.UseRetainerStock;
+            yield return new PreflightItem(consumables || retainer ? Severity.Warn : Severity.Error,
+                LowHqText(low)
+                + (consumables
+                    ? "。Artisan の食事・薬を使う設定なので、見込みは食事・薬なしの値です。止めずに進めます（HQ にならなければ、材料を使った後に止まります）"
+                    : retainer
+                        ? "。リテイナーから引き出した後の手持ちで、もう一度見込みを計算し、まだ作る品が 100% に届かなければ、素材を集める前に止めます"
+                        : "。そのため始めません"));
+        }
         else if (results.Any(r => r.Percent != null))
-            yield return new PreflightItem(Severity.Ok, $"HQ 指定の品 {results.Count(r => r.Percent != null)} 件は、いまのギアセットの能力値で HQ の見込みが {Ipc.ArtisanHqEstimate.WarnBelow:0}% 以上です");
+            yield return new PreflightItem(Severity.Ok, $"HQ 指定の品 {results.Count(r => r.Percent != null)} 件は、いまのギアセットの能力値で HQ の見込みが {StopHqBelow:0}% です");
     }
+
+    /// <summary>HQ の見込みが 100% に届かない品（表示と同じく小数1桁に丸めて比べる：表示が「100%」なのに止まる、を避ける）。</summary>
+    public static List<Ipc.ArtisanHqEstimate.Result> LowHq(IEnumerable<Ipc.ArtisanHqEstimate.Result> results)
+        => results.Where(r => r.Percent is { } p && Math.Round(p, 1) < StopHqBelow).OrderBy(r => r.Percent).ToList();
+
+    /// <summary>HQ の見込みが 100% に届かない品の説明（止めるとき・注意のとき共通）。</summary>
+    public static string LowHqText(IReadOnlyList<Ipc.ArtisanHqEstimate.Result> low)
+        => $"HQ 指定の品のうち、いまのギアセットの能力値では HQ の見込みが {StopHqBelow:0}% に届かないものがあります："
+           + string.Join("、", low.Select(r => $"{CraftPlanner.ItemName(r.ItemId)} {r.Percent:0.#}%（{r.Stats}・{r.Solver}）"))
+           + "。作業精度・加工精度・CP を上げる装備・マテリアを検討してください"
+           + "（Artisan の計算を借り、状態と成否を乱数で振って求めた見込み。食事・薬は入れない。レベルはレシピの職レベルまで上がったとして計算）";
 
     /// <summary>自動で OFF になる RSR の設定（記録に残すだけ。Henched が外れたときの原因の切り分け用：RSR の RSCommands_Actions）。</summary>
     private static readonly string[] RsrAutoOffSettings = ["AutoOffBetweenArea", "AutoOffCutScene", "AutoOffSwitchClass", "AutoOffWhenDead", "AutoOffAfterCombat"];

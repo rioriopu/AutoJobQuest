@@ -114,21 +114,41 @@ public sealed class UnlockFeatureTask : AutoTask
 {
     private readonly uint generalAction;
     private readonly bool required;
+    private readonly IReadOnlyList<uint> before;
     private readonly Queue<uint> chain = new();
     private RunQuestTask? sub;
+    private uint current;
+    private bool beforeOnly;
 
-    public UnlockFeatureTask(uint generalAction, bool required)
+    /// <param name="before">
+    /// 解放クエストより先に進めるクエスト（前提の欄には無いが、その機能を使うのに要るもの）。例：精選の元を採る「収集品採集」を解放する
+    /// 「職人の新たなお仕事」（Lv50）。受けられる順に「職人の新たなお仕事」→「生命、精選、もうひとつの答え」（Lv56）。
+    /// </param>
+    public UnlockFeatureTask(uint generalAction, bool required, IReadOnlyList<uint>? before = null)
     {
         this.generalAction = generalAction;
         this.required = required;
+        this.before = before ?? [];
     }
 
     public override string Name => $"解放: {Unlocks.Name(this.generalAction)}";
 
     protected override TaskResult OnStart(TaskContext ctx)
     {
+        var pendingBefore = this.before.Where(q => !FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(q)).ToList();
         if (Unlocks.IsUnlocked(this.generalAction))
-            return TaskResult.Done;
+        {
+            if (pendingBefore.Count == 0)
+                return TaskResult.Done;
+
+            // 機能は解放済みだが、使うのに要る先のクエストが残っている（例：精選は解放済みで、精選の元を採る「収集品採集」を解放する
+            // 「職人の新たなお仕事」が未完了。以前は先に進めず、霊砂をマーケットで買っていた）
+            foreach (var q in pendingBefore)
+                this.chain.Enqueue(q);
+            this.beforeOnly = true;
+            ctx.Log.Write("解放", $"{Unlocks.Name(this.generalAction)} は解放済みですが、使うのに要るクエストを Questionable で進めます：{string.Join(" → ", pendingBefore.Select(Unlocks.QuestName))}");
+            return TaskResult.Running;
+        }
 
         var quest = Unlocks.UnlockQuest(this.generalAction);
         if (quest == 0)
@@ -138,6 +158,8 @@ public sealed class UnlockFeatureTask : AutoTask
         if (blocked != null)
             return this.GiveUp(ctx, $"{Unlocks.Name(this.generalAction)} を解放するクエスト「{Unlocks.QuestName(quest)}」を進められません：{blocked}");
 
+        // 先に進めるクエスト（済んでいないものだけ）を前に置く
+        list = pendingBefore.Concat(list).Distinct().ToList();
         foreach (var q in list)
             this.chain.Enqueue(q);
         ctx.Log.Write("解放", $"{Unlocks.Name(this.generalAction)} が未解放なので、Questionable で次のクエストを進めます：{string.Join(" → ", list.Select(Unlocks.QuestName))}");
@@ -152,7 +174,9 @@ public sealed class UnlockFeatureTask : AutoTask
             {
                 if (Unlocks.IsUnlocked(this.generalAction))
                 {
-                    ctx.Log.Write("解放", $"{Unlocks.Name(this.generalAction)} を解放しました");
+                    ctx.Log.Write("解放", this.beforeOnly
+                        ? $"{Unlocks.Name(this.generalAction)} を使うのに要るクエストを終えました"
+                        : $"{Unlocks.Name(this.generalAction)} を解放しました");
                     return TaskResult.Done;
                 }
 
@@ -160,6 +184,7 @@ public sealed class UnlockFeatureTask : AutoTask
             }
 
             var q = this.chain.Dequeue();
+            this.current = q;
             this.sub = new RunQuestTask(q, Unlocks.QuestName(q));
         }
 
@@ -170,6 +195,8 @@ public sealed class UnlockFeatureTask : AutoTask
         this.sub.Cleanup(ctx);
         var failed = r == TaskResult.Failed ? this.sub.FailReason : null;
         this.sub = null;
+        if (failed != null)
+            Unlocks.FailedQuests[this.current] = failed;
         return failed == null ? TaskResult.Running : this.GiveUp(ctx, failed);
     }
 

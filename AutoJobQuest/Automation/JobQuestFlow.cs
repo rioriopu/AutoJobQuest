@@ -133,6 +133,11 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
     // 今の製作の列で頼んだ製作（終わったら HQ 失敗を品目ごとに数える）
     private readonly List<CraftOneTask> craftTasks = [];
     private Ipc.ArtisanHqEstimate.Job? hqCheck;
+
+    // リテイナーから引き出した後に、HQ の見込みをもう一度計算するか（事前点検で 100% に届かない品があり、リテイナーを使う設定で注意にとどめたとき）と、その計算
+    private bool hqRecheckPending;
+    private Ipc.ArtisanHqEstimate.Job? hqRecheck;
+    private JobQuestPlan? hqRecheckPlan;
     private JobQuestPlan? preflightPlan;
 
     private HqFailureTally hqFailures = new(3);
@@ -156,6 +161,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         MarketBoardTask.SpentThisRun = 0;
         MarketBoardTask.RunApprovedUpTo = Math.Max(0, ctx.Config.ConfirmRunTotalAboveGil);
         Unlocks.GaveUp.Clear();
+        Unlocks.FailedQuests.Clear();
 
         // ギアセットの品を守る数は、始めに手持ちにあった分まで
         Inventory.GearsetKeepCap = Inventory.GearsetKeepInBags();
@@ -399,6 +405,11 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
             return this.Fail($"事前点検で止めました：{string.Join(" / ", errors.Select(e => e.Text))}");
         }
 
+        // HQ の見込みが 100% に届かない品があり、リテイナーを使う設定で注意にとどめたときは、引き出した後の手持ちでもう一度計算して決める
+        // （RecheckHq：100% にならない場合は製作前に止める。食事・薬を使う設定のときは止めないので計算し直さない）
+        this.hqRecheckPending = ctx.Config.UseRetainerStock && !ctx.Config.UseArtisanConsumables
+                                && this.hqCheck.Error == null && Preflight.LowHq(this.hqCheck.Results).Count > 0;
+
         var warns = items.Where(i => i.Severity == Severity.Warn).ToList();
         foreach (var w in warns)
             ctx.Log.Warn("点検", w.Text);
@@ -638,10 +649,71 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
     }
 
     // ------------------------------------------------------------------
+    /// <summary>
+    /// リテイナーから引き出した後の手持ちで、HQ の見込みをもう一度計算する。まだ作る HQ 指定の品が 100% に届かなければ、素材を集める前に止める
+    /// （Artisan のスタンダードで製作した場合に 100% にならなければ、製作前に止める。事前点検はリテイナーから引き出す前の
+    /// 手持ちで見るので、リテイナーに HQ の完成品を預けていると、作る必要が無いのに止めてしまう）。
+    /// 計算中は Running、止めるときは Failed、決まったら null（先へ進む）。
+    /// </summary>
+    private TaskResult? RecheckHq(TaskContext ctx)
+    {
+        // 計画は計算の初めに1回だけ作る（計算は何フレームも続くので、毎フレーム作り直さない。事前点検の preflightPlan と同じ）
+        var plan = this.hqRecheckPlan ??= this.Plan(ctx);
+        if (Preflight.HqTargets(plan).Count == 0)
+        {
+            ctx.Log.Write("事前点検", "引き出した後の手持ちでは、作る HQ 指定の品はありません（HQ の見込みの確かめ直しは要りません）");
+            this.hqRecheckPending = false;
+            this.hqRecheckPlan = null;
+            return null;
+        }
+
+        this.hqRecheck ??= Preflight.BeginHq(plan);
+        this.hqRecheck.Tick();
+        if (!this.hqRecheck.Complete)
+        {
+            this.Status = $"引き出した後の HQ の見込みを計算しています（{this.hqRecheck.Status}）";
+            return TaskResult.Running;
+        }
+
+        var job = this.hqRecheck;
+        this.hqRecheck = null;
+        this.hqRecheckPlan = null;
+        this.hqRecheckPending = false;
+        try
+        {
+            if (job.Error != null)
+                return job.Stale
+                    ? this.Fail($"HQ の見込みの計算中に、装備か Artisan の設定が変わりました（{job.Error}）。もう一度開始してください")
+                    : WarnAndGo($"引き出した後の HQ の見込みを計算できませんでした（{job.Error}）。見込みを出さずに進めます");
+
+            foreach (var r in job.Results.Where(r => r.Percent != null))
+                ctx.Log.Write("事前点検", $"引き出した後の HQ の見込み：{CraftPlanner.ItemName(r.ItemId)} {r.Percent:0.#}%（{r.Stats}・{r.Solver}・{r.Runs}回）");
+            var low = Preflight.LowHq(job.Results);
+            if (low.Count > 0)
+                return this.Fail(Preflight.LowHqText(low) + "。リテイナーから引き出した後も作る必要があるので、素材を集める前に止めます");
+            ctx.Log.Write("事前点検", "引き出した後に作る HQ 指定の品は、どれも HQ の見込みが 100% です");
+            return null;
+        }
+        finally
+        {
+            job.Dispose();
+        }
+
+        TaskResult? WarnAndGo(string text)
+        {
+            ctx.Log.Warn("事前点検", text);
+            return null;
+        }
+    }
+
     // ②' 機能の解放（動かす前に解放済みか確かめ、未解放なら Questionable で解放する）
 
     private TaskResult StartUnlock(TaskContext ctx)
     {
+        // リテイナーから引き出した後の HQ の見込みの確かめ直し（解放の段は、引き出しの段のすぐ後に必ず通る）
+        if (this.hqRecheckPending && this.RecheckHq(ctx) is { } recheck)
+            return recheck;
+
         var plan = this.Plan(ctx);
         var steps = new List<Func<TaskContext, AutoTask?>>();
 
@@ -649,12 +721,25 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         if (plan.Materia.Any(m => !m.AlreadyMelded) && !Unlocks.IsUnlocked(Unlocks.Meld))
             steps.Add(_ => new UnlockFeatureTask(Unlocks.Meld, required: true));
 
-        // 精選：霊砂などを精選で集められる計画なら試す（解放できなければ、霊砂はマーケットに回す。確認窓あり）
+        // 精選：霊砂などを精選で集められる計画なら試す（解放できなければ、霊砂はマーケットに回す。確認窓あり）。
+        // 精選の元の収集品を採る「収集品採集」が未解放でも、それを解放する「職人の新たなお仕事」（Lv50）を自動で進められるなら、
+        // 先にそれを進めてから精選の解放クエスト「生命、精選、もうひとつの答え」（Lv56）を進める（受けられる順。
+        // 以前は「収集品採集」が使えないと精選の解放そのものを試さなかった）
+        // 精選の解放クエストを受けられないなら、「職人の新たなお仕事」も前倒ししない。
+        // 精選が解放済みでも「収集品採集」が未解放なら、「職人の新たなお仕事」だけ進める（以前は霊砂をマーケットで買っていた）
         var sources = ctx.Data.Sources!;
-        var wantsReduce = plan.Craft.RawShortfall.Keys.Any(k => sources.Get(k).CanReduce && ReduceTask.UsableSources(sources, k).Count > 0);
+        var collectChain = ReduceTask.ReductionRunnable() ? ReduceTask.CollectUnlockChain() : null;
+        var wantsReduce = plan.Craft.RawShortfall.Keys.Any(k => sources.Get(k).CanReduce
+            && ReduceTask.UsableSources(sources, k, assumeCollect: collectChain is { Count: > 0 }).Count > 0);
         // この実行で解放をあきらめたなら、区切りが変わってもやり直さない（計画でも精選を手段から外している）
-        if (wantsReduce && !Unlocks.IsUnlocked(Unlocks.Reduction) && !Unlocks.GaveUp.Contains(Unlocks.Reduction))
-            steps.Add(_ => new UnlockFeatureTask(Unlocks.Reduction, required: false));
+        var reductionLocked = !Unlocks.IsUnlocked(Unlocks.Reduction);
+        if (wantsReduce && !Unlocks.GaveUp.Contains(Unlocks.Reduction) && (reductionLocked || collectChain is { Count: > 0 }))
+        {
+            if (collectChain is { Count: > 0 })
+                ctx.Log.Write("解放", $"精選の元の収集品を採る「収集品採集」が未解放なので、先に「{string.Join("」→「", collectChain.Select(Unlocks.QuestName))}」を進めます"
+                                      + (reductionLocked ? $"（そのあと精選の解放クエスト「{Unlocks.QuestName(Unlocks.UnlockQuest(Unlocks.Reduction))}」）" : string.Empty));
+            steps.Add(_ => new UnlockFeatureTask(Unlocks.Reduction, required: false, collectChain));
+        }
 
         if (steps.Count == 0)
         {
@@ -734,6 +819,10 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         // 紫貨が足りていて交換だけのときは、素材を集めた後の秘伝書の段で止まった）
         if (this.UnlockQuestNeeded(this.books.ChooseTown(questDone: QuestDone)) && !FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(this.books.RequiredQuest))
         {
+            // この実行の機能の解放の段で、同じクエストを進められなかった（精選のための前倒し）なら、素材を集める前に止める
+            // （以前は素材を買ってから、秘伝書の段で同じクエストにもう一度失敗して止まった）
+            if (Unlocks.FailedQuests.TryGetValue(this.books.RequiredQuest, out var failedWhy))
+                return this.Fail(UnlockQuestBlocked(this.books.RequiredQuest, $"この実行の機能の解放の段で進められませんでした（{failedWhy}）"));
             Unlocks.ChainToRun(this.books.RequiredQuest, out var blockedBy);
             if (blockedBy != null)
                 return this.Fail(UnlockQuestBlocked(this.books.RequiredQuest, blockedBy));
@@ -1732,6 +1821,9 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
     {
         this.hqCheck?.Dispose();
         this.hqCheck = null;
+        this.hqRecheck?.Dispose();
+        this.hqRecheck = null;
+        this.hqRecheckPlan = null;
 
         // 中断の時計を止めたままにしない（次の実行の作業時間を狂わせない）
         WorkClock.Resume();
