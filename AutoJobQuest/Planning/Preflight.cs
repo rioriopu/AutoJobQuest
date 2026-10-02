@@ -437,10 +437,10 @@ public static class Preflight
             {
                 var ability = CraftAbility.FromGame();
                 var chosen = ScripCollectable.Choose(ctx.Config.ScripCollectableItemId, ctx.Config.ScripCollectableByJob, plan.Craft.LockedBySecretBook.Select(c => c.ClassJobId),
-                    item => planner.Pick(item, ability) != null);
+                    item => planner.Pick(item, ability) != null, ScripCollectable.HeldFromGame);
                 list.Add(planner.Pick(chosen, ability) != null
                     ? new PreflightItem(Severity.Ok, $"紫貨が足りなければ、{ScripCollectable.Describe(chosen, ctx.Config, planner)} を作って納品します"
-                                                     + $"（収集品だけに使う素材は、採集できれば採集し、できなければマーケットボードで買います。戦闘は {ScripCollectable.CombatItemsText(ctx.Config)}）")
+                                                     + "（収集品だけに使う素材は、採集できる品は採集、モンスターが落とす品は戦闘で集め、集めきれなければマーケットボードで買います）")
                     : new PreflightItem(Severity.Warn,
                         $"紫貨を稼ぐ収集品（{CraftPlanner.ItemName(ctx.Config.ScripCollectableItemId)} と同じ段の品）を作れる製作職がいません（{ScripCollectable.WhyNone(ctx.Config, planner, ability)}）。"
                         + "紫貨が足りなければ、秘伝書の下準備で止まります"));
@@ -453,7 +453,8 @@ public static class Preflight
                 var chain = Unlocks.ChainToRun(books.RequiredQuest, out var blocked);
                 list.Add(blocked == null
                     ? new PreflightItem(Severity.Ok,
-                        $"収集品の納品を開くクエスト「{Unlocks.QuestName(books.RequiredQuest)}」が未完了なので、秘伝書の段で Questionable で進めます（{string.Join("→", chain.Select(Unlocks.QuestName))}）")
+                        $"収集品の納品を開くクエスト「{Unlocks.QuestName(books.RequiredQuest)}」が未完了です。紫貨を稼ぐ納品か、モードゥナの窓口での交換が要るときに、"
+                        + $"秘伝書の段で Questionable で進めます（{string.Join("→", chain.Select(Unlocks.QuestName))}）")
                     : new PreflightItem(Severity.Warn,
                         $"収集品の納品を開くクエスト「{Unlocks.QuestName(books.RequiredQuest)}」が未完了で、自動で進められません：{blocked}。紫貨が足りなければ、秘伝書の下準備で止まります"));
             }

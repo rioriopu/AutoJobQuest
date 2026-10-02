@@ -127,6 +127,9 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
     // 戦闘に使えるジョブが無いことを記録に出したか（1回だけ出す）
     private bool noCombatJobLogged;
 
+    // RSR で戦えないので収集品だけの素材をマーケットへ回したことを記録に出したか（1回だけ出す）
+    private bool noRsrForCollectLogged;
+
     // 今の製作の列で頼んだ製作（終わったら HQ 失敗を品目ごとに数える）
     private readonly List<CraftOneTask> craftTasks = [];
     private Ipc.ArtisanHqEstimate.Job? hqCheck;
@@ -855,11 +858,11 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
             craftAll = ctx.Data.Planner!.Build(plan.Targets.Concat(extra), Inventory.Snapshot(), PlanBuilder.IsBookUnlocked, CraftAbility.FromGame());
 
         // 紫貨の収集品だけに使う素材（本編のジョブクエの計画に無い素材。作れる職がいなくて買う中間素材を含む）は、
-        // 採集できれば採集し、できなければ買う（戦闘・釣り・精選はしない。マーケットへの切り替えの確認も出さない）。
+        // NPC 購入・採集・戦闘で集め、集めきれなければ買う（釣り・精選はしない。マーケットへの切り替えの確認も出さない）。
         // 採集できる素材は採集し、採集できず中間素材として作ることもできないときは、
         // ジョブクエを進めるジョブの収集品を作るための素材をマーケットボードで買う。
-        // 以前は本編の素材と同じ順（NPC 購入→採集→釣り→戦闘→精選→マーケット）で、アルケオーニスの粗皮・ディープアイの涙・
-        // ダイアマイトウェブを戦闘で集めに行き、採集できない素材はマーケットへ切り替える確認を出していた
+        // モンスターのドロップで手に入る品は、マーケットボードで買わずに戦闘で集め、集めるのが難しければマーケットボードでの購入に切り替える。
+        // 以前は、採集できない素材をマーケットへ切り替えるたびに確認を出していた（開始の確認に載らない素材のため）
         var collectOnly = extra.Count == 0
             ? new HashSet<uint>()
             : craftAll.RawTotal.Keys.Where(k => !plan.Craft.RawTotal.ContainsKey(k)).ToHashSet();
@@ -868,7 +871,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
             .ToList();
         var collectRaw = raw.Where(r => collectOnly.Contains(r.Item)).ToList();
         if (collectRaw.Count > 0)
-            ctx.Log.Write("素材", $"紫貨の収集品だけに使う素材（採集できれば採集、できなければ購入。戦闘は {ScripCollectable.CombatItemsText(ctx.Config)}）："
+            ctx.Log.Write("素材", "紫貨の収集品だけに使う素材（採集できる品は採集、モンスターが落とす品は戦闘、集めきれなければ購入）："
                                   + string.Join("、", collectRaw.Select(r => $"{CraftPlanner.ItemName(r.Item)}×{r.Need}（{(r.Routes.Count > 0 ? string.Join("→", r.Routes.Select(Ui.MainWindow.RouteName)) : "手段なし")}）")));
 
         var marketMateria = MateriaMarketNeeds(ctx.Config, plan);
@@ -1099,16 +1102,32 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
     // 使える入手手段（計画の表示と同じ判定：PlanBuilder.AvailableRoutes）。
     // 戦闘に使えるジョブが無ければ、戦闘は手段から外す（次の手段がマーケットなら、買う前に確認窓を出す）。
     // 以前は戦闘が第一の手段の素材があると、そこで止まっていた
-    // 紫貨の収集品だけに使う素材（collectableOnly）は、NPC 購入・採集・マーケットだけにする（採集できれば採集、できなければ買う）。
-    // 設定で指定した品（ScripCollectableCombatItems：ディープアイの涙）だけは、戦闘でも集める
+    // 紫貨の収集品だけに使う素材（collectableOnly）は、NPC 購入・採集・戦闘・マーケットだけにする（釣り・精選はしない）。
+    // モンスターのドロップで手に入る品は、マーケットで買わずに戦闘で集め、
+    // 入手が困難ならマーケットに切り替える（戦闘で集めきれなければ、CollectFailures が戦闘を外し、次の周回でマーケットで買う）
     private List<Route> RoutesFor(TaskContext ctx, uint item, bool collectableOnly = false)
     {
         var routes = PlanBuilder.AvailableRoutes(ctx.Data.Sources!, item, this.excluded);
         if (collectableOnly)
         {
-            var combatOk = ctx.Config.ScripCollectableCombatItems.Contains(item);
-            routes.RemoveAll(r => r is Route.Fish or Route.Reduce || (r == Route.Combat && !combatOk));
+            routes.RemoveAll(r => r is Route.Fish or Route.Reduce);
+
+            // RSR が読み込まれていない・外部ターゲット指定が有効か読めないときは、戦闘を始められない（StartAcquire で止まる）。
+            // 収集品だけの素材は「入手が困難ならマーケット」の扱いなので、止めずにマーケットへ回す（本編の素材は今までどおり止めて知らせる）。
+            // 外すのはこの周回だけ（途中で RSR を入れれば次の周回から戦闘に戻る）。
+            if (routes.Contains(Route.Combat) && (!ctx.Rotation.IsLoaded || Ipc.RsrStateReader.ReadTargetFreelyOverride() != false))
+            {
+                if (!this.noRsrForCollectLogged)
+                {
+                    this.noRsrForCollectLogged = true;
+                    ctx.Log.Warn("素材", "RotationSolverReborn が読み込まれていないか、外部ターゲット指定が有効または読めないので、"
+                                         + "紫貨の収集品だけに使う素材は戦闘で集めず、マーケットで買います");
+                }
+
+                routes.Remove(Route.Combat);
+            }
         }
+
         if (routes.Contains(Route.Combat) && CombatJobPicker.Pick() == null)
         {
             if (!this.noCombatJobLogged)

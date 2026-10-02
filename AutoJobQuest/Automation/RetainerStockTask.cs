@@ -830,6 +830,13 @@ public sealed unsafe class RetainerStockTask : AutoTask
 
         var watch = System.Diagnostics.Stopwatch.StartNew();
         var (targets, _) = this.Targets(ctx, Inventory.Snapshot());
+
+        // 紫貨の収集品は、引き出す時（Targets）にもう一度選ぶ。読む時と引き出す時で秘伝書の要る職が変わり、選ぶ品が変わっても
+        // 素材を読み漏らさないよう、収集品が要るときは候補の品すべての素材を読む（増えるのは最大8品の素材）
+        var candidates = ScripCollectable.Candidates(ctx.Config);
+        if (targets.Any(t => candidates.Contains(t.ItemId)))
+            targets = targets.Concat(candidates.Where(c => targets.All(t => t.ItemId != c)).Select(c => new QuestItemReq(c, 1, false, "紫貨のための収集品の候補"))).ToList();
+
         var items = ctx.Data.Planner!.Build(targets, new RetainerPlan.Stock(), _ => true, CraftAbility.FromGame()).StockDemand.Keys
             .Concat(targets.Select(t => t.ItemId))
             .Distinct()

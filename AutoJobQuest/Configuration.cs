@@ -129,17 +129,12 @@ public sealed class Configuration
     /// 既定では調理師（15）だけ「収集用のソーム・アル・オ・マロン」（31076：収集品納品の Lv50〜52 の段・レシピ Lv52。
     /// 同じ段の「収集用のアウフラウフ」より素材が少なく作りやすいため）。上の品と同じ窓口・同じ報酬の通貨の、その職の品でなければ使わない。
     /// </summary>
-    public Dictionary<uint, uint> ScripCollectableByJob { get; set; } = new()
+    public Dictionary<uint, uint> ScripCollectableByJob { get; set; } = DefaultScripCollectableByJob();
+
+    private static Dictionary<uint, uint> DefaultScripCollectableByJob() => new()
     {
         [15] = 31076,
     };
-
-    /// <summary>
-    /// 紫貨の収集品だけに使う素材でも、戦闘（モンスターのドロップ）で集める品。それ以外の収集品だけの素材は、採集できなければ買う
-    /// （JobQuestFlow.RoutesFor）。ディープアイの涙だけは自分でドロップして入手できる
-    /// （12628：錬金術師の収集用のアルケオーニスグリモアの中間素材ミスライトエンチャントインクの素材。落とすのはクルザス西部高地のディープアイ）。
-    /// </summary>
-    public List<uint> ScripCollectableCombatItems { get; set; } = [12628];
 
     /// <summary>
     /// 納品物に「任意のマテリア」を付けるクエスト（各クラフター Lv20 の7本）で、買って付けるマテリア
@@ -332,6 +327,10 @@ public sealed class Configuration
         Data.CraftAbility.RequireGear = this.RequireGearForOtherCrafters;
 
         this.HqRetryRounds = Math.Clamp(this.HqRetryRounds, 0, 10);
+
+        // 紫貨の収集品の職ごとの指定がファイルに null と書かれていたら、既定（調理師＝マロン）に戻す（空の {} は「指定なし」としてそのまま。
+        // null のままだと説明の文を作るところで落ち、秘伝書の下準備と事前点検が止まる）
+        this.ScripCollectableByJob ??= DefaultScripCollectableByJob();
 
         // 版 3：1回の購入額の既定を 500,000 から 100,000 へ。古い既定のまま（利用者が変えていない）なら 100,000 にする。
         // 利用者が自分で別の額にしていれば変えない

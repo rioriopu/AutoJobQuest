@@ -96,17 +96,59 @@ public static class ScripCollectable
         return none;
     }
 
+    // 品 → 納品の下限の収集価値（CollectablesShopRefine.LowCollectability。表に無ければ 0）
+    private static readonly ConcurrentDictionary<uint, int> MinCollect = new();
+
+    /// <summary>その収集品の納品の下限の収集価値（BookData.ResolveCollectable と同じく、表で最初に見つかった行。無ければ 0）。</summary>
+    public static int MinCollectabilityOf(uint item)
+        => MinCollect.GetOrAdd(item, i =>
+        {
+            foreach (var r in Svc.Data.GetSubrowExcelSheet<CollectablesShopItem>())
+            {
+                for (var k = 0; k < r.Count; k++)
+                {
+                    if (r[k].Item.RowId == i && r[k].CollectablesShopRefine.ValueNullable is { } refine)
+                        return refine.LowCollectability;
+                }
+            }
+
+            return 0;
+        });
+
     /// <summary>
     /// 紫貨を稼ぐ収集品を選ぶ。選ぶ順：
+    ///  0) 手持ちがあって（<paramref name="held"/>）作れる品（下の 1〜3 の候補のうち、手持ちのいちばん多いもの）。以前は、
+    ///     選ぶ品が職や設定で変わるので、前に作った別の収集品を持っていても見ずに、新しく作っていた
     ///  1) 秘伝書の要る職（<paramref name="preferredJobs"/> の順）の品（<see cref="ItemFor"/>）で、作れるもの（ジョブに合わせる）
     ///  2) 設定の品（作れるなら）
     ///  3) ほかの製作職の品で、作れるもの
     /// どれも作れなければ設定の品を返す（秘伝書の下準備で、作れる職がいない理由を出して止まる：JobQuestFlow.WaitBookData）。
     /// </summary>
-    /// <param name="canCraft">その品を、いまのキャラクターの職で作れるか（レベル・ギアセット・装備。試すときに差し替える）。</param>
-    public static uint Choose(uint configured, IReadOnlyDictionary<uint, uint>? byJob, IEnumerable<uint> preferredJobs, Func<uint, bool> canCraft)
+    /// <param name="canCraft">その品を、いまのキャラクターの職で作れるか（レベル・ギアセット・装備。試すときに差し替える）。
+    /// 手持ちだけで足りる品も、納品のときにその職へ着替えるので、作れることを条件にする。</param>
+    /// <param name="held">納品の下限を満たす手持ちの数（省略時は見ない。試すときに差し替える）。</param>
+    public static uint Choose(uint configured, IReadOnlyDictionary<uint, uint>? byJob, IEnumerable<uint> preferredJobs, Func<uint, bool> canCraft,
+        Func<uint, int>? held = null)
     {
-        foreach (var job in preferredJobs.Distinct())
+        var jobs = preferredJobs.Distinct().ToList();
+        if (held != null)
+        {
+            var candidates = jobs.Select(j => ItemFor(configured, byJob, j))
+                .Append(configured)
+                .Concat(Jobs.Crafters.Select(j => ItemFor(configured, byJob, j)))
+                .Where(i => i != 0)
+                .Distinct()
+                .ToList();
+            var best = candidates
+                .Select(i => (Item: i, Held: held(i)))
+                .Where(x => x.Held > 0 && canCraft(x.Item))
+                .OrderByDescending(x => x.Held) // 同じ数なら候補の順（要る職 → 設定の品 → ほかの職）
+                .FirstOrDefault();
+            if (best.Item != 0)
+                return best.Item;
+        }
+
+        foreach (var job in jobs)
         {
             var item = ItemFor(configured, byJob, job);
             if (item != 0 && canCraft(item))
@@ -126,14 +168,24 @@ public static class ScripCollectable
         return configured;
     }
 
+    /// <summary>選ばれうる品（製作8職の品と設定の品。0 と重なりを除く）。</summary>
+    public static HashSet<uint> Candidates(Configuration cfg)
+        => Jobs.Crafters.Select(j => ItemFor(cfg.ScripCollectableItemId, cfg.ScripCollectableByJob, j))
+            .Append(cfg.ScripCollectableItemId)
+            .Where(i => i != 0)
+            .ToHashSet();
+
     /// <summary>今のキャラクターの状態で選ぶ（フレームワークのスレッドから呼ぶ。レベルとギアセットをその時点で写し取る）。</summary>
     public static uint ChooseFromGame(Configuration cfg, IEnumerable<uint> preferredJobs, CraftPlanner? planner)
     {
         if (planner == null)
             return cfg.ScripCollectableItemId;
         var ability = CraftAbility.FromGame();
-        return Choose(cfg.ScripCollectableItemId, cfg.ScripCollectableByJob, preferredJobs, item => planner.Pick(item, ability) != null);
+        return Choose(cfg.ScripCollectableItemId, cfg.ScripCollectableByJob, preferredJobs, item => planner.Pick(item, ability) != null, HeldFromGame);
     }
+
+    /// <summary>納品の下限を満たす手持ちの数（フレームワークのスレッドから呼ぶ）。</summary>
+    public static int HeldFromGame(uint item) => Inventory.CountCollectables(item, MinCollectabilityOf(item));
 
     /// <summary>
     /// どの製作職も、紫貨の収集品を作れない理由（職ごと。例：「木工師（収集用のシーダーロングボウ）Lv1・レシピ Lv50／錬金術師（…）ギアセットが無い」）。
@@ -144,19 +196,13 @@ public static class ScripCollectable
             .Where(x => x.Item != 0)
             .Select(x => $"{Jobs.Name(x.Job)}（{CraftPlanner.ItemName(x.Item)}）{ability.WhyNot(x.Job, planner.Pick(x.Item) is { } r ? CraftAbility.RecipeLevel(r) : 999) ?? "作れる"}"));
 
-    /// <summary>収集品だけの素材のうち、戦闘でも集める品の説明（記録・点検用。例：「ディープアイの涙だけ」。無ければ「しない」）。</summary>
-    public static string CombatItemsText(Configuration cfg)
-        => cfg.ScripCollectableCombatItems.Count == 0
-            ? "しない"
-            : $"{string.Join("・", cfg.ScripCollectableCombatItems.Select(CraftPlanner.ItemName))}だけ";
-
     /// <summary>記録・点検に出す説明（例：「収集用のアルケオーニスグリモア（錬金術師の品。設定の『収集用のシーダーロングボウ』と同じ段の品を、ジョブに合わせて選びました）」）。</summary>
     public static string Describe(uint item, Configuration cfg, CraftPlanner? planner)
     {
         var job = planner?.Pick(item) is { } r ? Jobs.Name(Jobs.CraftTypeToClassJob(r.CraftType.RowId)) : "?";
         if (item == cfg.ScripCollectableItemId)
             return $"{CraftPlanner.ItemName(item)}（{job}の品。設定の品）";
-        if (cfg.ScripCollectableByJob.ContainsValue(item))
+        if (cfg.ScripCollectableByJob?.ContainsValue(item) == true)
             return $"{CraftPlanner.ItemName(item)}（{job}の品。職ごとの指定の品を、ジョブに合わせて選びました）";
         return $"{CraftPlanner.ItemName(item)}（{job}の品。設定の「{CraftPlanner.ItemName(cfg.ScripCollectableItemId)}」と同じ段の品を、ジョブに合わせて選びました）";
     }

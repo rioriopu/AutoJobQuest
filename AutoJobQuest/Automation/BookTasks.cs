@@ -656,6 +656,9 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
     // （以前は 2.5 秒。成功ならその時点で次へ進むので、長くしても普段は遅くならない）
     private static readonly TimeSpan VerifyLimit = TimeSpan.FromSeconds(10);
 
+    // 納品画面の一覧が出るのを待つ上限（ListPending）。画面は開いたフレームでは準備ができておらず、一覧の行数も 0 のまま
+    private static readonly TimeSpan ListWaitLimit = TimeSpan.FromSeconds(5);
+
     private readonly BookData data;
     private readonly NpcSpot npc;
     private readonly Func<int> targetScrips;
@@ -687,6 +690,9 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
     private int closeAttempts;
     private bool shopFallbackLogged;
     private bool startedWithShopOpen;
+
+    // 一覧が出るのを待ち始めた時刻（待っていなければ null）
+    private DateTime? listWaitSince;
 
     public int Delivered { get; private set; }
 
@@ -801,7 +807,13 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
 
     private TaskResult TickSelect(TaskContext ctx, AtkUnitBase* addon)
     {
-        if (!TryReadOffers(addon, out var offers, out var readFailure))
+        // 画面の準備ができて一覧が出るまで待ってから読む（準備完了〔IsAddonReady〕を確かめてから読む）。
+        // 不具合の例：話しかけて納品画面が開いた（準備完了=False・値は 0〜12 番だけ）26ms 後に一覧の行数（20 番）を読み、
+        // 0 だったので「納品画面の一覧を読めません：納品できる品がありません」で止まった。自分が開いた画面の記録（持ち主）があると、
+        // 準備を待たずにここへ来るため
+        if (this.ListPending(addon, out var offers, out var readFailure) is { } pending)
+            return pending;
+        if (offers == null)
             return this.Fail($"納品画面の一覧を読めません：{readFailure}");
 
         var held = Inventory.HeldCollectables();
@@ -1094,6 +1106,31 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
     }
 
     private readonly record struct Offer(int Row, uint ItemId);
+
+    /// <summary>
+    /// 納品画面の一覧を読む。準備ができていないか一覧が読めないうちは、上限（<see cref="ListWaitLimit"/>）まで待つ（Running を返す）。
+    /// 読めたら null と一覧、上限を過ぎても読めなければ null と offers=null・理由（呼ぶ側で止める）。
+    /// </summary>
+    private TaskResult? ListPending(AtkUnitBase* addon, out List<Offer>? offers, out string failure)
+    {
+        offers = null;
+        failure = "納品画面の準備ができていません";
+        if (GameUi.IsReady("CollectablesShop", out var ready) && ready == addon && TryReadOffers(addon, out var read, out failure))
+        {
+            this.listWaitSince = null;
+            offers = read;
+            return null;
+        }
+
+        this.listWaitSince ??= DateTime.UtcNow;
+        if (DateTime.UtcNow - this.listWaitSince.Value < ListWaitLimit)
+        {
+            this.Status = "納品画面の一覧が出るのを待っています";
+            return TaskResult.Running;
+        }
+
+        return null;
+    }
 
     /// <summary>
     /// 納品画面の一覧を読む。

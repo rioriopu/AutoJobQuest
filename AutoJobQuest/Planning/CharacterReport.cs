@@ -196,10 +196,17 @@ public static class CharacterReport
                 $"納品に使う収集品（いまのジョブで選んだ品。実行では秘伝書の要る職に合わせます）：{ScripCollectable.Describe(shown.CollectableItemId, ctx.Config, data.Planner)}"
                 + $"（収集価値 {shown.MinCollectability} 以上で 1個 {shown.RewardLow}〜{shown.RewardHigh}）　手持ち {held} 個"));
 
-            var town = books.ChooseTown();
+            // 実行（秘伝書の下準備・秘伝書の段）と同じ見方：収集品の納品を開くクエスト（職人の新たなお仕事）は、この段で進めるので済んだものとして街を選ぶ
+            // （以前は未完了のとき、モードゥナを選べず「解放済みのエーテライトがありません」と誤った理由を出していた）
+            var townQuest = books.RequiredQuest;
+            bool QuestDone(uint q) => QuestManager.IsQuestComplete(q) || (q != 0 && q == townQuest);
+            var town = books.ChooseTown(questDone: QuestDone);
             lines.Add(town == null
-                ? new ReportLine(Severity.Warn, "収集品納品窓口とスクリップ取引窓口のある街に、解放済みのエーテライトがありません")
-                : new ReportLine(Severity.Ok, $"納品・交換に使う街：{TeleportTask.TerritoryName(town.Value.Collect.Territory)}"));
+                ? new ReportLine(Severity.Warn, books.WhyNoTown(QuestDone))
+                : new ReportLine(Severity.Ok, $"納品・交換に使う街：{TeleportTask.TerritoryName(town.Value.Collect.Territory)}"
+                                              + (townQuest != 0 && !QuestManager.IsQuestComplete(townQuest)
+                                                  ? $"（「{Unlocks.QuestName(townQuest)}」は、要るときに秘伝書の段で進めます）"
+                                                  : string.Empty)));
         });
 
         Add("ジョブクエの進み具合（Lv70 まで）", lines =>
