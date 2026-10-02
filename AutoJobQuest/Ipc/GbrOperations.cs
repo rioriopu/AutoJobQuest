@@ -651,10 +651,20 @@ public sealed class GbrOperations
     /// </summary>
     /// <param name="entries">品目と「持っていたい総数」。</param>
     /// <param name="notGil">ギルの店で自動購入できなかった品目。</param>
-    /// <param name="preferredNpc">品目ごとに買う NPC（ENpc）。その NPC で登録できなければ、GBR が選ぶ店で買う（記録に残す）。</param>
-    public Guid? PrepareVendorList(IReadOnlyList<(uint ItemId, uint TargetOwned)> entries, out List<uint> notGil, IReadOnlyDictionary<uint, uint>? preferredNpc = null)
+    /// <param name="reasons">NPC 購入から外した品目の理由（使える売り手がいない・登録できない）。</param>
+    /// <param name="preferredNpc">
+    /// 品目ごとに買う NPC（ENpc）。<paramref name="whyNot"/> があれば、その NPC が使えるときだけ使う（使えなければ使える別の売り手）。
+    /// <paramref name="whyNot"/> が無ければ、その NPC で登録できないとき GBR が選ぶ店で買う（今までどおり。記録に残す）。
+    /// </param>
+    /// <param name="whyNot">
+    /// その品をその売り手（NPC と店）で、このキャラクターが買えない理由（買えるなら null：VendorAccess.WhyNot）。
+    /// 渡すと、品ごとに使える売り手を選んで登録し、使える売り手がいない品は外す。
+    /// </param>
+    public Guid? PrepareVendorList(IReadOnlyList<(uint ItemId, uint TargetOwned)> entries, out List<uint> notGil, out Dictionary<uint, string> reasons,
+        IReadOnlyDictionary<uint, uint>? preferredNpc = null, Func<uint, Data.VendorCandidate, string?>? whyNot = null)
     {
         notGil = [];
+        reasons = [];
         var h = this.reflection.Get();
         if (h == null)
         {
@@ -694,10 +704,50 @@ public sealed class GbrOperations
             var trySet = vt.GetMethod("TrySetTarget", GbrHandle.PubInst, null,
                 [typeof(Guid), typeof(uint), typeof(uint), typeof(bool), typeof(bool), typeof(bool)], null)!;
 
+            // 品ごとに、このキャラクターが使える売り手（NPC と店の組）を選ぶ（友好部族を解放していないと現れない
+            // アキンドなど、人によって使えない購入先に GBR を向かわせない。GBR は条件を見ずに、店の番号順で置き場所の分かる最初の NPC を選ぶ）。
+            // 判定の材料（whyNot）が無いか、GBR の売り手を読めないときは、今までどおり GBR に任せる
+            Dictionary<uint, Data.VendorCandidate>? chosen = null;
+            if (whyNot != null)
+            {
+                if (this.VendorCandidates(h, entries.Select(e => e.ItemId)) is { } candidates)
+                {
+                    var (c, excluded) = Data.VendorAccess.Choose(candidates, whyNot, preferredNpc);
+                    chosen = c;
+                    foreach (var (item, why) in excluded)
+                        reasons[item] = why;
+                }
+                else
+                {
+                    Note("GBR の売り手の一覧（店と NPC・置き場所）を読めないので、買う NPC は GBR に任せます（友好部族などの条件は確かめられません）");
+                }
+            }
+
             foreach (var (itemId, target) in entries)
             {
                 if (gilRoute != null && !gilRoute.Contains(itemId))
                 {
+                    notGil.Add(itemId);
+                    continue;
+                }
+
+                if (chosen != null)
+                {
+                    // 使える売り手がいない品は NPC 購入から外す（理由は reasons。次の周回で別の手段にする）
+                    if (!chosen.TryGetValue(itemId, out var pick))
+                    {
+                        notGil.Add(itemId);
+                        continue;
+                    }
+
+                    if (this.TryAddWithNpc(h, vblm, listId, itemId, target, pick.Npc, out var pickWhy, pick.Shop))
+                    {
+                        Note($"{Data.CraftPlanner.ItemName(itemId)} は {pick.Name}（{Data.AreaAccess.Name(pick.Territory)}・店 {pick.Shop}）で買うよう登録しました");
+                        continue;
+                    }
+
+                    // GBR 任せに戻さない（GBR は使えない NPC を選びうる）
+                    reasons[itemId] = $"{pick.Name} で登録できませんでした（{pickWhy}）";
                     notGil.Add(itemId);
                     continue;
                 }
@@ -749,7 +799,7 @@ public sealed class GbrOperations
     /// 品目を、指定の NPC（ENpc）から買うように購入リストへ入れる（GBR の TryAddTarget(Guid, VendorShopEntry, VendorNpc, uint, bool, bool, bool)）。
     /// ギルの店の一覧（VendorShopResolver.GilShopEntries）から、その品目を置き、その NPC が売っていて、自動購入に対応し、除外されていない組を探す。
     /// </summary>
-    private bool TryAddWithNpc(GbrHandle h, object vblm, Guid listId, uint itemId, uint target, uint npcId, out string why)
+    private bool TryAddWithNpc(GbrHandle h, object vblm, Guid listId, uint itemId, uint target, uint npcId, out string why, uint shopId = 0)
     {
         why = string.Empty;
         var resolver = h.GbrAsm.GetType("GatherBuddy.Vulcan.Vendors.VendorShopResolver", throwOnError: false);
@@ -784,6 +834,9 @@ public sealed class GbrOperations
             foreach (var n in (IEnumerable)et.GetProperty("Npcs")!.GetValue(e)!)
             {
                 if ((uint)n.GetType().GetProperty("NpcId")!.GetValue(n)! != npcId)
+                    continue;
+                // 店の番号も照らす（同じ NPC が複数の店を持つことがある。選んだ店の条件で判断しているので、別の店で登録しない）
+                if (shopId != 0 && n.GetType().GetProperty("ShopId")?.GetValue(n) is uint npcShop && npcShop != shopId)
                     continue;
                 if (!(bool)isSupported.Invoke(null, [e, n])! || (bool)isExcluded.Invoke(null, [n])!)
                 {
@@ -975,6 +1028,57 @@ public sealed class GbrOperations
                     result.Add(item);
                     break;
                 }
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 品ごとに、GBR が挙げる売り手（NPC と店の組。GBR の並び順＝GBR がいつも選ぶ順）。GBR が自動で買えない売り手（IsPurchaseSupported・
+    /// VendorDevExclusions）と、置き場所の分からない売り手（GBR は置き場所の無い NPC を指定されると、黙ってほかの NPC に切り替える：
+    /// VendorBuyListManager.cs 531-542）は除く。GBR の型が読めなければ null（呼ぶ側は今までどおり GBR に任せる）。
+    /// </summary>
+    private Dictionary<uint, List<Data.VendorCandidate>>? VendorCandidates(GbrHandle h, IEnumerable<uint> wanted)
+    {
+        var resolver = h.GbrAsm.GetType("GatherBuddy.Vulcan.Vendors.VendorShopResolver", throwOnError: false);
+        var vpm = h.GbrAsm.GetType("GatherBuddy.Vulcan.Vendors.VendorPurchaseManager", throwOnError: false);
+        var excl = h.GbrAsm.GetType("GatherBuddy.Vulcan.Vendors.VendorDevExclusions", throwOnError: false);
+        var locs = h.GbrAsm.GetType("GatherBuddy.Vulcan.Vendors.VendorNpcLocationCache", throwOnError: false);
+        if (resolver == null || vpm == null || excl == null || locs == null)
+            return null;
+        if (resolver.GetProperty("IsInitialized", GbrHandle.PubStatic)?.GetValue(null) is not true)
+            return null;
+
+        var isSupported = vpm.GetMethod("IsPurchaseSupported", GbrHandle.PubStatic);
+        var isExcluded = excl.GetMethod("IsExcluded", GbrHandle.PubStatic);
+        var firstLocation = locs.GetMethod("TryGetFirstLocation", GbrHandle.PubStatic, null, [typeof(uint)], null);
+        var entries = resolver.GetProperty("GilShopEntries", GbrHandle.PubStatic)?.GetValue(null) as IEnumerable;
+        if (isSupported == null || isExcluded == null || firstLocation == null || entries == null)
+            return null;
+
+        var want = wanted.ToHashSet();
+        var result = want.ToDictionary(i => i, _ => new List<Data.VendorCandidate>());
+        foreach (var e in entries)
+        {
+            var et = e.GetType();
+            var item = (uint)et.GetProperty("ItemId")!.GetValue(e)!;
+            if (!want.Contains(item))
+                continue;
+
+            foreach (var n in (IEnumerable)et.GetProperty("Npcs")!.GetValue(e)!)
+            {
+                if (!(bool)isSupported.Invoke(null, [e, n])! || (bool)isExcluded.Invoke(null, [n])!)
+                    continue;
+                var nt = n.GetType();
+                var npc = (uint)nt.GetProperty("NpcId")!.GetValue(n)!;
+                var shop = nt.GetProperty("ShopId")?.GetValue(n) is uint s ? s : 0u;
+                if (firstLocation.Invoke(null, [npc]) is not { } location)
+                    continue;
+                var territory = location.GetType().GetProperty("TerritoryId")?.GetValue(location) is uint t ? t : 0u;
+                var name = nt.GetProperty("Name")?.GetValue(n) as string ?? $"NPC {npc}";
+                if (!result[item].Any(c => c.Npc == npc && c.Shop == shop))
+                    result[item].Add(new Data.VendorCandidate(npc, shop, name, territory));
             }
         }
 

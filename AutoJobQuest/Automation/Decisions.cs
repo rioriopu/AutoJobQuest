@@ -38,9 +38,13 @@ public static class CollectableSelection
     /// <param name="ambiguous">同じ所持数の別の収集品が一覧にあるか。</param>
     /// <param name="sameAsConfirmed">この画面で前に確かめた選択と同じ行か。</param>
     /// <param name="nameMatches">右の一覧の行の品名が目的の品と一致したか（読めなければ null）。</param>
-    public static Verdict Decide(int? rows, int ownedBefore, int rowsBeforeSelect, bool ambiguous, bool sameAsConfirmed, bool? nameMatches)
+    /// <param name="deliverableBefore">
+    /// 目的の品のうち、納品の下限を満たす数（選ぶ前。省略時 -1＝見ない）。下限に届かない同じ品が混ざっていると、右の一覧に出るのが
+    /// 渡せる品だけになりうるので、行数がこの数と合っても選べたとみなす（どちらになるかはゲームの中で未確認）。
+    /// </param>
+    public static Verdict Decide(int? rows, int ownedBefore, int rowsBeforeSelect, bool ambiguous, bool sameAsConfirmed, bool? nameMatches, int deliverableBefore = -1)
     {
-        if (rows is not { } r || r <= 0 || r != ownedBefore)
+        if (rows is not { } r || r <= 0 || (r != ownedBefore && r != deliverableBefore))
             return Verdict.Wait;
         if (nameMatches == false)
             return Verdict.Wait;

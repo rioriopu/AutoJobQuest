@@ -59,13 +59,15 @@ public static class DropHuntCatalog
     /// デバッグの一覧から外す。計画の判定（PlanBuilder.RouteBlockers の NPC 購入）と同じ見方。
     /// </summary>
     public static bool BuyableFromNpc(SourceIndex sources, uint itemId, System.Func<uint, bool> isComplete)
-        => sources.Get(itemId).VendorOffers.Any(o => !o.Unknown && o.Quests.All(isComplete));
+        => sources.Get(itemId).VendorOffers.Any(o => o.Usable(isComplete));
 
-    /// <summary>NPC の店で買うのに要る、まだ終えていないクエスト（画面の説明用）。</summary>
+    /// <summary>NPC の店で買うのに要る、まだ終えていないクエスト（画面の説明用。店を開く NPC が現れる条件も含める）。</summary>
     public static string VendorNeeds(SourceIndex sources, uint itemId, System.Func<uint, bool> isComplete)
     {
         var offers = sources.Get(itemId).VendorOffers;
-        var quests = offers.SelectMany(o => o.Quests).Where(q => !isComplete(q)).Distinct().Select(q => $"「{Unlocks.QuestName(q)}」").ToList();
+        var quests = offers.SelectMany(o => o.Quests)
+            .Concat(offers.Where(o => o.Npcs is { Length: > 0 } && !o.Npcs.Any(n => n.Visible(isComplete))).SelectMany(o => o.Npcs!.SelectMany(n => n.Gate)))
+            .Where(q => !isComplete(q)).Distinct().Select(q => $"「{Unlocks.QuestName(q)}」").ToList();
         return quests.Count > 0 ? $"クエスト{string.Join("か", quests)}の完了" : "確かめられない条件（アチーブメント等）";
     }
 

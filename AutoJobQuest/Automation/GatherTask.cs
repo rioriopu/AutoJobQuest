@@ -530,13 +530,23 @@ public sealed class VendorTask : AutoTask
 
         var preferred = this.needs.Where(n => n.PreferredNpcId != null && this.targets.ContainsKey(n.ItemId))
             .ToDictionary(n => n.ItemId, n => n.PreferredNpcId!.Value);
-        this.listId = ctx.Gbr.PrepareVendorList(this.targets.Select(t => (t.Key, (uint)t.Value)).ToList(), out var notGil, preferred);
+
+        // 品ごとに、このキャラクターが使える売り手だけで買う（友好部族を解放していないと現れない NPC
+        // 〔高地ドラヴァニアのアキンド〕などに向かわない。店と品の条件・NPC が現れる条件〔ゲームデータの Story〕・エリアの解放を見る：VendorAccess）
+        var sources = ctx.Data.Sources;
+        var unlocked = AreaAccess.UnlockedNow();
+        Func<uint, VendorCandidate, string?>? whyNot = sources == null
+            ? null
+            : (item, c) => VendorAccess.WhyNot(sources, item, c, QuestManager.IsQuestComplete, t => AreaAccess.Reachable(t, unlocked));
+        this.listId = ctx.Gbr.PrepareVendorList(this.targets.Select(t => (t.Key, (uint)t.Value)).ToList(), out var notGil, out var reasons, preferred, whyNot);
         if (this.listId == null)
             return this.Fail(ctx.Gbr.LastError ?? "GBR の購入リストを用意できませんでした");
 
         foreach (var id in notGil.Distinct())
         {
-            ctx.Log.Warn("購入", $"{CraftPlanner.ItemName(id)} はギルの店で自動購入できません（別の手段で集めます）");
+            ctx.Log.Warn("購入", reasons.TryGetValue(id, out var why)
+                ? $"{CraftPlanner.ItemName(id)} は NPC から買いません：{why}（別の手段で集めます）"
+                : $"{CraftPlanner.ItemName(id)} はギルの店で自動購入できません（別の手段で集めます）");
             this.Unfinished.Add(id);
             this.targets.Remove(id);
         }

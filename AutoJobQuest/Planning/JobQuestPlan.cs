@@ -858,13 +858,11 @@ public static class PlanBuilder
     {
         var list = new List<(Route, string)>();
 
-        if (routes.Contains(Route.Vendor) && s.VendorOffers.Count > 0 && !s.VendorOffers.Any(o => !o.Unknown && o.Quests.All(isComplete)))
-        {
-            var q = s.VendorOffers.SelectMany(o => o.Quests).FirstOrDefault(q => !isComplete(q));
-            list.Add((Route.Vendor, q != 0
-                ? $"売っている店に、クエスト「{Unlocks.QuestName(q)}」の完了が要ります"
-                : "売っている店に、確かめられない条件（アチーブメント等）が付いています"));
-        }
+        // NPC 購入：店と品の条件を満たし、店を開く NPC の誰かが現れている店が無ければ外す（友好部族を解放していないと
+        // 現れない NPC〔高地ドラヴァニアのアキンド〕を購入先に含めない。NPC が現れる条件はゲームデータの Story：VendorOffer.Usable）。
+        // どの NPC で買うかは、買うときに GBR の売り手ごとに確かめ直す（VendorAccess.Choose）
+        if (routes.Contains(Route.Vendor) && s.VendorOffers.Count > 0 && !s.VendorOffers.Any(o => o.Usable(isComplete)))
+            list.Add((Route.Vendor, VendorAccess.BlockedReason(s.VendorOffers, isComplete)));
 
         if (routes.Contains(Route.Gather) && s.Gather.Count > 0)
         {

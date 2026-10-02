@@ -656,7 +656,7 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
     // （以前は 2.5 秒。成功ならその時点で次へ進むので、長くしても普段は遅くならない）
     private static readonly TimeSpan VerifyLimit = TimeSpan.FromSeconds(10);
 
-    // 納品画面の一覧が出るのを待つ上限（ListPending）。画面は開いたフレームでは準備ができておらず、一覧の行数も 0 のまま
+    // 納品画面の一覧が出るのを待つ上限（ListPending）。画面の準備ができても、一覧の値は 130〜170ms ほど後に入る
     private static readonly TimeSpan ListWaitLimit = TimeSpan.FromSeconds(5);
 
     private readonly BookData data;
@@ -684,6 +684,11 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
     private int selectRowsBefore = -1;
     private bool ambiguous;
     private int confirmedRow = -1;
+
+    // 選んだ時点の、納品の下限を満たす手持ち（下限に届かない同じ品が混ざると、右の一覧の行数が所持数と合わないことがある）と、
+    // 一覧にある別の収集品の名前（右の一覧の文字に別の品の名前が読めたときだけ「違う品」とみなす）
+    private int deliverableBefore = -1;
+    private List<string> otherOfferNames = [];
     private nint confirmedAddon;
 
     private DateTime lastClose = DateTime.MinValue;
@@ -737,9 +742,22 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
             case DeliverStep.Equip:
                 if (this.Deliverable == 0)
                 {
+                    // 同じ品を持っているのに、収集価値がどれも下限に届いていない（Artisan が下限まで上げずに仕上げた等）。黙って飛ばすと、
+                    // 紫貨が足りず秘伝書の段をやり直して作り直し、3周目に別の理由で止まる（素材とギルを3周分使う）ので、理由を出してここで止める
+                    var heldAny = Inventory.HeldCollectables().GetValueOrDefault(this.Item);
+                    if (heldAny > 0)
+                        return this.Fail($"{CraftPlanner.ItemName(this.Item)} を {heldAny} 個持っていますが、収集価値（{string.Join(" / ", Inventory.Collectabilities(this.Item))}）が"
+                                         + $"納品の下限 {this.data.MinCollectability} に届いていないため納品できません。Artisan の収集品の設定（品質を上げる段）や、"
+                                         + "そのレシピのマクロ・装備・食事を見直してください");
+
                     ctx.Log.Write("納品", $"納品できる {CraftPlanner.ItemName(this.Item)}（収集価値 {this.data.MinCollectability} 以上）がありません");
                     return TaskResult.Done;
                 }
+
+                // 下限に届かない同じ品が混ざっていれば知らせる（右の一覧の行数の照合で、下限以上の数とも照らす：WaitTrade）
+                if (Inventory.HeldCollectables().GetValueOrDefault(this.Item) is var heldAll && heldAll > this.Deliverable && this.sub == null)
+                    ctx.Log.Warn("納品", $"{CraftPlanner.ItemName(this.Item)} のうち {heldAll - this.Deliverable} 個は収集価値が下限 {this.data.MinCollectability} に届いていないので納品しません"
+                                         + $"（収集価値：{string.Join(" / ", Inventory.Collectabilities(this.Item))}）");
 
                 this.sub ??= new EquipJobTask(this.data.CollectableTabClassJob);
                 return this.RunSub(ctx, DeliverStep.Talk);
@@ -807,10 +825,10 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
 
     private TaskResult TickSelect(TaskContext ctx, AtkUnitBase* addon)
     {
-        // 画面の準備ができて一覧が出るまで待ってから読む（準備完了〔IsAddonReady〕を確かめてから読む）。
-        // 不具合の例：話しかけて納品画面が開いた（準備完了=False・値は 0〜12 番だけ）26ms 後に一覧の行数（20 番）を読み、
-        // 0 だったので「納品画面の一覧を読めません：納品できる品がありません」で止まった。自分が開いた画面の記録（持ち主）があると、
-        // 準備を待たずにここへ来るため
+        // 一覧が出るまで待ってから読む。不具合の例：話しかけて納品画面が開いた 26ms 後に一覧の行数（20 番）を読み、
+        // 0 だったので「納品画面の一覧を読めません：納品できる品がありません」で止まった。画面の準備完了（IsReady・IsFullyLoaded）は
+        // 持ち主の記録を引く所でも待っていたが、準備完了になっても一覧の値はまだ入っていない（開いた時の値は 0〜10 番＝11 職のタブのアイコンだけ。
+        // ゲームは開いた後に一覧を頼み、130〜170ms 後に入る：実測）。
         if (this.ListPending(addon, out var offers, out var readFailure) is { } pending)
             return pending;
         if (offers == null)
@@ -869,6 +887,8 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
 
         this.rowIndex = offer.Row;
         this.ownedBefore = owned;
+        this.deliverableBefore = this.Deliverable;
+        this.otherOfferNames = offers.Where(o => o.ItemId != this.Item).Select(o => GameUi.Normalize(CraftPlanner.ItemName(o.ItemId))).Where(n => n.Length > 0).ToList();
         this.heldBefore = held;
         this.scripsBefore = scrips;
         this.selectedAt = DateTime.UtcNow;
@@ -930,7 +950,8 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
                 var node = uld.NodeList[k];
                 if (node == null || node->Type != NodeType.Text)
                     continue;
-                var text = ((AtkTextNode*)node)->NodeText.ToString();
+                // 色の切り替え・ソフトハイフンなどの制御が品名の途中に入ると、生の文字では照合が外れるので、SeString として解析する（GameUi.AllTexts と同じ読み方）
+                var text = Dalamud.Game.Text.SeStringHandling.SeString.Parse(((AtkTextNode*)node)->NodeText.AsSpan().ToArray()).TextValue;
                 if (text.Length > 0)
                     texts.Add(text);
             }
@@ -961,10 +982,20 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
         if (btn != null && btn->GetComponentType() == ComponentType.Button && btn->OwnerNode != null)
             this.lastButton = $"見える={btn->OwnerNode->AtkResNode.IsVisible()} 押せる={((AtkComponentButton*)btn)->IsEnabled}";
 
-        // 右の一覧の行の品名（読めたら品名で照合する。読めて違う品なら撃たない）
-        var texts = HeldListTexts(addon);
-        var name = CraftPlanner.ItemName(this.Item);
-        bool? nameMatches = texts == null || texts.Count == 0 ? null : texts.Any(t => t.Contains(name, StringComparison.Ordinal));
+        // 右の一覧の行の品名（読めたら品名で照合する。別の品の名前が読めたら撃たない）。
+        // 目的の品名も別の品名も読めない（収集価値の数字だけ・省略表示など）ときは「不明」として、行数の条件で判断する
+        // （以前は文字が1つでも読めて目的の品名が無ければ「違う品」とみなし、2秒で止まりえた。
+        //  この照合は、ゲームの中で一度も通っていない）
+        var texts = HeldListTexts(addon)?.Select(GameUi.Normalize).ToList();
+        var name = GameUi.Normalize(CraftPlanner.ItemName(this.Item));
+        bool? nameMatches = null;
+        if (texts is { Count: > 0 })
+        {
+            if (texts.Any(t => t.Contains(name, StringComparison.Ordinal)))
+                nameMatches = true;
+            else if (this.otherOfferNames.Any(o => texts.Any(t => t.Contains(o, StringComparison.Ordinal))))
+                nameMatches = false;
+        }
 
         var rows = HeldListRows(addon);
         this.lastSelection = rows is { } r
@@ -973,7 +1004,7 @@ public sealed unsafe class DeliverCollectablesTask : AutoTask
         if (nameMatches is { } nm)
             this.lastSelection += nm ? "・品名が一致" : $"・品名が違う（{string.Join("／", texts!.Take(4))}）";
         var sameAsConfirmed = this.confirmedRow == this.rowIndex && this.confirmedAddon == (nint)addon;
-        if (CollectableSelection.Decide(rows, this.ownedBefore, this.selectRowsBefore, this.ambiguous, sameAsConfirmed, nameMatches) == CollectableSelection.Verdict.Fire)
+        if (CollectableSelection.Decide(rows, this.ownedBefore, this.selectRowsBefore, this.ambiguous, sameAsConfirmed, nameMatches, this.deliverableBefore) == CollectableSelection.Verdict.Fire)
         {
             this.confirmedRow = this.rowIndex;
             this.confirmedAddon = (nint)addon;

@@ -21,10 +21,42 @@ public sealed record GatherSpot(uint Territory, int GatheringLevel, bool Timed, 
     public const uint AllHours = 0xFFFFFF;
 }
 
+/// <summary>
+/// ギルショップを開く NPC 1人と、その NPC が現れる条件（ゲームデータの Story：ストーリーの進み具合で NPC を出し入れする表）。
+/// 友好部族を解放していないと現れない NPC（高地ドラヴァニアのアキンド）は購入先に含めない。
+/// ゲームデータとキャラクター情報から、行くかを判断する。アキンド（ENpc 1016804）は Story 1703969 の段 150 以降にだけ現れ、
+/// 段 150 は「名なしのグナース族」（67791：グナース族の解放）の完了（外部の資料とも一致）。
+/// </summary>
+/// <param name="Npc">ENpc の番号。</param>
+/// <param name="Gate">現れるのに要るクエスト（空なら条件なし）。</param>
+/// <param name="GateAll">Gate のすべてが要るか（false ならどれか1つ。StoryDefine.CompletedQuestOperator＝1 がすべて）。</param>
+/// <param name="Never">条件を読み取れない・途中で消える（使えないとみなす）。</param>
+public sealed record ShopNpc(uint Npc, uint[] Gate, bool GateAll, bool Never)
+{
+    public static readonly ShopNpc[] None = [];
+
+    /// <summary>このキャラクターの前に現れているか。</summary>
+    public bool Visible(Func<uint, bool> isComplete)
+        => !this.Never && (this.Gate.Length == 0 || (this.GateAll ? this.Gate.All(isComplete) : this.Gate.Any(isComplete)));
+}
+
 /// <summary>その品を売るギルショップの1件（店の条件）。</summary>
 /// <param name="Quests">買うのに要るクエスト（店の GilShop.Quest と品の GilShopItem.QuestRequired。空なら条件なし）。</param>
 /// <param name="Unknown">確かめられない条件（アチーブメント）が付いているか（付いていれば、その店では買えないとみなす）。</param>
-public sealed record VendorOffer(uint[] Quests, bool Unknown);
+/// <param name="Shop">ギルショップ（GilShop の行）。</param>
+/// <param name="Npcs">その店を直接開く NPC（ENpcData に店がある NPC）と、その NPC が現れる条件。分からなければ空。</param>
+public sealed record VendorOffer(uint[] Quests, bool Unknown, uint Shop = 0, ShopNpc[]? Npcs = null)
+{
+    /// <summary>店と品の条件（クエスト・アチーブメント）を満たすか。</summary>
+    public bool Conditions(Func<uint, bool> isComplete) => !this.Unknown && this.Quests.All(isComplete);
+
+    /// <summary>
+    /// このキャラクターがこの店で買えるか：店と品の条件を満たし、店を開く NPC の誰かが現れている。
+    /// 店を開く NPC が分からない店は条件だけで見る（GBR は独自の対応表と Allagan Tools の対応も使うので、買うときに NPC ごとに確かめ直す：VendorAccess）。
+    /// </summary>
+    public bool Usable(Func<uint, bool> isComplete)
+        => this.Conditions(isComplete) && (this.Npcs is not { Length: > 0 } || this.Npcs.Any(n => n.Visible(isComplete)));
+}
 
 /// <summary>モンスターの出現位置1件。</summary>
 /// <param name="BNpcNameId">モンスターの名前 ID（BNpcName の行）。</param>
@@ -363,13 +395,43 @@ public sealed class SourceIndex
         static int LowerLevel(int now, int level) => level <= 0 ? now : now <= 0 ? level : Math.Min(now, level);
     }
 
+    // ENpcData の値の上位 16bit（イベントハンドラの種別：FFXIVClientStructs の EventHandlerContent。Shop＝0x0004・Story＝0x001A）
+    private const uint HandlerGilShop = 0x0004;
+    private const uint HandlerStory = 0x001A;
+
+    // NPC → 現れる条件（null＝条件なし）。店を開く NPC は作るときに、ほかの NPC（GBR が独自の対応表で挙げる NPC）は初めて聞かれたときに計算して覚える
+    // （Story を持つ NPC は 6,000 人を超え、全員を先に計算すると読み込みが十数秒延びた）
+    private readonly Dictionary<uint, ShopNpc?> npcGates = [];
+
+    // Story → 聞き手の NPC → 現れる段の範囲（Story ごとに1回だけ作る）
+    private readonly Dictionary<uint, Dictionary<uint, List<(int Begin, int End)>>> storyListeners = [];
+    private readonly object gateGate = new();
+
+    /// <summary>その NPC の現れる条件（Story の聞き手でなければ null＝いつも現れる）。どのスレッドから呼んでもよい。</summary>
+    public ShopNpc? NpcGate(uint npc)
+    {
+        lock (this.gateGate)
+        {
+            if (this.npcGates.TryGetValue(npc, out var known))
+                return known;
+            var gate = Svc.Data.GetExcelSheet<ENpcBase>().TryGetRow(npc, out var row) ? this.GateOf(row) : null;
+            this.npcGates[npc] = gate;
+            return gate;
+        }
+    }
+
+    /// <summary>その NPC が、このキャラクターの前に現れているか（条件の無い NPC は true）。</summary>
+    public bool NpcVisible(uint npc, Func<uint, bool> isComplete) => this.NpcGate(npc)?.Visible(isComplete) ?? true;
+
     private void BuildVendors()
     {
         var items = Svc.Data.GetExcelSheet<Item>();
         var shops = Svc.Data.GetExcelSheet<GilShop>();
+        var shopNpcs = this.BuildShopNpcs(shops);
         foreach (var shop in Svc.Data.GetSubrowExcelSheet<GilShopItem>())
         {
             var shopQuest = shops.TryGetRow(shop.RowId, out var gs) ? gs.Quest.RowId : 0;
+            var npcs = shopNpcs.GetValueOrDefault(shop.RowId) ?? ShopNpc.None;
             foreach (var row in shop)
             {
                 var id = row.Item.RowId;
@@ -380,11 +442,110 @@ public sealed class SourceIndex
                 s.Vendor = true;
                 var quests = row.QuestRequired.Select(q => q.RowId).Append(shopQuest).Where(q => q != 0).Distinct().ToArray();
                 // StateRequired は普通の店の品の大半にも 100 が入っていて条件ではない（ゲームデータで数えた：12,617件）ので見ない
-                s.VendorOffers.Add(new VendorOffer(quests, row.AchievementRequired.RowId != 0));
+                s.VendorOffers.Add(new VendorOffer(quests, row.AchievementRequired.RowId != 0, shop.RowId, npcs));
                 if (items.TryGetRow(id, out var it) && it.PriceMid > 0 && (s.VendorPrice == 0 || it.PriceMid < s.VendorPrice))
                     s.VendorPrice = it.PriceMid;
             }
         }
+    }
+
+    /// <summary>
+    /// ギルショップ → その店を直接開く NPC（ENpcData に店の番号がある NPC：GBR の VendorShopResolver と同じ見方）と、
+    /// NPC が現れる条件（ENpcData の Story：<see cref="StoryGate"/>）。条件は <see cref="npcGates"/> にも入れる（GBR が独自の対応表で挙げる NPC にも使う）。
+    /// ゲームデータの調べ：ギルショップを直接開く NPC 487 人のうち、Story の聞き手は 47 人。どの人も「あるクエストの完了」で現れ、途中で消える人はいない。
+    /// </summary>
+    private Dictionary<uint, ShopNpc[]> BuildShopNpcs(Lumina.Excel.ExcelSheet<GilShop> shops)
+    {
+        var map = new Dictionary<uint, List<ShopNpc>>();
+        foreach (var npc in Svc.Data.GetExcelSheet<ENpcBase>())
+        {
+            List<uint>? gil = null;
+            foreach (var d in npc.ENpcData)
+            {
+                var v = d.RowId;
+                if (v != 0 && v >> 16 == HandlerGilShop && shops.TryGetRow(v, out _))
+                    (gil ??= []).Add(v);
+            }
+
+            if (gil == null)
+                continue;
+            ShopNpc? gate;
+            lock (this.gateGate)
+            {
+                gate = this.GateOf(npc);
+                this.npcGates[npc.RowId] = gate;
+            }
+
+            var entry = gate ?? new ShopNpc(npc.RowId, [], false, false);
+            foreach (var shop in gil.Distinct())
+            {
+                if (!map.TryGetValue(shop, out var list))
+                    map[shop] = list = [];
+                list.Add(entry);
+            }
+        }
+
+        return map.ToDictionary(kv => kv.Key, kv => kv.Value.ToArray());
+    }
+
+    /// <summary>
+    /// その Story で NPC が現れる条件（聞き手でなければ null）。ゲームデータの読み方（ゲームの中では未確認の推定を含む）：
+    ///  ・StoryListener のうち、その NPC の行の SequenceBegin（現れる段）〜 SequenceEnd（65535＝ずっと）。ずっと現れる行が無ければ「途中で消える」とみなし使わない。
+    ///  ・現れる段が 1 以下なら条件なし。それより後なら、その段以上で「クエストの完了だけ」で決まる最初の StoryDefine の CompletedQuest が条件
+    ///    （CompletedQuestOperator＝1 はすべて、2 はどれか）。受注中だけで現れる段は、完了まで「現れない」側に倒す。見つからなければ使わない。
+    /// 注意：Lumina の入れ子の構造体を FirstOrDefault の空振りで受けると、既定値のまま欄を読んだ時点で落ちる（調べで実際に起きた）ので、ToList して数で見る。
+    /// </summary>
+    private ShopNpc? StoryGate(uint npc, Story story)
+    {
+        if (!this.storyListeners.TryGetValue(story.RowId, out var index))
+        {
+            index = [];
+            foreach (var l in story.StoryListener)
+            {
+                var id = l.Listener.RowId;
+                if (id == 0)
+                    continue;
+                if (!index.TryGetValue(id, out var r))
+                    index[id] = r = [];
+                r.Add((l.SequenceBegin, l.SequenceEnd));
+            }
+
+            this.storyListeners[story.RowId] = index;
+        }
+
+        if (!index.TryGetValue(npc, out var ranges) || ranges.Count == 0)
+            return null;
+        var open = ranges.Where(r => r.End == ushort.MaxValue).ToList();
+        if (open.Count == 0)
+            return new ShopNpc(npc, [], false, true);
+        var begin = open.Min(r => r.Begin);
+        if (begin <= 1)
+            return null;
+
+        var defs = story.StoryDefine
+            .Where(x => x.Sequence >= begin && x.CompletedQuest.Any(q => q.RowId != 0) && x.AcceptedQuest.All(q => q.RowId == 0))
+            .OrderBy(x => x.Sequence)
+            .ToList();
+        if (defs.Count == 0)
+            return new ShopNpc(npc, [], false, true);
+        var d = defs[0];
+        return new ShopNpc(npc, d.CompletedQuest.Select(q => q.RowId).Where(q => q != 0).Distinct().ToArray(), d.CompletedQuestOperator == 1, false);
+    }
+
+    /// <summary>その NPC の ENpcData にある Story のうち、聞き手になっている最初の Story から決めた条件（無ければ null）。gateGate を握って呼ぶ。</summary>
+    private ShopNpc? GateOf(ENpcBase npc)
+    {
+        var stories = Svc.Data.GetExcelSheet<Story>();
+        foreach (var d in npc.ENpcData)
+        {
+            var v = d.RowId;
+            if (v == 0 || v >> 16 != HandlerStory || !stories.TryGetRow(v, out var story))
+                continue;
+            if (this.StoryGate(npc.RowId, story) is { } gate)
+                return gate;
+        }
+
+        return null;
     }
 
     private void BuildMarket()
