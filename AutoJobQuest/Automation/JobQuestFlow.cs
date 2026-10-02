@@ -685,8 +685,13 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
 
         var bookItems = tomes.Select(t => sheet.GetRow(t).Item.RowId).ToList();
         this.requiredBookItems = bookItems;
-        var collectable = ctx.Config.ScripCollectableItemId;
+        // 紫貨を稼ぐ収集品は、秘伝書の要る職に合わせて選ぶ（錬金術師なら「収集用のアルケオーニスグリモア」。
+        // 設定の品＝木工師のシーダーロングボウと同じ収集品納品の Lv50 の段。以前は設定の品に決め打ちで、木工師 Lv1 のキャラクターが
+        // 「入手手段が残っていない素材があります：収集用のシーダーロングボウ×3」で止まった）
+        var configured = ctx.Config.ScripCollectableItemId;
+        var collectable = ScripCollectable.ChooseFromGame(configured, plan.Craft.LockedBySecretBook.Select(c => c.ClassJobId), ctx.Data.Planner);
         ctx.Log.Write("秘伝書", $"未読の秘伝書：{string.Join("、", bookItems.Select(CraftPlanner.ItemName))}");
+        ctx.Log.Write("秘伝書", $"紫貨が足りなければ作って納品する収集品：{ScripCollectable.Describe(collectable, configured, ctx.Data.Planner)}");
         this.bookBuild = Task.Run(() => BookData.Build(bookItems, collectable));
         this.stage = Stage.WaitBookData;
         this.NextPhase("秘伝書・収集品のデータを調べています");
@@ -722,12 +727,24 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         this.RecomputeBookNeeds(ctx);
 
         // 収集品の納品には前提のクエスト（職人の新たなお仕事。その前提は蒼天のメインクエスト）が要る。
-        // 納品が要るのに前提を自動で進められないなら、素材を集める前に止める（以前は秘伝書の段まで進んでから止まった）
-        if (this.NeedsDelivery() && this.books.RequiredQuest != 0 && !FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(this.books.RequiredQuest))
+        // 納品が要るのに前提を自動で進められないなら、素材を集める前に止める（以前は秘伝書の段まで進んでから止まった）。
+        // 交換の窓口を開くのにだけ要るときも、ここで見る（StartBooks と同じ条件：UnlockQuestNeeded。以前は納品のときしか見ず、
+        // 紫貨が足りていて交換だけのときは、素材を集めた後の秘伝書の段で止まった）
+        if (this.UnlockQuestNeeded(this.books.ChooseTown(questDone: QuestDone)) && !FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(this.books.RequiredQuest))
         {
             Unlocks.ChainToRun(this.books.RequiredQuest, out var blockedBy);
             if (blockedBy != null)
-                return this.Fail($"紫貨を稼ぐ収集品の納品にはクエスト「{Unlocks.QuestName(this.books.RequiredQuest)}」が要りますが、進められません：{blockedBy}");
+                return this.Fail(UnlockQuestBlocked(this.books.RequiredQuest, blockedBy));
+        }
+
+        // 紫貨のための収集品を作れる製作職がいない（どの職の同じ段の品も、レベル・ギアセット・装備が足りない）なら、素材を集める前に止める
+        // （以前は素材集めの周回の初めに「入手手段が残っていない素材があります：収集用のシーダーロングボウ×3」とだけ出て、理由が分からなかった）
+        if (this.NeedsDelivery() && this.collectablesNeeded > Inventory.CountCollectables(this.books.CollectableItemId, this.books.MinCollectability))
+        {
+            var ability = CraftAbility.FromGame();
+            if (ctx.Data.Planner!.Pick(this.books.CollectableItemId, ability) == null)
+                return this.Fail($"紫貨を稼ぐ収集品（収集品納品の、{CraftPlanner.ItemName(ctx.Config.ScripCollectableItemId)} と同じ段の品）を作れる製作職がいません："
+                                 + ScripCollectable.WhyNone(ctx.Config.ScripCollectableItemId, ctx.Data.Planner!, ability));
         }
 
         // 紫貨のための収集品は、中間素材まで別の職で作る（例：シーダーロングボウ＝木工・鍛冶・裁縫）。
@@ -783,6 +800,26 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
     /// <summary>交換に要る紫貨に届いていない（収集品の納品が要る）か。</summary>
     private bool NeedsDelivery()
         => this.books != null && BookMath.ShouldDeliver(Inventory.CountSpecialCurrency(this.books.RewardSpecialCurrencyId, out _), this.ScripTarget());
+
+    /// <summary>
+    /// 収集品の納品に要るクエスト（職人の新たなお仕事：<see cref="BookData.RequiredQuest"/>）を、この段で使うか。
+    /// 納品が要るとき、または、交換が要り（まだ読んでいなくて手元にも無い秘伝書がある：交換の手順と同じ条件）、選んだ窓口
+    /// （<paramref name="town"/>）の画面を開くのにこのクエストが要るとき（モードゥナ＝67631）。
+    /// 以前は交換が要らない（秘伝書を持っていて読むだけ）ときも窓口のために進め、前提のメインクエストが未完了だと止まった。
+    /// </summary>
+    private bool UnlockQuestNeeded((NpcSpot Collect, NpcSpot Scrip)? town)
+    {
+        if (this.books is not { RequiredQuest: not 0 } b)
+            return false;
+        if (this.NeedsDelivery())
+            return true;
+        var exchangeNeeded = this.booksToBuy.Any(o => !ExchangeBooksTask.IsLearned(o.TomeId) && Inventory.CountNow(o.BookItemId) == 0);
+        return exchangeNeeded && town is { } t && t.Scrip.UnlockQuest != 0 && t.Scrip.UnlockQuest == b.RequiredQuest;
+    }
+
+    /// <summary>収集品の納品に要るクエストを自動で進められないときの理由（止めるときの文言）。</summary>
+    private static string UnlockQuestBlocked(uint quest, string blockedBy)
+        => $"紫貨を稼ぐ収集品の納品と、秘伝書を交換する窓口には、クエスト「{Unlocks.QuestName(quest)}」が要りますが、進められません：{blockedBy}";
 
     /// <summary>計画で使う職のうち、ギアセットの無いもの（「職（品）」の並び）。全部あれば null。</summary>
     private static string? MissingGearsets(CraftPlan plan)
@@ -1201,15 +1238,14 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         var b = this.books;
         this.booksCut = null;
 
-        // 収集品の納品に要るクエスト（職人の新たなお仕事）。納品が要るときだけ、未完了の前提（同じ区分のもの）ごと進める
+        // 収集品の納品に要るクエスト（職人の新たなお仕事）。要るとき（UnlockQuestNeeded）だけ、未完了の前提（同じ区分のもの）ごと進める
         // （以前は紫貨が足りていて納品しないときも進め、前提も進めなかった）
-        // 選んだ窓口の画面を開くのにこのクエストが要るときも、納品の要らないときでも進める
-        var windowNeedsQuest = town.Value.Scrip.UnlockQuest != 0 && town.Value.Scrip.UnlockQuest == b.RequiredQuest;
-        if ((this.NeedsDelivery() || windowNeedsQuest) && b.RequiredQuest != 0 && !FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(b.RequiredQuest))
+        if (this.UnlockQuestNeeded(town) && !FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(b.RequiredQuest))
         {
             var chain = Unlocks.ChainToRun(b.RequiredQuest, out var blockedBy);
             if (blockedBy != null)
-                return this.Fail($"紫貨を稼ぐ収集品の納品にはクエスト「{Unlocks.QuestName(b.RequiredQuest)}」が要りますが、進められません：{blockedBy}");
+                return this.Fail(UnlockQuestBlocked(b.RequiredQuest, blockedBy));
+            ctx.Log.Write("秘伝書", $"収集品の納品・交換の窓口を開くため、「{string.Join("」→「", chain.Select(Unlocks.QuestName))}」を Questionable で進めます");
             foreach (var id in chain)
                 steps.Add(_ => new RunQuestTask(id, Unlocks.QuestName(id)));
         }

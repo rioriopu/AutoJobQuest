@@ -26,7 +26,7 @@ public sealed record BookOffer(uint BookItemId, uint TomeId, uint ShopId, uint P
 /// 秘伝書に要るゲームデータをまとめて引く。
 ///
 ///  ・秘伝書 → 交換する SpecialShop（アイテム交換画面 InclusionShop の中でだけ開く店）と値段・通貨
-///  ・収集品（既定は「収集用のシーダーロングボウ」）→ 納品の報酬（通貨・量）と受け付ける収集価値
+///  ・収集品（既定は「収集用のシーダーロングボウ」。秘伝書の要る職に合わせて同じ段の品に替える：ScripCollectable）→ 納品の報酬（通貨・量）と受け付ける収集価値
 ///  ・収集品納品窓口とスクリップ取引窓口の NPC と、Level シートにある座標
 ///
 /// ENpcBase を全部見るので重い。別スレッドで作る。
@@ -90,6 +90,33 @@ public sealed class BookData
         d.ResolveBooks(bookItemIds.ToHashSet());
         d.ResolveCollectable();
         d.ResolveNpcs();
+        return d;
+    }
+
+    /// <summary>
+    /// 同じ窓口（CollectablesShop）の別の収集品に替えた写し。秘伝書の店・窓口の場所は写す（重い ENpcBase の走査をしない）。
+    /// 収集品をジョブに合わせて選ぶ（<see cref="ScripCollectable"/>）ときに、読み込み済みの表から作る。窓口が違えば null。
+    /// <see cref="Notes"/> は収集品の分だけを持つ（秘伝書の店・窓口の分は元の表の Notes を見る）。
+    /// </summary>
+    public BookData? ForCollectable(uint itemId)
+    {
+        if (itemId == this.CollectableItemId)
+            return this;
+
+        var d = new BookData { CollectableItemId = itemId };
+        d.ResolveCollectable();
+        if (d.CollectablesShopId == 0 || d.CollectablesShopId != this.CollectablesShopId)
+            return null;
+
+        foreach (var (k, v) in this.Offers)
+            d.Offers[k] = v;
+        foreach (var (k, v) in this.ShopPaths)
+            d.ShopPaths[k] = v;
+        d.BookCategories.UnionWith(this.BookCategories);
+        foreach (var (k, v) in this.BookSeriesSubrow)
+            d.BookSeriesSubrow[k] = v;
+        d.CollectableNpcs.AddRange(this.CollectableNpcs);
+        d.ScripNpcs.AddRange(this.ScripNpcs);
         return d;
     }
 

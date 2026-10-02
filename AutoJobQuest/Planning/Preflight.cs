@@ -212,7 +212,8 @@ public static class Preflight
             if (plan != null)
             {
                 used = plan.RemainingQuests.Select(q => q.ClassJobId).Concat(plan.Craft.Crafts.Select(c => c.ClassJobId)).ToHashSet();
-                if (plan.Craft.LockedBySecretBook.Count > 0 && ctx.Data.Planner?.Pick(ctx.Config.ScripCollectableItemId) is { } collectRecipe)
+                if (plan.Craft.LockedBySecretBook.Count > 0
+                    && ctx.Data.Planner?.Pick(ScripCollectable.ChooseFromGame(ctx.Config.ScripCollectableItemId, plan.Craft.LockedBySecretBook.Select(c => c.ClassJobId), ctx.Data.Planner)) is { } collectRecipe)
                     used.Add(Jobs.CraftTypeToClassJob(collectRecipe.CraftType.RowId));
             }
 
@@ -428,7 +429,34 @@ public static class Preflight
 
         // 7) 秘伝書
         if (plan != null && plan.Craft.LockedBySecretBook.Count > 0)
+        {
             list.Add(new PreflightItem(Severity.Warn, "秘伝書が未読のレシピがあります。紫貨を稼いで秘伝書を交換・使用してから製作します"));
+
+            // 紫貨を稼ぐ収集品（秘伝書の要る職に合わせて選ぶ）。作れる職がいなければ、紫貨が足りないと秘伝書の下準備で止まる
+            if (ctx.Data.Planner is { } planner)
+            {
+                var configured = ctx.Config.ScripCollectableItemId;
+                var ability = CraftAbility.FromGame();
+                var chosen = ScripCollectable.Choose(configured, plan.Craft.LockedBySecretBook.Select(c => c.ClassJobId), item => planner.Pick(item, ability) != null);
+                list.Add(planner.Pick(chosen, ability) != null
+                    ? new PreflightItem(Severity.Ok, $"紫貨が足りなければ、{ScripCollectable.Describe(chosen, configured, planner)} を作って納品します")
+                    : new PreflightItem(Severity.Warn,
+                        $"紫貨を稼ぐ収集品（{CraftPlanner.ItemName(configured)} と同じ段の品）を作れる製作職がいません（{ScripCollectable.WhyNone(configured, planner, ability)}）。"
+                        + "紫貨が足りなければ、秘伝書の下準備で止まります"));
+            }
+
+            // 収集品の納品に要るクエスト（「職人の新たなお仕事」：モードゥナのスクリップ取引窓口も開く）。秘伝書の段で、要るときに前提ごと進める
+            // （以前から自動で進めていたが、点検に出ていなかった）
+            if (ctx.Data.Books is { RequiredQuest: not 0 } books && !FFXIVClientStructs.FFXIV.Client.Game.QuestManager.IsQuestComplete(books.RequiredQuest))
+            {
+                var chain = Unlocks.ChainToRun(books.RequiredQuest, out var blocked);
+                list.Add(blocked == null
+                    ? new PreflightItem(Severity.Ok,
+                        $"収集品の納品を開くクエスト「{Unlocks.QuestName(books.RequiredQuest)}」が未完了なので、秘伝書の段で Questionable で進めます（{string.Join("→", chain.Select(Unlocks.QuestName))}）")
+                    : new PreflightItem(Severity.Warn,
+                        $"収集品の納品を開くクエスト「{Unlocks.QuestName(books.RequiredQuest)}」が未完了で、自動で進められません：{blocked}。紫貨が足りなければ、秘伝書の下準備で止まります"));
+            }
+        }
 
         if (list.All(x => x.Severity == Severity.Ok))
             list.Add(new PreflightItem(Severity.Ok, "問題は見つかりませんでした"));

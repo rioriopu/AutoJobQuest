@@ -1001,8 +1001,12 @@ public sealed unsafe class RetainerStockTask : AutoTask
             return (targets, notes);
 
         // 秘伝書の表が欠けていても、引き出しは止めない（秘伝書の段で改めて確かめて止める）
+        // 紫貨の収集品は、秘伝書の要る職に合わせて選ぶ（秘伝書の下準備と同じ選び方：ScripCollectable）。
+        // 読み込み済みの表は設定の品で作ってあるので、同じ窓口の選んだ品に替えた写しを使う
         var books = ctx.Data.Books;
-        if (books == null || books.CollectableItemId != ctx.Config.ScripCollectableItemId)
+        var collectable = ScripCollectable.ChooseFromGame(ctx.Config.ScripCollectableItemId, craft.LockedBySecretBook.Select(c => c.ClassJobId), ctx.Data.Planner);
+        books = books?.ForCollectable(collectable);
+        if (books == null || books.CollectableItemId != collectable)
         {
             notes.Add("秘伝書の表を読めないため、秘伝書と紫貨の収集品の材料は引き出しの対象に入れません");
             return (targets, notes);
