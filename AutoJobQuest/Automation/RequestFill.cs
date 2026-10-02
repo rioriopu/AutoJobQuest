@@ -76,6 +76,16 @@ public interface IRequestWindow
     /// </summary>
     bool? SlotFilledWith(int slot, TurnInItem item) => null;
 
+    /// <summary>
+    /// その品の情報（アイテムの表の行）を、ゲームがいま読み込んでいるか。読み込んでいないと、ゲームは欄の候補の準備を保留し
+    /// （候補の小窓を開かない）、その間に「入れる」を送っても何も入らず、知らせも出ない（ゲーム本体 2026.09.15 の逆アセンブル：
+    /// 欄を選ぶ処理と入れる処理が、同じ関数で行を引き、無ければ黙って終わる）。偽物の窓では既定で true。
+    /// </summary>
+    bool ItemRowReady(uint itemId) => true;
+
+    /// <summary>受け渡しの枠（HandIn の欄 <paramref name="slot"/>）の生の値（止まったときの報告用。読めなければ null）。偽物の窓では既定で null。</summary>
+    string? HandInState(int slot) => null;
+
     void SelectSlot(int slot);
 
     /// <summary>選んだ欄の候補の数（まだ出ていなければ 0 以下）。</summary>
@@ -168,6 +178,9 @@ public sealed class RequestFiller
     // 欄を選んでから見たフレームの数（候補は選んだその場で出る。0件なら1フレーム待って止める）
     private int framesSinceSelect;
 
+    // 品の情報（Item の行）の読み込みを待ち始めた時刻（ItemRowReady。待っていなければ MinValue）
+    private DateTime rowWaitSince = DateTime.MinValue;
+
     // 欄ごとに入れた品（渡す前に、受け渡しの枠が全部その品を指しているかを確かめる）
     private readonly Dictionary<int, TurnInItem> putItems = [];
 
@@ -206,6 +219,32 @@ public sealed class RequestFiller
     public string? MateriaNote { get; private set; }
 
     /// <summary>窓が閉じた・別の窓になったときに呼ぶ。</summary>
+    /// <summary>
+    /// 品の情報（Item の行）をゲームが読み込んでいなければ、何も触らずに待つ（Waiting）。上限（<see cref="OptionWaitLimit"/>）を過ぎたら、入れずに止める（Failed）。
+    /// 読み込んでいれば null（進んでよい）。不具合の例：錬金術師 Lv55「ココロツヨキオンナ」の納品で、知力の錬金溶剤G1 HQ を持っているのに
+    /// 「受け渡しの枠が選んだ品を指していません」で止まった。ゲームがその品の行を一時的に手放していて、欄を選んでも候補の準備を保留し（成功した 16 回には
+    /// 必ず出る候補の小窓が出ていなかった）、同じフレームで送った「入れる」が黙って何もしなかった。行を引くとゲームが読み込みを頼む（ゲームの保留の仕組みも
+    /// 同じ関数を毎フレーム引き直す）ので、待てば読み込まれる。
+    /// </summary>
+    private Outcome? WaitItemRow(IRequestWindow window, RequestSlot req, int slot, out string detail)
+    {
+        detail = string.Empty;
+        if (window.ItemRowReady(req.ItemId))
+        {
+            this.rowWaitSince = DateTime.MinValue;
+            return null;
+        }
+
+        if (this.rowWaitSince == DateTime.MinValue)
+            this.rowWaitSince = this.clock();
+        if (this.clock() - this.rowWaitSince < OptionWaitLimit)
+            return Outcome.Waiting;
+
+        this.finished = true;
+        detail = $"納品窓の {slot + 1} 番目（{Describe(req)}）の品の情報（アイテムの表の行）を、ゲームが {OptionWaitLimit.TotalSeconds:0}秒たっても読み込まないので、入れずに止めます";
+        return Outcome.Failed;
+    }
+
     public void Reset()
     {
         this.addon = 0;
@@ -221,6 +260,7 @@ public sealed class RequestFiller
         this.used.Clear();
         this.putItems.Clear();
         this.framesSinceSelect = 0;
+        this.rowWaitSince = DateTime.MinValue;
         this.CountsBeforeSubmit.Clear();
         this.Touched = false;
         this.HasSubmitted = false;
@@ -337,6 +377,13 @@ public sealed class RequestFiller
             var req = window.GetRequest(slot);
             if (this.selectedByUs != slot || window.SelectedSlot != slot)
             {
+                // 品の情報をゲームが読み込むまで、欄を選ばずに待つ（WaitItemRow。選ぶとゲームが候補の準備を保留に入るので、選ぶ前に確かめる）
+                if (this.WaitItemRow(window, req, slot, out var rowDetail) is { } rowWait)
+                {
+                    detail = rowDetail;
+                    return rowWait;
+                }
+
                 window.SelectSlot(slot);
                 this.selectedByUs = slot;
                 this.selectedAt = this.clock();
@@ -383,6 +430,13 @@ public sealed class RequestFiller
                 return Outcome.Failed;
             }
 
+            // 入れる前にも確かめる（ゲームが自分で次の欄を選んだときは、こちらは欄を選ばないので上を通らない）
+            if (this.WaitItemRow(window, req, slot, out var putRowDetail) is { } putRowWait)
+            {
+                detail = putRowDetail;
+                return putRowWait;
+            }
+
             var chosen = window.GetOption(option)!;
             window.PutOption(option);
 
@@ -391,7 +445,9 @@ public sealed class RequestFiller
             if (window.SlotFilledWith(slot, chosen) == false)
             {
                 this.finished = true;
-                detail = $"納品窓の {slot + 1} 番目（{Describe(req)}）に入れましたが、受け渡しの枠が選んだ品を指していません（渡さずに止めます）";
+                detail = $"納品窓の {slot + 1} 番目（{Describe(req)}）に入れましたが、受け渡しの枠が選んだ品を指していません（渡さずに止めます）"
+                         + $"（{window.HandInState(slot) ?? "受け渡しの枠を読めません"}／選んだ品：入れ物 {chosen.Container}・番号 {chosen.SlotIndex}・"
+                         + $"品の情報 {(window.ItemRowReady(req.ItemId) ? "読み込み済み" : "未読み込み")}・候補の小窓 {(window.OptionMenuOpen ? "開いている" : "開いていない")}）";
                 return Outcome.Failed;
             }
 
@@ -729,6 +785,35 @@ public sealed unsafe class GameRequestWindow : IRequestWindow
     }
 
     public void SelectSlot(int slot) => Agent->SelectTurnInSlot((ushort)slot);
+
+    public bool ItemRowReady(uint itemId)
+    {
+        // 専用品（2,000,000 以上）はアイテムの表に無い。ゲームは 2,000,000〜2,003,843 では行を確かめず、それより上の番号では
+        // ゲーム自身も入れられない（行を引く関数が必ず無いと返す）ので、待たない
+        if (itemId >= 2_000_000)
+            return true;
+        try
+        {
+            // ゲームが欄を選ぶとき・入れるときに使うのと同じ関数（ExdModule.GetItemRowById：シグネチャはゲームの exe で1か所、呼び先が同じことを確かめた）
+            return FFXIVClientStructs.FFXIV.Component.Exd.ExdModule.GetItemRowById(itemId) != null;
+        }
+        catch (Exception)
+        {
+            return true; // 呼べなければ今までどおり（入れた後の確かめが守る）
+        }
+    }
+
+    public string? HandInState(int slot)
+    {
+        var im = InventoryManager.Instance();
+        if (im == null)
+            return null;
+        var c = im->GetInventoryContainer(InventoryType.HandIn);
+        if (c == null || !c->IsLoaded || c->Items == null || slot < 0 || slot >= c->Size)
+            return null;
+        var s = c->Items + slot;
+        return $"受け渡しの枠 {slot + 1}：リンク {(s->IsSymbolic ? "あり" : "なし")}・リンク先の入れ物 {s->LinkedInventoryType}・番号 {s->LinkedItemSlot}・品 {s->ItemId}";
+    }
 
     public int OptionCount
     {
