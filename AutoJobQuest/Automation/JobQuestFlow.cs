@@ -868,7 +868,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
             .ToList();
         var collectRaw = raw.Where(r => collectOnly.Contains(r.Item)).ToList();
         if (collectRaw.Count > 0)
-            ctx.Log.Write("素材", "紫貨の収集品だけに使う素材（採集できれば採集、できなければ購入。戦闘はしない）："
+            ctx.Log.Write("素材", $"紫貨の収集品だけに使う素材（採集できれば採集、できなければ購入。戦闘は {ScripCollectable.CombatItemsText(ctx.Config)}）："
                                   + string.Join("、", collectRaw.Select(r => $"{CraftPlanner.ItemName(r.Item)}×{r.Need}（{(r.Routes.Count > 0 ? string.Join("→", r.Routes.Select(Ui.MainWindow.RouteName)) : "手段なし")}）")));
 
         var marketMateria = MateriaMarketNeeds(ctx.Config, plan);
@@ -1099,12 +1099,16 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
     // 使える入手手段（計画の表示と同じ判定：PlanBuilder.AvailableRoutes）。
     // 戦闘に使えるジョブが無ければ、戦闘は手段から外す（次の手段がマーケットなら、買う前に確認窓を出す）。
     // 以前は戦闘が第一の手段の素材があると、そこで止まっていた
-    // 紫貨の収集品だけに使う素材（collectableOnly）は、NPC 購入・採集・マーケットだけにする（採集できれば採集、できなければ買う）
+    // 紫貨の収集品だけに使う素材（collectableOnly）は、NPC 購入・採集・マーケットだけにする（採集できれば採集、できなければ買う）。
+    // 設定で指定した品（ScripCollectableCombatItems：ディープアイの涙）だけは、戦闘でも集める
     private List<Route> RoutesFor(TaskContext ctx, uint item, bool collectableOnly = false)
     {
         var routes = PlanBuilder.AvailableRoutes(ctx.Data.Sources!, item, this.excluded);
         if (collectableOnly)
-            routes.RemoveAll(r => r is Route.Combat or Route.Fish or Route.Reduce);
+        {
+            var combatOk = ctx.Config.ScripCollectableCombatItems.Contains(item);
+            routes.RemoveAll(r => r is Route.Fish or Route.Reduce || (r == Route.Combat && !combatOk));
+        }
         if (routes.Contains(Route.Combat) && CombatJobPicker.Pick() == null)
         {
             if (!this.noCombatJobLogged)

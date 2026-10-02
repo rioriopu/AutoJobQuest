@@ -144,6 +144,12 @@ public static class ScripCollectable
             .Where(x => x.Item != 0)
             .Select(x => $"{Jobs.Name(x.Job)}（{CraftPlanner.ItemName(x.Item)}）{ability.WhyNot(x.Job, planner.Pick(x.Item) is { } r ? CraftAbility.RecipeLevel(r) : 999) ?? "作れる"}"));
 
+    /// <summary>収集品だけの素材のうち、戦闘でも集める品の説明（記録・点検用。例：「ディープアイの涙だけ」。無ければ「しない」）。</summary>
+    public static string CombatItemsText(Configuration cfg)
+        => cfg.ScripCollectableCombatItems.Count == 0
+            ? "しない"
+            : $"{string.Join("・", cfg.ScripCollectableCombatItems.Select(CraftPlanner.ItemName))}だけ";
+
     /// <summary>記録・点検に出す説明（例：「収集用のアルケオーニスグリモア（錬金術師の品。設定の『収集用のシーダーロングボウ』と同じ段の品を、ジョブに合わせて選びました）」）。</summary>
     public static string Describe(uint item, Configuration cfg, CraftPlanner? planner)
     {

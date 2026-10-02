@@ -440,7 +440,7 @@ public static class Preflight
                     item => planner.Pick(item, ability) != null);
                 list.Add(planner.Pick(chosen, ability) != null
                     ? new PreflightItem(Severity.Ok, $"紫貨が足りなければ、{ScripCollectable.Describe(chosen, ctx.Config, planner)} を作って納品します"
-                                                     + "（収集品だけに使う素材は、採集できれば採集し、できなければマーケットボードで買います。戦闘はしません）")
+                                                     + $"（収集品だけに使う素材は、採集できれば採集し、できなければマーケットボードで買います。戦闘は {ScripCollectable.CombatItemsText(ctx.Config)}）")
                     : new PreflightItem(Severity.Warn,
                         $"紫貨を稼ぐ収集品（{CraftPlanner.ItemName(ctx.Config.ScripCollectableItemId)} と同じ段の品）を作れる製作職がいません（{ScripCollectable.WhyNone(ctx.Config, planner, ability)}）。"
                         + "紫貨が足りなければ、秘伝書の下準備で止まります"));
