@@ -189,12 +189,11 @@ public static class CharacterReport
             var cap = DeliverCollectablesTask.ScripCap(books.RewardSpecialCurrencyId);
             lines.Add(new ReportLine(Severity.Ok, $"{CraftPlanner.ItemName(scripItem)}：{scrips}/{cap}"));
             // 納品に使う収集品は、秘伝書の要る職に合わせて選ぶ。ここでは、いまのジョブで選んだ品を出す
-            var configured = ctx.Config.ScripCollectableItemId;
-            var chosen = ScripCollectable.ChooseFromGame(configured, [Jobs.CurrentClassJob], data.Planner);
+            var chosen = ScripCollectable.ChooseFromGame(ctx.Config, [Jobs.CurrentClassJob], data.Planner);
             var shown = books.ForCollectable(chosen) ?? books;
             var held = Inventory.CountCollectables(shown.CollectableItemId, shown.MinCollectability);
             lines.Add(new ReportLine(Severity.Ok,
-                $"納品に使う収集品（いまのジョブで選んだ品。実行では秘伝書の要る職に合わせます）：{ScripCollectable.Describe(shown.CollectableItemId, configured, data.Planner)}"
+                $"納品に使う収集品（いまのジョブで選んだ品。実行では秘伝書の要る職に合わせます）：{ScripCollectable.Describe(shown.CollectableItemId, ctx.Config, data.Planner)}"
                 + $"（収集価値 {shown.MinCollectability} 以上で 1個 {shown.RewardLow}〜{shown.RewardHigh}）　手持ち {held} 個"));
 
             var town = books.ChooseTown();

@@ -688,10 +688,9 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         // 紫貨を稼ぐ収集品は、秘伝書の要る職に合わせて選ぶ（錬金術師なら「収集用のアルケオーニスグリモア」。
         // 設定の品＝木工師のシーダーロングボウと同じ収集品納品の Lv50 の段。以前は設定の品に決め打ちで、木工師 Lv1 のキャラクターが
         // 「入手手段が残っていない素材があります：収集用のシーダーロングボウ×3」で止まった）
-        var configured = ctx.Config.ScripCollectableItemId;
-        var collectable = ScripCollectable.ChooseFromGame(configured, plan.Craft.LockedBySecretBook.Select(c => c.ClassJobId), ctx.Data.Planner);
+        var collectable = ScripCollectable.ChooseFromGame(ctx.Config, plan.Craft.LockedBySecretBook.Select(c => c.ClassJobId), ctx.Data.Planner);
         ctx.Log.Write("秘伝書", $"未読の秘伝書：{string.Join("、", bookItems.Select(CraftPlanner.ItemName))}");
-        ctx.Log.Write("秘伝書", $"紫貨が足りなければ作って納品する収集品：{ScripCollectable.Describe(collectable, configured, ctx.Data.Planner)}");
+        ctx.Log.Write("秘伝書", $"紫貨が足りなければ作って納品する収集品：{ScripCollectable.Describe(collectable, ctx.Config, ctx.Data.Planner)}");
         this.bookBuild = Task.Run(() => BookData.Build(bookItems, collectable));
         this.stage = Stage.WaitBookData;
         this.NextPhase("秘伝書・収集品のデータを調べています");
@@ -744,7 +743,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
             var ability = CraftAbility.FromGame();
             if (ctx.Data.Planner!.Pick(this.books.CollectableItemId, ability) == null)
                 return this.Fail($"紫貨を稼ぐ収集品（収集品納品の、{CraftPlanner.ItemName(ctx.Config.ScripCollectableItemId)} と同じ段の品）を作れる製作職がいません："
-                                 + ScripCollectable.WhyNone(ctx.Config.ScripCollectableItemId, ctx.Data.Planner!, ability));
+                                 + ScripCollectable.WhyNone(ctx.Config, ctx.Data.Planner!, ability));
         }
 
         // 紫貨のための収集品は、中間素材まで別の職で作る（例：シーダーロングボウ＝木工・鍛冶・裁縫）。
@@ -855,9 +854,22 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
         if (extra.Count > 0)
             craftAll = ctx.Data.Planner!.Build(plan.Targets.Concat(extra), Inventory.Snapshot(), PlanBuilder.IsBookUnlocked, CraftAbility.FromGame());
 
+        // 紫貨の収集品だけに使う素材（本編のジョブクエの計画に無い素材。作れる職がいなくて買う中間素材を含む）は、
+        // 採集できれば採集し、できなければ買う（戦闘・釣り・精選はしない。マーケットへの切り替えの確認も出さない）。
+        // 採集できる素材は採集し、採集できず中間素材として作ることもできないときは、
+        // ジョブクエを進めるジョブの収集品を作るための素材をマーケットボードで買う。
+        // 以前は本編の素材と同じ順（NPC 購入→採集→釣り→戦闘→精選→マーケット）で、アルケオーニスの粗皮・ディープアイの涙・
+        // ダイアマイトウェブを戦闘で集めに行き、採集できない素材はマーケットへ切り替える確認を出していた
+        var collectOnly = extra.Count == 0
+            ? new HashSet<uint>()
+            : craftAll.RawTotal.Keys.Where(k => !plan.Craft.RawTotal.ContainsKey(k)).ToHashSet();
         var raw = craftAll.RawShortfall
-            .Select(kv => (Item: kv.Key, Need: kv.Value, Routes: this.RoutesFor(ctx, kv.Key)))
+            .Select(kv => (Item: kv.Key, Need: kv.Value, Routes: this.RoutesFor(ctx, kv.Key, collectOnly.Contains(kv.Key))))
             .ToList();
+        var collectRaw = raw.Where(r => collectOnly.Contains(r.Item)).ToList();
+        if (collectRaw.Count > 0)
+            ctx.Log.Write("素材", "紫貨の収集品だけに使う素材（採集できれば採集、できなければ購入。戦闘はしない）："
+                                  + string.Join("、", collectRaw.Select(r => $"{CraftPlanner.ItemName(r.Item)}×{r.Need}（{(r.Routes.Count > 0 ? string.Join("→", r.Routes.Select(Ui.MainWindow.RouteName)) : "手段なし")}）")));
 
         var marketMateria = MateriaMarketNeeds(ctx.Config, plan);
 
@@ -870,6 +882,7 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
             .Where(r => r.Routes.Count > 0 && r.Routes[0] == Route.MarketBoard
                         && PlanBuilder.ChooseRoutes(sourcesIdx, r.Item).FirstOrDefault() != Route.MarketBoard
                         && !PlanBuilder.TimeLimited(sourcesIdx, r.Item) // 出ている時間で決まる品は、確認を出さずにマーケット
+                        && !collectOnly.Contains(r.Item) // 紫貨の収集品だけに使う素材は、採集できなければ買う
                         && !MarketSwitch.Approved(this.marketSwitchApproved, this.marketSwitchUsed, r.Item, r.Need))
             .ToList();
         if (switched.Count > 0)
@@ -1086,9 +1099,12 @@ public sealed class JobQuestFlow : AutoTask, IOutcomeHint
     // 使える入手手段（計画の表示と同じ判定：PlanBuilder.AvailableRoutes）。
     // 戦闘に使えるジョブが無ければ、戦闘は手段から外す（次の手段がマーケットなら、買う前に確認窓を出す）。
     // 以前は戦闘が第一の手段の素材があると、そこで止まっていた
-    private List<Route> RoutesFor(TaskContext ctx, uint item)
+    // 紫貨の収集品だけに使う素材（collectableOnly）は、NPC 購入・採集・マーケットだけにする（採集できれば採集、できなければ買う）
+    private List<Route> RoutesFor(TaskContext ctx, uint item, bool collectableOnly = false)
     {
         var routes = PlanBuilder.AvailableRoutes(ctx.Data.Sources!, item, this.excluded);
+        if (collectableOnly)
+            routes.RemoveAll(r => r is Route.Combat or Route.Fish or Route.Reduce);
         if (routes.Contains(Route.Combat) && CombatJobPicker.Pick() == null)
         {
             if (!this.noCombatJobLogged)

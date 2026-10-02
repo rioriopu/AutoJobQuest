@@ -213,7 +213,7 @@ public static class Preflight
             {
                 used = plan.RemainingQuests.Select(q => q.ClassJobId).Concat(plan.Craft.Crafts.Select(c => c.ClassJobId)).ToHashSet();
                 if (plan.Craft.LockedBySecretBook.Count > 0
-                    && ctx.Data.Planner?.Pick(ScripCollectable.ChooseFromGame(ctx.Config.ScripCollectableItemId, plan.Craft.LockedBySecretBook.Select(c => c.ClassJobId), ctx.Data.Planner)) is { } collectRecipe)
+                    && ctx.Data.Planner?.Pick(ScripCollectable.ChooseFromGame(ctx.Config, plan.Craft.LockedBySecretBook.Select(c => c.ClassJobId), ctx.Data.Planner)) is { } collectRecipe)
                     used.Add(Jobs.CraftTypeToClassJob(collectRecipe.CraftType.RowId));
             }
 
@@ -435,13 +435,14 @@ public static class Preflight
             // 紫貨を稼ぐ収集品（秘伝書の要る職に合わせて選ぶ）。作れる職がいなければ、紫貨が足りないと秘伝書の下準備で止まる
             if (ctx.Data.Planner is { } planner)
             {
-                var configured = ctx.Config.ScripCollectableItemId;
                 var ability = CraftAbility.FromGame();
-                var chosen = ScripCollectable.Choose(configured, plan.Craft.LockedBySecretBook.Select(c => c.ClassJobId), item => planner.Pick(item, ability) != null);
+                var chosen = ScripCollectable.Choose(ctx.Config.ScripCollectableItemId, ctx.Config.ScripCollectableByJob, plan.Craft.LockedBySecretBook.Select(c => c.ClassJobId),
+                    item => planner.Pick(item, ability) != null);
                 list.Add(planner.Pick(chosen, ability) != null
-                    ? new PreflightItem(Severity.Ok, $"紫貨が足りなければ、{ScripCollectable.Describe(chosen, configured, planner)} を作って納品します")
+                    ? new PreflightItem(Severity.Ok, $"紫貨が足りなければ、{ScripCollectable.Describe(chosen, ctx.Config, planner)} を作って納品します"
+                                                     + "（収集品だけに使う素材は、採集できれば採集し、できなければマーケットボードで買います。戦闘はしません）")
                     : new PreflightItem(Severity.Warn,
-                        $"紫貨を稼ぐ収集品（{CraftPlanner.ItemName(configured)} と同じ段の品）を作れる製作職がいません（{ScripCollectable.WhyNone(configured, planner, ability)}）。"
+                        $"紫貨を稼ぐ収集品（{CraftPlanner.ItemName(ctx.Config.ScripCollectableItemId)} と同じ段の品）を作れる製作職がいません（{ScripCollectable.WhyNone(ctx.Config, planner, ability)}）。"
                         + "紫貨が足りなければ、秘伝書の下準備で止まります"));
             }
 
