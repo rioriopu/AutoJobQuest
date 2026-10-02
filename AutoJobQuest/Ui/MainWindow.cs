@@ -1066,7 +1066,12 @@ public sealed class MainWindow : Window
         ImGui.SameLine();
         ImGui.Checkbox("狙わない敵も表示", ref this.dropHuntShowSkipped);
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("チェックを外した敵・エリアは、ふだんは一覧に出しません。ここをオンにすると出るので、戻せます");
+            ImGui.SetTooltip("チェックを外した敵・エリアは、ふだんは一覧に出しません。ここをオンにすると出るので、戻せます。"
+                             + "クエスト専用として自動で外した敵も、ここをオンにすると出ます");
+
+        // クエスト専用として自動で外した敵（EventOnlySpawns）。ゲームのデータでは普段の敵と見分けきれないことがあるので、利用者が戻せるようにする
+        if (this.dropHuntShowSkipped)
+            this.DrawAutoRemoved(sources, list);
 
         var unlocked = Svc.Aetherytes.Select(a => a.AetheryteId).ToHashSet();
         var running = this.services.Runner.IsRunning;
@@ -1174,6 +1179,36 @@ public sealed class MainWindow : Window
 
             ImGui.Spacing();
         }
+    }
+
+    /// <summary>
+    /// クエスト専用として自動で外した敵のうち、一覧の素材を落とすもの（敵×エリア）。チェックを付けると戻す（HuntPrefs.SetRestored。
+    /// 戻すと、デバッグでも本番の素材集めの戦闘でも、そのエリアのその敵を狙う）。討伐手帳に載らない普段の敵の誤りは、データでは見分けられない
+    /// </summary>
+    private void DrawAutoRemoved(SourceIndex sources, List<DropHuntEntry> list)
+    {
+        var dropsOf = list.SelectMany(e => sources.Get(e.ItemId).DropMobs.Select(m => (Mob: m, e.ItemName))).ToLookup(x => x.Mob, x => x.ItemName);
+        var groups = sources.EventOnlySpawnsRemoved.Where(x => dropsOf.Contains(x.NameId)).GroupBy(x => (x.NameId, x.Territory))
+            .OrderBy(g => g.Key.Territory).ThenBy(g => g.Key.NameId).ToList();
+        if (groups.Count == 0 || !ImGui.TreeNode($"クエスト専用として自動で外した敵（{groups.Count} 組）##autoRemoved"))
+            return;
+
+        ImGui.TextColored(Grey, "ゲームのデータで、クエストを進めている人の前にだけ湧く敵と分かったもの（クエストの台本の敵の置き場所と一致し、討伐手帳に載らない）。"
+                                + "普段からいる敵なら、チェックを付けると戻ります（デバッグでも本番の素材集めでも狙います）");
+        var names = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.BNpcName>();
+        foreach (var g in groups)
+        {
+            var name = names.TryGetRow(g.Key.NameId, out var row) ? row.Singular.ExtractText() : $"敵 {g.Key.NameId}";
+            var on = HuntPrefs.IsRestored(g.Key.Territory, g.Key.NameId);
+            if (ImGui.Checkbox($"{name}（{TeleportTask.TerritoryName(g.Key.Territory)}）：{g.First().Why}・素材 {string.Join("・", dropsOf[g.Key.NameId].Distinct())}"
+                               + $"##auto{g.Key.Territory}_{g.Key.NameId}", ref on))
+            {
+                HuntPrefs.SetRestored(g.Key.Territory, g.Key.NameId, on);
+                this.dropHuntBuild = null; // 一覧を作り直す（戻した敵が、素材の行のエリアに出る）
+            }
+        }
+
+        ImGui.TreePop();
     }
 
     private void DrawLogTab()

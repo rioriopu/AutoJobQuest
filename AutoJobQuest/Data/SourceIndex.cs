@@ -179,9 +179,25 @@ public sealed class SourceIndex
         return s;
     }
 
-    /// <summary>そのモンスターの出現位置。</summary>
+    // クエスト専用として外した出現位置（名前の番号ごと。利用者が戻したエリアのものは SpawnsOf で足す）
+    private readonly Dictionary<uint, List<MobSpot>> eventOnlySpots = [];
+
+    /// <summary>
+    /// そのモンスターの出現位置。クエスト専用として外した出現位置のうち、利用者がデバッグタブで戻したエリアのもの（HuntPrefs.IsRestored）も足す
+    /// （ゲームのデータでは普段の敵と見分けきれないことがあるので、利用者が戻せるようにする）。
+    /// </summary>
     public IReadOnlyList<MobSpot> SpawnsOf(uint bnpcNameId)
-        => this.spawns.TryGetValue(bnpcNameId, out var l) ? l : [];
+    {
+        var list = this.spawns.TryGetValue(bnpcNameId, out var l) ? l : null;
+        if (this.eventOnlySpots.TryGetValue(bnpcNameId, out var removed))
+        {
+            var back = removed.Where(s => HuntPrefs.IsRestored(s.Territory, bnpcNameId)).ToList();
+            if (back.Count > 0)
+                return [.. list ?? [], .. back];
+        }
+
+        return list ?? [];
+    }
 
     private void BuildCrystals()
     {
@@ -426,6 +442,9 @@ public sealed class SourceIndex
     /// <summary>素材を落とす敵から外した FATE のボスの名前（調べ用）。</summary>
     public IReadOnlySet<string> FateBosses { get; private set; } = new HashSet<string>();
 
+    /// <summary>クエスト専用の敵として外した出現位置（調べ用：名前の番号・エリア・地図座標・理由。EventOnlySpawns）。</summary>
+    public IReadOnlyList<(uint NameId, uint Territory, float MapX, float MapY, string Why)> EventOnlySpawnsRemoved { get; private set; } = [];
+
     private void BuildCombat()
     {
         try
@@ -441,10 +460,36 @@ public sealed class SourceIndex
             }
 
             var spawnRows = CsvLoader.LoadResource<MobSpawnPosition>(CsvLoader.MobSpawnResourceName, true, out var failed2, out _);
+
+            // クエスト専用の敵の出現位置は入れない（EventOnlySpawns）。
+            // 読めなければ外さずに続ける（以前と同じ。普段いない敵は、戦闘で見かけないまま回ったら回らなくなる）
+            EventOnlySpawns? eventOnly = null;
+            Dictionary<MobSpawnPosition, string> questOnly = new(ReferenceEqualityComparer.Instance);
+            try
+            {
+                var built = EventOnlySpawns.Build();
+                questOnly = built.QuestOnly(spawnRows);
+                eventOnly = built; // 判定まで済んでから（途中で失敗したら、外した件数の記録を出さない）
+            }
+            catch (Exception ex)
+            {
+                this.notes.Add($"クエストの敵の置き場所を読めませんでした（外さずに続けます）: {ex.GetType().Name}: {ex.Message}");
+            }
+
+            var removedEvent = new List<(uint, uint, float, float, string)>();
             foreach (var m in spawnRows)
             {
                 if (m.BNpcNameId == 0 || m.TerritoryTypeId == 0)
                     continue;
+                if (questOnly.TryGetValue(m, out var quest))
+                {
+                    removedEvent.Add((m.BNpcNameId, m.TerritoryTypeId, m.Position.X, m.Position.Y, $"クエスト「{quest}」の敵"));
+                    if (!this.eventOnlySpots.TryGetValue(m.BNpcNameId, out var gone))
+                        this.eventOnlySpots[m.BNpcNameId] = gone = [];
+                    gone.Add(new MobSpot(m.BNpcNameId, m.TerritoryTypeId, m.Position.X, m.Position.Y));
+                    continue;
+                }
+
                 if (!this.spawns.TryGetValue(m.BNpcNameId, out var list))
                     this.spawns[m.BNpcNameId] = list = [];
 
@@ -454,6 +499,11 @@ public sealed class SourceIndex
 
             if (failed1.Count + failed2.Count > 0)
                 this.notes.Add($"戦闘ドロップのデータで読めない行がありました（ドロップ {failed1.Count} 行 / 出現位置 {failed2.Count} 行）");
+
+            this.EventOnlySpawnsRemoved = removedEvent;
+            if (eventOnly != null)
+                Core.DebugLog.Current?.Line("データ", $"クエスト専用の敵の出現位置を外しました：{removedEvent.Count} 行"
+                                                    + $"（クエストの台本の敵の置き場所 {eventOnly.QuestPlaces} か所から。討伐手帳に載る敵は外さない。デバッグタブで戻せる）");
 
             this.ExcludeFateBosses();
         }

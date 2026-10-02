@@ -15,6 +15,7 @@ namespace AutoJobQuest.Data;
 ///    素材ごとに持つ（例：マイトリングはダイアマイトウェブを落とさない。同じ敵でも別の素材は落としうる）。
 ///  ・後回しのエリア（素材×エリア）：ほかに行けるエリアで見つからなくなったときだけ行く
 ///    （例：アンフィプテレの粗皮はアジス・ラーで集め、見つからなくなったらドラヴァニア雲海へ）。
+///  ・自動で外した敵を戻す（エリア×敵）：クエスト専用の敵としてゲームのデータで外した敵（EventOnlySpawns）が、実は普段からいるとき。
 ///  ・狩り場（素材×エリア×ワールド座標）：その素材の敵は、データの出現点の代わりにここを回って探す
 ///    （例：北部森林のベーンマイトは決まった場所に固まっているので、そこへ飛んで探す）。
 /// 置き場所はこのプラグインの設定フォルダの hunt_prefs.json（2つのゲームで共有：5秒ごとに読み直し、変えるときは読み直してから書く）。
@@ -33,6 +34,9 @@ public static class HuntPrefs
 
         /// <summary>後回しのエリア（「素材:エリア」）：ほかに行けるエリアで見つからなくなったときだけ行く。</summary>
         public List<string> Later { get; set; } = [];
+
+        /// <summary>クエスト専用として自動で外した敵のうち、戻すもの（「エリア:敵の名前の番号」。EventOnlySpawns）。</summary>
+        public List<string> Restored { get; set; } = [];
     }
 
     /// <summary>狩り場（ワールド座標）。</summary>
@@ -44,6 +48,7 @@ public static class HuntPrefs
     private static Store? cache;
     private static HashSet<string> cachedSkips = new(StringComparer.Ordinal); // 画面が毎フレーム引くので、引きやすい形でも持つ
     private static HashSet<string> cachedLater = new(StringComparer.Ordinal);
+    private static HashSet<string> cachedRestored = new(StringComparer.Ordinal);
     private static DateTime cachedAt = DateTime.MinValue;
 
     private static string? FilePath
@@ -89,6 +94,7 @@ public static class HuntPrefs
         cache = store;
         cachedSkips = store.Skips.ToHashSet(StringComparer.Ordinal);
         cachedLater = store.Later.ToHashSet(StringComparer.Ordinal);
+        cachedRestored = store.Restored.ToHashSet(StringComparer.Ordinal);
         cachedAt = DateTime.UtcNow;
     }
 
@@ -98,6 +104,7 @@ public static class HuntPrefs
         {
             store.Skips = store.Skips.Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
             store.Later = store.Later.Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
+            store.Restored = store.Restored.Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
             if (FilePath is { } p)
                 File.WriteAllText(p, JsonSerializer.Serialize(store, new JsonSerializerOptions { WriteIndented = true }));
         }
@@ -144,6 +151,23 @@ public static class HuntPrefs
         store.Later.Remove($"{itemId}:{territory}");
         if (later)
             store.Later.Add($"{itemId}:{territory}");
+        Write(store);
+    }
+
+    /// <summary>クエスト専用として自動で外した、そのエリアのその敵を、利用者が戻したか。</summary>
+    public static bool IsRestored(uint territory, uint nameId)
+    {
+        Read(false);
+        return cachedRestored.Contains($"{territory}:{nameId}");
+    }
+
+    /// <summary>自動で外した敵を戻す・戻さないを変えて保存する（読み直してから書く）。</summary>
+    public static void SetRestored(uint territory, uint nameId, bool restored)
+    {
+        var store = Read(true);
+        store.Restored.Remove($"{territory}:{nameId}");
+        if (restored)
+            store.Restored.Add($"{territory}:{nameId}");
         Write(store);
     }
 
