@@ -262,7 +262,8 @@ public static class CharacterReport
             var installed = Svc.PluginInterface.InstalledPlugins.ToList();
             foreach (var (internalName, display, why) in Preflight.RequiredPlugins)
             {
-                var p = installed.FirstOrDefault(x => x.InternalName == internalName);
+                // 同じ内部名が2つ以上あるときは、読み込まれているものを見る（開発用と配布元の版を両方登録している等。Preflight と同じ）
+                var p = installed.FirstOrDefault(x => x.InternalName == internalName && x.IsLoaded) ?? installed.FirstOrDefault(x => x.InternalName == internalName);
                 lines.Add(p is { IsLoaded: true }
                     ? new ReportLine(Severity.Ok, $"{display} {p.Version}（{why}）")
                     : new ReportLine(Severity.Error, $"{display}：読み込まれていません（{why}）"));

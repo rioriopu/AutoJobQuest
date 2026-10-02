@@ -111,8 +111,10 @@ public static class Preflight
         var questFishing = plan == null ? [] : QuestsWithFishing(plan.RemainingQuests, QuestionablePaths.Steps);
         foreach (var (internalName, display, why) in RequiredPlugins)
         {
-            var p = installed.FirstOrDefault(x => x.InternalName == internalName);
-            if (p != null && p.IsLoaded)
+            // 同じ内部名が2つ以上あるとき（開発用と配布元の版を両方登録している等）は、どれか1つでも読み込まれていればよい
+            // （不具合の例：開発用の Questionable 15.290.0.3 と配布元の 15.756.3.25 を登録していて、
+            // 15.756.3.25 を使うと、最初に見つかった開発用〔読み込まれていない〕を見て「読み込まれていません」と誤って判定した）
+            if (installed.Any(x => x.InternalName == internalName && x.IsLoaded))
                 continue;
 
             if (internalName == "AutoHook" && questFishing.Count > 0)
