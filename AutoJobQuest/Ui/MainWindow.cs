@@ -21,7 +21,7 @@ namespace AutoJobQuest.Ui;
 ///  ② チェックを入れたジョブのジョブクエだけを、上部の「ジョブクエ開始」ボタンで自動化
 ///  ※ 全部を ON にするチェックボックスも置く
 /// </summary>
-public sealed class MainWindow : Window
+public sealed partial class MainWindow : Window
 {
     private static readonly Vector4 Yellow = new(1f, 0.85f, 0.35f, 1f);
     private static readonly Vector4 Red = new(1f, 0.45f, 0.45f, 1f);
@@ -154,6 +154,12 @@ public sealed class MainWindow : Window
             using var t = ImRaii.TabItem("デバッグ");
             if (t)
                 this.DrawLogTab();
+        }
+
+        using (var t = ImRaii.TabItem("ご支援"))
+        {
+            if (t)
+                this.DrawDonationTab();
         }
     }
 

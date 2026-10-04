@@ -133,6 +133,7 @@ https://raw.githubusercontent.com/rioriopu/PrivateReleaseRepo/main/repo.json
 | 事前点検 | 「点検する」で、開始時と同じ点検の結果を出す |
 | 必須プラグイン | 導入の状態とインストール |
 | 設定 | 下の「設定」 |
+| ご支援 | 開発のご支援（Patreon のページを開く・URL をコピー） |
 
 ### キャラクタータブ・デバッグタブ（ふだんは隠れている）
 
@@ -249,13 +250,14 @@ dotnet build -c Release
 すべてを Dalamud の devPlugins フォルダへ置く。**DLL だけでは一覧に出ない。**
 ライセンスの文書（`LICENSE`・`THIRD-PARTY-NOTICES.md`・`licenses\`）も同じ場所に出る（配布する zip にも入る）。
 
-ビルド後に自動で配置したい場合は、環境変数 `AJQ_DEPLOY_DIR` に配置先を指定する。
+Release でビルドすると、`C:\DevPlugins` がある PC では `C:\DevPlugins\AutoJobQuest\` へ自動で配置する。
+別の場所に置きたい場合は、環境変数 `AJQ_DEPLOY_DIR` に配置先を指定する。
 
 ```
 setx AJQ_DEPLOY_DIR "D:\MyPlugins\AutoJobQuest\"
 ```
 
-指定が無ければ配置せずビルドだけを行う。Dalamud API 15（Dalamud.NET.Sdk 15.0.0・.NET 10）。
+どちらも無ければ配置せずビルドだけを行う。Dalamud API 15（Dalamud.NET.Sdk 15.0.0・.NET 10）。
 
 ### 作者が確かめた版
 
@@ -264,6 +266,11 @@ TextAdvance 3.3.0.1／AutoHook 6.0.2.3／vnavmesh 1.2.3.14／AutoRetainer 4.6.2.
 他のプラグインの更新で内部の名前が変わると、動かなくなることがある。
 
 ## 更新履歴
+
+### 0.1.0.1
+
+- 「ご支援」タブを追加
+- Release でビルドしたとき、既定で `C:\DevPlugins\AutoJobQuest\` へ配置するようにした（`C:\DevPlugins` がある PC だけ）
 
 ### 0.1.0.0
 

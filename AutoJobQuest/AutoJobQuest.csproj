@@ -6,7 +6,7 @@
     DalamudLibPath / DalamudPackager の参照は Dalamud.NET.Sdk の既定値を使う。
   -->
   <PropertyGroup>
-    <Version>0.1.0.0</Version>
+    <Version>0.1.0.1</Version>
     <RootNamespace>AutoJobQuest</RootNamespace>
     <AssemblyName>AutoJobQuest</AssemblyName>
     <Description>製作系・採集系のジョブクエ（Lv1〜70）の素材集め・製作・マテリア装着・クエスト進行を自動で行う</Description>
@@ -50,13 +50,15 @@
     Release のターゲットの後だけに付ける。AfterTargets に Debug 側も並べると、Release では条件で飛ばされる
     Debug 側の番で先に走り、manifest を作り直す前の古いものを写してしまう。
 
-    配置先は環境変数 AJQ_DEPLOY_DIR で指定する。指定が無ければ配置しない
+    配置先は、既定では C:\DevPlugins\AutoJobQuest\（C:\DevPlugins がある PC だけ）。
+    環境変数 AJQ_DEPLOY_DIR を指定すると、そちらに置く。どちらも無ければ配置しない
     （ビルドは通る。bin\Release\ の中身を手で置けばよい）。
 
         setx AJQ_DEPLOY_DIR "D:\MyPlugins\AutoJobQuest\"
   -->
-  <PropertyGroup>
-    <DeployDir Condition="'$(Configuration)' == 'Release'">$(AJQ_DEPLOY_DIR)</DeployDir>
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DeployDir>$(AJQ_DEPLOY_DIR)</DeployDir>
+    <DeployDir Condition="'$(DeployDir)' == '' And Exists('C:\DevPlugins')">C:\DevPlugins\$(AssemblyName)\</DeployDir>
   </PropertyGroup>
 
   <Target Name="DeployToPluginFolder"
