@@ -1,5 +1,28 @@
+# ビルドの出力（各プロジェクトの bin・obj、道具を -o out で組み立てたもの、配布用の zip）
 bin/
 obj/
+out/
+*.zip
+
+# Visual Studio・Rider の個人設定
 .vs/
+.idea/
 *.user
+*.suo
+*.DotSettings.user
+
+# 詳しい記録（ログ）
 ログ/
+
+# ビルド済みのプラグインをリポジトリの直下に写したもの
+/*.dll
+/*.deps.json
+/*.pdb
+/AutoJobQuest.json
+
+# 手元だけで使う資料・道具（公開しない）
+docs/
+旧版/
+修正版/
+_公開の道具/
+/【*】*.md

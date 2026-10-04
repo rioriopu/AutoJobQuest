@@ -11,8 +11,7 @@ namespace AutoJobQuest.Core;
 /// <summary>
 /// 不具合を調べるための記録をファイルに残す（細かく説明しなくても分かるように）。
 ///
-/// 置き場所（既定）：開発環境（<c>DevelopmentRoot</c> がある）では <c>DefaultDirectory</c>、それ以外ではプラグインの設定フォルダの <c>ログ\</c>
-/// （以前はどの PC でも開発用のフォルダの ログ を作っていた）。
+/// 置き場所（既定）：プラグインの設定フォルダの <c>ログ\</c>（全体の設定の LogDirectory で別のフォルダも指定できる）。
 ///   全体_yyyyMMdd_キャラクター名.log        … その日の記録すべて（プラグインを読み込んでいる間ずっと）
 ///   実行_yyyyMMdd_HHmmss_キャラクター名.log … 「ジョブクエ開始」から止まるまでの記録（1回の実行で1つ）
 ///   失敗_yyyyMMdd_HHmmss_キャラクター名.md  … 止まったときの状況（状態の写し＋直前の記録）
@@ -30,12 +29,6 @@ namespace AutoJobQuest.Core;
 /// </summary>
 public sealed class DebugLog : IDisposable
 {
-    /// <summary>開発環境での置き場所（<see cref="DevelopmentRoot"/> があるときだけ使う）。</summary>
-    public const string DefaultDirectory = @"C:\ソース\AutoJobQuest\ログ";
-
-    /// <summary>開発環境の目印（このフォルダがあれば、記録を <see cref="DefaultDirectory"/> に置く）。</summary>
-    public const string DevelopmentRoot = @"C:\ソース\AutoJobQuest";
-
     private readonly BlockingCollection<(string Path, string Text)> queue = new(new ConcurrentQueue<(string, string)>());
     private readonly Thread writer;
     private readonly object runGate = new();
@@ -72,7 +65,7 @@ public sealed class DebugLog : IDisposable
     public DebugLog(string? preferredDirectory, bool enabled)
     {
         this.preferredDirectory = preferredDirectory;
-        this.Directory = DirectoryCandidates(preferredDirectory, System.IO.Directory.Exists(DevelopmentRoot), Svc.PluginInterface.ConfigDirectory.FullName)[0];
+        this.Directory = DirectoryCandidates(preferredDirectory, Svc.PluginInterface.ConfigDirectory.FullName)[0];
         this.writer = new Thread(this.WriteLoop) { IsBackground = true, Name = "AutoJobQuest.DebugLog" };
         this.writer.Start();
         instance = this;
@@ -108,23 +101,20 @@ public sealed class DebugLog : IDisposable
     }
 
     /// <summary>
-    /// 記録の置き場所の候補（試す順）。指定があればそれ、開発環境ならその ログ、最後にプラグインの設定フォルダの ログ。
-    /// 開発環境でないときは、開発用のフォルダを作らない。
+    /// 記録の置き場所の候補（試す順）。指定があればそれ、最後にプラグインの設定フォルダの ログ。
     /// </summary>
-    public static List<string> DirectoryCandidates(string? preferred, bool developmentRootExists, string configDirectory)
+    public static List<string> DirectoryCandidates(string? preferred, string configDirectory)
     {
         var list = new List<string>();
         if (!string.IsNullOrWhiteSpace(preferred))
             list.Add(preferred);
-        if (developmentRootExists)
-            list.Add(DefaultDirectory);
         list.Add(Path.Combine(configDirectory, "ログ"));
         return list;
     }
 
     private static string ResolveDirectory(string? preferred)
     {
-        foreach (var dir in DirectoryCandidates(preferred, System.IO.Directory.Exists(DevelopmentRoot), Svc.PluginInterface.ConfigDirectory.FullName))
+        foreach (var dir in DirectoryCandidates(preferred, Svc.PluginInterface.ConfigDirectory.FullName))
         {
             if (string.IsNullOrWhiteSpace(dir))
                 continue;

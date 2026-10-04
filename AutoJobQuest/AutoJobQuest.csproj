@@ -18,6 +18,16 @@
     <Content Include="AutoJobQuest.json" />
   </ItemGroup>
 
+  <!--
+    ライセンスと第三者の表示を出力フォルダへ写す。DalamudPackager は出力フォルダの中身を zip にするので、配布物にも入る
+    （同梱する GPL・Apache のライブラリは、配布物にライセンスを添えることを求めている）。
+  -->
+  <ItemGroup>
+    <None Include="..\LICENSE" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+    <None Include="..\THIRD-PARTY-NOTICES.md" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+    <None Include="..\licenses\*.txt" LinkBase="licenses" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+
   <!-- ビルド時刻をアセンブリへ埋め込む（古い DLL が動いていないかの切り分け用） -->
   <ItemGroup>
     <AssemblyMetadata Include="BuildTime" Value="$([System.DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))" />
@@ -28,20 +38,25 @@
     初期化せずに同梱すると紛らわしいので参照しない。
   -->
   <ItemGroup>
-    <!-- モンスターのドロップ表と出現位置（ゲームデータに無いため）。Artisan 導入版と同じ版 -->
+    <!-- モンスターのドロップ表と出現位置（ゲームデータに無いため） -->
     <PackageReference Include="LuminaSupplemental.Excel" Version="4.3.3" />
   </ItemGroup>
 
   <!--
     ビルドしたら dev プラグインの置き場へコピーする。
-    DalamudPackager が manifest を作った後に走らせる（AfterTargets="Build" だと manifest が無い）。
-    依存 DLL（LuminaSupplemental とその依存。ECommons は使っていない）も一緒に置く。
+    DalamudPackager が manifest を作った後に走らせる（AfterTargets="Build" だと manifest がまだ無い）。
+    依存 DLL（LuminaSupplemental とその依存）も一緒に置く。
 
-    Release のターゲットの後だけに付ける。AfterTargets に Debug 側も並べると、
-    Release では条件で飛ばされる Debug 側の番で先に走り、manifest を作り直す前の古いものを写してしまう。
+    Release のターゲットの後だけに付ける。AfterTargets に Debug 側も並べると、Release では条件で飛ばされる
+    Debug 側の番で先に走り、manifest を作り直す前の古いものを写してしまう。
+
+    配置先は環境変数 AJQ_DEPLOY_DIR で指定する。指定が無ければ配置しない
+    （ビルドは通る。bin\Release\ の中身を手で置けばよい）。
+
+        setx AJQ_DEPLOY_DIR "D:\MyPlugins\AutoJobQuest\"
   -->
   <PropertyGroup>
-    <DeployDir Condition="'$(Configuration)' == 'Release'">C:\自作プラグイン\AutoJobQuest\</DeployDir>
+    <DeployDir Condition="'$(Configuration)' == 'Release'">$(AJQ_DEPLOY_DIR)</DeployDir>
   </PropertyGroup>
 
   <Target Name="DeployToPluginFolder"
