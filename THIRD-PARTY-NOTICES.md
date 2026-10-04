@@ -1,6 +1,6 @@
 # 第三者のソフトウェアの表示
 
-AutoJobQuest 本体（Copyright (C) 2026 Estell）のライセンスは GNU Affero General Public License v3.0（[LICENSE](LICENSE)）。
+AutoJobQuest 本体のライセンスは GNU Affero General Public License v3.0（[LICENSE](LICENSE)）。
 このファイルには、AutoJobQuest のソースの一部の元になったものと、配布物（zip）に同梱しているライブラリの、
 著作権表示とライセンスをまとめる。
 

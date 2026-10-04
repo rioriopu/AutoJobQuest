@@ -273,8 +273,6 @@ TextAdvance 3.3.0.1／AutoHook 6.0.2.3／vnavmesh 1.2.3.14／AutoRetainer 4.6.2.
 
 作者：Estell
 
-Copyright (C) 2026 Estell
-
 GNU Affero General Public License v3.0（[LICENSE](LICENSE)）。
 
 ソースの一部は Questionable（AGPL-3.0）・Automaton（BSD-3-Clause）・ECommons（MIT）を元にしている。
