@@ -28,6 +28,14 @@
     <None Include="..\licenses\*.txt" LinkBase="licenses" CopyToOutputDirectory="PreserveNewest" Visible="false" />
   </ItemGroup>
 
+  <!--
+    アイコン。開発版（devPlugins）は、プラグインのフォルダの images\icon.png を一覧に出す。
+    リポジトリから入れたものは、導入の前も後も manifest の IconUrl（配布リポジトリの icons\AutoJobQuest.png）を出す。
+  -->
+  <ItemGroup>
+    <None Include="images\icon.png" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <!-- ビルド時刻をアセンブリへ埋め込む（古い DLL が動いていないかの切り分け用） -->
   <ItemGroup>
     <AssemblyMetadata Include="BuildTime" Value="$([System.DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))" />
@@ -71,6 +79,8 @@
     <Copy SourceFiles="@(DeployFiles)" DestinationFolder="$(DeployDir)" ContinueOnError="true">
       <Output TaskParameter="CopiedFiles" ItemName="ActuallyCopied" />
     </Copy>
+    <Copy SourceFiles="$(OutputPath)images\icon.png" DestinationFolder="$(DeployDir)images\" ContinueOnError="true"
+          Condition="Exists('$(OutputPath)images\icon.png')" />
     <Warning Condition="'@(ActuallyCopied)' == ''"
              Text="配置できませんでした。ゲームが DLL を掴んでいる可能性があります。もう一度ビルドしてください。" />
     <Message Condition="'@(ActuallyCopied)' != ''" Importance="high" Text="配置しました: $(DeployDir)" />

@@ -270,6 +270,7 @@ TextAdvance 3.3.0.1／AutoHook 6.0.2.3／vnavmesh 1.2.3.14／AutoRetainer 4.6.2.
 ### 0.1.0.1
 
 - 「ご支援」タブを追加
+- アイコンを追加（プラグインの一覧で、導入の前も後も出る）
 - Release でビルドしたとき、既定で `C:\DevPlugins\AutoJobQuest\` へ配置するようにした（`C:\DevPlugins` がある PC だけ）
 
 ### 0.1.0.0
